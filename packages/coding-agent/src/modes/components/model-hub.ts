@@ -11,7 +11,6 @@
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
-import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { getCatalogProviderEntry } from "@oh-my-pi/pi-catalog/provider-models";
 import {
 	type Component,
@@ -33,8 +32,10 @@ import type { Settings } from "../../config/settings";
 import {
 	AUTO_THINKING,
 	type ConfiguredThinkingLevel,
+	getAvailableThinkingLevelsForModel,
 	getConfiguredThinkingLevelMetadata,
 	parseConfiguredThinkingLevel,
+	resolveThinkingLevelForModel,
 } from "../../thinking";
 import { theme } from "../theme/theme";
 import { matchesSelectCancel, matchesSelectDown, matchesSelectUp } from "../utils/keybinding-matchers";
@@ -316,15 +317,19 @@ export class ModelHubComponent implements Component {
 
 	#getResolvedRoleThinkingLevel(
 		role: string,
+		model: Model,
 		resolved: { explicitThinkingLevel: boolean; thinkingLevel?: ConfiguredThinkingLevel },
 	): ConfiguredThinkingLevel {
-		if (resolved.explicitThinkingLevel && resolved.thinkingLevel !== undefined) {
-			return resolved.thinkingLevel;
+		const configured =
+			resolved.explicitThinkingLevel && resolved.thinkingLevel !== undefined
+				? resolved.thinkingLevel
+				: role === "default"
+					? (parseConfiguredThinkingLevel(this.#settings.get("defaultThinkingLevel")) ?? ThinkingLevel.Inherit)
+					: ThinkingLevel.Inherit;
+		if (configured === ThinkingLevel.Ultra) {
+			return resolveThinkingLevelForModel(model, configured) ?? ThinkingLevel.Inherit;
 		}
-		if (role === "default") {
-			return parseConfiguredThinkingLevel(this.#settings.get("defaultThinkingLevel")) ?? ThinkingLevel.Inherit;
-		}
-		return ThinkingLevel.Inherit;
+		return configured;
 	}
 
 	/** Resolve every known role: configured values first, auto-selection for the rest. */
@@ -346,7 +351,7 @@ export class ModelHubComponent implements Component {
 			if (resolved.model) {
 				nextRoles[role] = {
 					model: resolved.model,
-					thinkingLevel: this.#getResolvedRoleThinkingLevel(role, resolved),
+					thinkingLevel: this.#getResolvedRoleThinkingLevel(role, resolved.model, resolved),
 					autoSelected: false,
 				};
 			}
@@ -363,7 +368,7 @@ export class ModelHubComponent implements Component {
 				if (!resolved.model) continue;
 				nextRoles[role] = {
 					model: resolved.model,
-					thinkingLevel: this.#getResolvedRoleThinkingLevel(role, resolved),
+					thinkingLevel: this.#getResolvedRoleThinkingLevel(role, resolved.model, resolved),
 					autoSelected: true,
 				};
 			}
@@ -851,7 +856,7 @@ export class ModelHubComponent implements Component {
 	}
 
 	#thinkingOptionsFor(model: Model): ConfiguredThinkingLevel[] {
-		return [ThinkingLevel.Inherit, ThinkingLevel.Off, AUTO_THINKING, ...getSupportedEfforts(model)];
+		return [ThinkingLevel.Inherit, ThinkingLevel.Off, AUTO_THINKING, ...getAvailableThinkingLevelsForModel(model)];
 	}
 
 	#openRoleStrip(item: ModelBrowserItem): void {

@@ -54,10 +54,14 @@ function rateColor(percent: number): string {
 	return ANSI.red;
 }
 
+const BENCHMARK_THINKING_LEVELS: readonly ResolvedThinkingLevel[] = [
+	ThinkingLevel.Off,
+	...THINKING_EFFORTS,
+	ThinkingLevel.Ultra,
+];
+
 function parseThinkingLevel(value: string | null | undefined): ResolvedThinkingLevel | undefined {
-	return value !== undefined &&
-		value !== null &&
-		[ThinkingLevel.Off, ...THINKING_EFFORTS].includes(value as ResolvedThinkingLevel)
+	return value !== undefined && value !== null && BENCHMARK_THINKING_LEVELS.includes(value as ResolvedThinkingLevel)
 		? (value as ResolvedThinkingLevel)
 		: undefined;
 }

@@ -184,6 +184,8 @@ export function thinkingLevelGlyph(level: ConfiguredThinkingLevel): string {
 			return glyphOf(theme.thinking.xhigh);
 		case ThinkingLevel.Max:
 			return glyphOf(theme.thinking.max);
+		case ThinkingLevel.Ultra:
+			return glyphOf(theme.thinking.max);
 		case ThinkingLevel.Inherit:
 			return "";
 	}

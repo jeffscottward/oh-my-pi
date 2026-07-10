@@ -6,6 +6,7 @@ import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { thinkingLevelGlyph } from "@oh-my-pi/pi-coding-agent/modes/components/model-browser";
 import {
 	type ModelHubCallbacks,
 	ModelHubComponent,
@@ -173,6 +174,11 @@ describe("ModelHub", () => {
 			expect(rendered).toContain("●smol");
 		});
 
+		test("defines a compact glyph for ultra thinking", () => {
+			installTestTheme();
+			expect(thinkingLevelGlyph(ThinkingLevel.Ultra)).toBeTruthy();
+		});
+
 		test("renders hollow chips for auto-selected role fallbacks", () => {
 			const settings = Settings.isolated({});
 			const haiku = makeModel("test", "claude-haiku-4.5");
@@ -208,6 +214,30 @@ describe("ModelHub", () => {
 			expect(defaultRow).toContain("auto");
 			expect(defaultRow).not.toContain("inherit");
 			expect(smolRow).toContain("auto");
+		});
+
+		test("roles view resolves default ultra to the selected model ceiling", () => {
+			const model = getBundledModel("openai", "gpt-5.5");
+			if (!model) throw new Error("Expected bundled model openai/gpt-5.5");
+			const settings = Settings.isolated({
+				cycleOrder: ["default", "slow"],
+				defaultThinkingLevel: ThinkingLevel.Ultra,
+				modelRoles: {
+					default: `${model.provider}/${model.id}`,
+					slow: `${model.provider}/${model.id}:ultra`,
+				},
+			});
+			const { hub } = createHub({ models: [model], scoped: true, settings });
+			installTestTheme();
+
+			hub.handleInput(UP); // All models → Roles (since Recent is removed)
+			const lines = hub.render(220).map(line => stripVTControlCharacters(line));
+			const defaultRow = lines.find(line => line.includes("DEFAULT"));
+			const slowRow = lines.find(line => line.includes("SLOW"));
+			expect(defaultRow).toContain("xhigh");
+			expect(defaultRow).not.toContain("ultra");
+			expect(slowRow).toContain("xhigh");
+			expect(slowRow).not.toContain("ultra");
 		});
 
 		test("x clears a configured role back to auto-selection", () => {
@@ -359,6 +389,7 @@ describe("ModelHub", () => {
 			expect(thinking).toContain("inherit");
 			expect(thinking).toContain("xhigh");
 			expect(thinking).not.toContain("max");
+			expect(thinking).not.toContain("ultra");
 		});
 
 		test("renders max as a real final tier on max-capable models (gpt-5.6)", () => {
@@ -372,6 +403,7 @@ describe("ModelHub", () => {
 			const thinking = footerLine(hub.render(220));
 			expect(thinking).toContain("xhigh");
 			expect(thinking).toContain("max");
+			expect(thinking).toContain("ultra");
 		});
 
 		test("Enter on a chip already holding this model unassigns it", () => {

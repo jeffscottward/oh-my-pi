@@ -1597,6 +1597,9 @@ export class AcpAgent implements Agent {
 		if (!thinkingLevel) {
 			throw new Error(`Unknown ACP thinking level: ${value}`);
 		}
+		if (!this.#buildThinkingOptions(session).some(option => option.value === thinkingLevel)) {
+			throw new Error(`ACP thinking level unavailable for current model: ${value}`);
+		}
 		session.setThinkingLevel(thinkingLevel);
 	}
 
