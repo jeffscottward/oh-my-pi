@@ -2094,7 +2094,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	async #clearTransientModeState(): Promise<void> {
 		if (this.planModeEnabled || this.planModePaused) {
 			if (this.#planModePreviousTools !== undefined) {
-				await this.session.setActiveToolsByName(this.#planModePreviousTools);
+				await this.session.setActiveToolsByName(this.#planModePreviousTools, { explicit: false });
 			}
 			this.session.setStandingResolveHandler?.(null);
 			this.session.setPlanModeState(undefined);
@@ -2110,7 +2110,7 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		if (this.goalModeEnabled || this.goalModePaused) {
 			if (this.#goalModePreviousTools !== undefined) {
-				await this.session.setActiveToolsByName(this.#goalModePreviousTools);
+				await this.session.setActiveToolsByName(this.#goalModePreviousTools, { explicit: false });
 			}
 			this.session.setGoalModeState(undefined);
 			this.goalModeEnabled = false;
@@ -2167,7 +2167,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			if (restored?.goal) {
 				const previousTools = this.session.getActiveToolNames().filter(name => name !== "goal");
 				this.#goalModePreviousTools = previousTools;
-				await this.session.setActiveToolsByName([...new Set([...previousTools, "goal"])]);
+				await this.session.setActiveToolsByName([...new Set([...previousTools, "goal"])], { explicit: false });
 			}
 			this.#updateGoalModeStatus();
 			return;
@@ -2235,7 +2235,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		// prompt, which predictably invalidates the cache.
 		this.lastAssistantUsage = undefined;
 
-		await this.session.setActiveToolsByName(uniquePlanTools);
+		await this.session.setActiveToolsByName(uniquePlanTools, { explicit: false });
 		this.session.setPlanModeState({
 			enabled: true,
 			planFilePath,
@@ -2325,7 +2325,7 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		const previousTools = this.#planModePreviousTools;
 		if (previousTools && previousTools.length > 0) {
-			await this.session.setActiveToolsByName(previousTools);
+			await this.session.setActiveToolsByName(previousTools, { explicit: false });
 		}
 		if (this.#planModePreviousModelState) {
 			if (!options?.deferModelRestore) {
@@ -2385,7 +2385,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		const state = options.resume
 			? await this.session.goalRuntime.resumeGoal()
 			: await this.session.goalRuntime.createGoal({ objective: options.objective ?? "" });
-		await this.session.setActiveToolsByName(goalTools);
+		await this.session.setActiveToolsByName(goalTools, { explicit: false });
 		this.session.setGoalModeState(state);
 		this.goalModeEnabled = true;
 		this.#resetGoalContinuationSuppression();
@@ -2405,7 +2405,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	}): Promise<void> {
 		const previousTools = this.#goalModePreviousTools;
 		if (this.goalModeEnabled && previousTools) {
-			await this.session.setActiveToolsByName(previousTools);
+			await this.session.setActiveToolsByName(previousTools, { explicit: false });
 		}
 		const currentState = this.session.getGoalModeState();
 		if (options?.reason === "completed") {
@@ -2802,7 +2802,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		// Restore the execution tool set, but force-enable `read`: approved-plan
 		// prompts now require loading the durable local:// plan file before work.
 		const executionTools = previousTools.includes("read") ? previousTools : [...previousTools, "read"];
-		await this.session.setActiveToolsByName(executionTools);
+		await this.session.setActiveToolsByName(executionTools, { explicit: false });
 		this.session.setPlanReferencePath(options.planFilePath);
 
 		// Resolve the deferred plan-approval model transition. On the compact path

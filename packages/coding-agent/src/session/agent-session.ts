@@ -430,7 +430,12 @@ const TOOL_CALL_LOOP_REDIRECT_TYPE = "tool-call-loop-redirect";
 const ULTRA_MODE_CONTEXT_TYPE = "ultra-mode-context";
 const ULTRA_MODE_RESET_TYPE = "ultra-mode-reset";
 
-type UltraModeInactiveReason = "selector-inactive" | "subagent" | "task-eager-configured" | "task-unavailable";
+type UltraModeInactiveReason =
+	| "selector-inactive"
+	| "subagent"
+	| "vibe-mode"
+	| "task-eager-configured"
+	| "task-unavailable";
 
 type UltraModeDecision = { active: true; taskToolName: string } | { active: false; reason: UltraModeInactiveReason };
 
@@ -1109,6 +1114,7 @@ function parseRetryFallbackSelector(
 	if (!trimmed) return undefined;
 	const parsed = parseModelString(trimmed, {
 		allowMaxSuffix: true,
+		allowUltraSuffix: true,
 		allowAutoAlias: true,
 		isLiteralModelId: (provider, id) => modelLookup?.find(provider, id) !== undefined,
 	});
@@ -1810,6 +1816,8 @@ export class AgentSession {
 	#setActiveToolNames: ((names: Iterable<string>) => void) | undefined;
 	#disconnectOwnedMcpManager: (() => Promise<void>) | undefined;
 	#requestedToolNames: ReadonlySet<string> | undefined;
+	/** Logical sessions where a public active-tool update explicitly removed `task`. */
+	#runtimeTaskExclusionSessionIds = new Set<string>();
 	#baseSystemPrompt: string[];
 	#baseSystemPromptBeforeMemoryPromotion: string[] | undefined;
 	/**
@@ -6291,7 +6299,7 @@ export class AgentSession {
 			...this.#getActiveNonMCPToolNames(),
 			...this.#filterSelectableMCPToolNames(nextSelectedMCPToolNames),
 		];
-		await this.setActiveToolsByName(nextActive);
+		await this.#applyActiveToolsByName(nextActive);
 		return [...new Set(activated)];
 	}
 
@@ -6386,7 +6394,7 @@ export class AgentSession {
 			}
 			if (newlyAdded.length > 0) {
 				const nextActive = [...this.getActiveToolNames(), ...newlyAdded];
-				await this.setActiveToolsByName(nextActive);
+				await this.#applyActiveToolsByName(nextActive);
 				this.#invalidateDiscoverableToolSearchIndex();
 			}
 		}
@@ -6623,9 +6631,19 @@ export class AgentSession {
 	 * Only tools in the registry can be enabled. Unknown tool names are ignored.
 	 * Also rebuilds the system prompt to reflect the new tool set.
 	 * Changes take effect before the next model call.
+	 * Additive internal reconciliation can pass `explicit: false` to preserve that intent.
 	 */
-	async setActiveToolsByName(toolNames: string[]): Promise<void> {
-		await this.#applyActiveToolsByName(toolNames);
+	async setActiveToolsByName(toolNames: string[], options?: { explicit?: boolean }): Promise<void> {
+		const normalizedToolNames = normalizeToolNames(toolNames);
+		const explicitSessionId = options?.explicit === false ? undefined : this.sessionManager.getSessionId();
+		await this.#applyActiveToolsByName(normalizedToolNames);
+		if (explicitSessionId !== undefined) {
+			if (normalizedToolNames.includes("task")) {
+				this.#runtimeTaskExclusionSessionIds.delete(explicitSessionId);
+			} else {
+				this.#runtimeTaskExclusionSessionIds.add(explicitSessionId);
+			}
+		}
 	}
 
 	async #restoreMCPSelectionsForSessionContext(
@@ -8598,9 +8616,10 @@ export class AgentSession {
 	}
 
 	/** Clear queued messages and return the user-restorable ones (text plus any attached images).
-	 *  Only user-authored messages (plain user turns, `attribution:"user"` custom like `/skill`) are
-	 *  returned for editor restore. Other queued messages stay in the agent-core queues so a continuing
-	 *  stream still delivers them — EXCEPT on `forInterrupt` (Esc+abort), where only advisor cards are
+	 *  User-authored messages (plain user turns, `attribution:"user"` custom like `/skill`) are
+	 *  returned for editor restore; known hidden user companions and queued Ultra context leave with
+	 *  a removed root, while Ultra remains beside a retained vibe root. Other agent-authored messages
+	 *  stay queued — EXCEPT on `forInterrupt` (Esc+abort), where only advisor cards are
 	 *  kept (abort()'s #extractQueuedAdvisorCards preserves them as visible advice) and every other
 	 *  non-user steer (hidden goal/plan/budget, IRC/extension asides) is dropped, so abort()'s
 	 *  #drainStrandedQueuedMessages can't auto-resume the run the user just interrupted (the drain only
@@ -8613,10 +8632,17 @@ export class AgentSession {
 		const followUpAll = this.agent.peekFollowUpQueue();
 		const steering = steeringAll.filter(isUserQueuedMessage).map(toRestoredQueuedMessage);
 		const followUp = followUpAll.filter(isUserQueuedMessage).map(toRestoredQueuedMessage);
-		const keep: (m: AgentMessage) => boolean = options?.forInterrupt
-			? isAdvisorCard
-			: m => !isUserQueuedMessage(m) && !isHiddenUserCompanion(m);
-		this.agent.replaceQueues(steeringAll.filter(keep), followUpAll.filter(keep));
+		const keepAfterRestore = (queue: readonly AgentMessage[]): AgentMessage[] =>
+			queue.filter((message, index) => {
+				if (isUserQueuedMessage(message) || isHiddenUserCompanion(message)) return false;
+				if (!this.#isUltraModeCustomMessage(message)) return true;
+				const root = queue[index + 1];
+				return root?.role === "custom" && root.customType === "vibe-mode-context";
+			});
+		this.agent.replaceQueues(
+			options?.forInterrupt ? steeringAll.filter(isAdvisorCard) : keepAfterRestore(steeringAll),
+			options?.forInterrupt ? followUpAll.filter(isAdvisorCard) : keepAfterRestore(followUpAll),
+		);
 		return { steering, followUp };
 	}
 
@@ -8652,12 +8678,16 @@ export class AgentSession {
 			}
 			return -1;
 		};
-		// Notices queue immediately before their user message, so dropping the popped
-		// prompt means also dropping the contiguous hidden-user companions right before
-		// it — companions of other queued prompts stay put.
+		// Known hidden notices and a queued Ultra context sit immediately before
+		// their user message. Remove that contiguous group with the restored prompt;
+		// agent-authored entries such as advisor cards remain independently queued.
 		const removeWithCompanions = (queue: readonly AgentMessage[], userIndex: number): AgentMessage[] => {
 			let start = userIndex;
-			while (start > 0 && isHiddenUserCompanion(queue[start - 1])) start--;
+			while (start > 0) {
+				const previous = queue[start - 1];
+				if (!isHiddenUserCompanion(previous) && !this.#isUltraModeCustomMessage(previous)) break;
+				start--;
+			}
 			const next = queue.slice();
 			next.splice(start, userIndex - start + 1);
 			return next;
@@ -11457,18 +11487,22 @@ export class AgentSession {
 		return messages.filter(message => !this.#isUltraModeCustomMessage(message));
 	}
 
+	#isQueuedUltraRootMessage(message: AgentMessage): boolean {
+		if (message.role === "custom" && message.customType === "vibe-mode-context") return true;
+		return !this.#isAgentOnlyRootTurnMessage(message) && !isHiddenUserCompanion(message);
+	}
+
 	async #reconcileQueuedUltraModeContext(): Promise<void> {
 		if (!this.agent.hasQueuedMessages()) return;
 
-		const originalSteering = [...this.agent.peekSteeringQueue()];
-		const originalFollowUp = [...this.agent.peekFollowUpQueue()];
-		const steering = this.#stripQueuedUltraModeMessages(originalSteering);
-		const followUp = this.#stripQueuedUltraModeMessages(originalFollowUp);
-		const firstQueuedRootMessage = steering[0] ?? followUp[0];
-		if (!firstQueuedRootMessage) {
-			if (steering.length !== originalSteering.length || followUp.length !== originalFollowUp.length) {
-				this.agent.replaceQueues(steering, followUp);
-			}
+		const hasQueuedRootMessage = [...this.agent.peekSteeringQueue(), ...this.agent.peekFollowUpQueue()].some(
+			message => this.#isQueuedUltraRootMessage(message),
+		);
+		if (!hasQueuedRootMessage) {
+			this.agent.transformQueues(queues => ({
+				steering: this.#stripQueuedUltraModeMessages(queues.steering),
+				followUp: this.#stripQueuedUltraModeMessages(queues.followUp),
+			}));
 			return;
 		}
 
@@ -11476,15 +11510,33 @@ export class AgentSession {
 			activateTask: true,
 			suppressActiveReassertion: true,
 		});
-		if (steering.length > 0) {
-			this.agent.replaceQueues([...ultraModeMessages, ...steering], followUp);
-			return;
-		}
-		this.agent.replaceQueues(steering, [...ultraModeMessages, ...followUp]);
+		this.agent.transformQueues(queues => {
+			const steering = this.#stripQueuedUltraModeMessages(queues.steering);
+			const followUp = this.#stripQueuedUltraModeMessages(queues.followUp);
+			const steeringRootIndex = steering.findIndex(message => this.#isQueuedUltraRootMessage(message));
+			const followUpRootIndex = followUp.findIndex(message => this.#isQueuedUltraRootMessage(message));
+			const target = steeringRootIndex >= 0 ? "steering" : followUpRootIndex >= 0 ? "followUp" : undefined;
+			if (!target || ultraModeMessages.length === 0) return { steering, followUp };
+
+			const queued = target === "steering" ? steering : followUp;
+			const rootIndex = target === "steering" ? steeringRootIndex : followUpRootIndex;
+			let insertionIndex = rootIndex;
+			while (insertionIndex > 0 && isHiddenUserCompanion(queued[insertionIndex - 1])) {
+				insertionIndex--;
+			}
+			const hiddenCompanions = queued.slice(insertionIndex, rootIndex);
+			const reconciled = [...queued.slice(0, insertionIndex), ...ultraModeMessages, ...queued.slice(insertionIndex)];
+			return {
+				steering: target === "steering" ? reconciled : steering,
+				followUp: target === "followUp" ? reconciled : followUp,
+				companions: [...ultraModeMessages, ...hiddenCompanions],
+			};
+		});
 	}
 
 	#implicitUltraTaskAllowed(): boolean {
-		return this.#requestedToolNames === undefined || this.#requestedToolNames.has("task");
+		if (this.#requestedToolNames !== undefined && !this.#requestedToolNames.has("task")) return false;
+		return !this.#runtimeTaskExclusionSessionIds.has(this.sessionManager.getSessionId());
 	}
 
 	#resolveImplicitUltraModeDecision(): UltraModeDecision {
@@ -11494,6 +11546,9 @@ export class AgentSession {
 		if (this.#agentKind === "sub") {
 			return { active: false, reason: "subagent" };
 		}
+		if (this.#vibeModeState?.enabled) {
+			return { active: false, reason: "vibe-mode" };
+		}
 		if (this.settings.isConfigured("task.eager")) {
 			return { active: false, reason: "task-eager-configured" };
 		}
@@ -11501,7 +11556,8 @@ export class AgentSession {
 			return { active: false, reason: "task-unavailable" };
 		}
 		const activeToolNames = this.getActiveToolNames();
-		const taskIsAvailable = activeToolNames.includes("task") || this.#toolRegistry.has("task");
+		const taskIsAvailable =
+			this.#builtInToolNames.has("task") && (activeToolNames.includes("task") || this.#toolRegistry.has("task"));
 		if (!taskIsAvailable) {
 			return { active: false, reason: "task-unavailable" };
 		}
@@ -11510,6 +11566,7 @@ export class AgentSession {
 
 	async #ensureImplicitUltraTaskActive(): Promise<void> {
 		if (!this.#implicitUltraTaskAllowed()) return;
+		if (!this.#builtInToolNames.has("task")) return;
 		const activeToolNames = this.getActiveToolNames();
 		if (activeToolNames.includes("task")) return;
 		if (!this.#toolRegistry.has("task")) return;
@@ -11587,6 +11644,15 @@ export class AgentSession {
 		suppressActiveReassertion?: boolean;
 	}): Promise<CustomMessage[]> {
 		const lastStatus = this.#lastUltraModeContextStatusFromBranch();
+		if (this.#runtimeTaskExclusionSessionIds.has(this.sessionManager.getSessionId())) {
+			const activeToolNames = this.getActiveToolNames();
+			if (activeToolNames.includes("task")) {
+				await this.#applyActiveToolsByName(
+					activeToolNames.filter(name => name !== "task"),
+					{ persistMCPSelection: false },
+				);
+			}
+		}
 		const decision = this.#resolveImplicitUltraModeDecision();
 		if (decision.active) {
 			if (options.activateTask) {
@@ -12285,6 +12351,7 @@ export class AgentSession {
 
 		const parsed = parseModelString(trimmedTarget, {
 			allowMaxSuffix: true,
+			allowUltraSuffix: true,
 			allowAutoAlias: true,
 			isLiteralModelId: (provider, id) =>
 				availableModels.some(model => model.provider === provider && model.id === id),
