@@ -1856,7 +1856,7 @@ describe("advisor", () => {
 			expect(failures).toHaveLength(2);
 		});
 
-		it("treats an empty stop turn without advise as a failed advisor turn", async () => {
+		it("treats zero- and EOS-only empty stop turns as failed advisor turns", async () => {
 			const promptInputs: string[] = [];
 			const turnErrors: unknown[] = [];
 			const failures: unknown[] = [];
@@ -1881,10 +1881,10 @@ describe("advisor", () => {
 						model: "mock-advisor",
 						usage: {
 							input: 0,
-							output: 0,
+							output: promptCalls % 2,
 							cacheRead: 0,
 							cacheWrite: 0,
-							totalTokens: 0,
+							totalTokens: promptCalls % 2,
 						},
 						stopReason: "stop",
 						timestamp: promptCalls * 2,
@@ -1960,7 +1960,10 @@ describe("advisor", () => {
 			expect(runtime.backlog).toBe(0);
 		});
 
-		it("accepts a silent empty stop that spent output tokens as a successful review", async () => {
+		it.each([
+			["reported reasoning tokens", { output: 0, reasoningTokens: 640, totalTokens: 760 }],
+			["multiple output tokens", { output: 66, totalTokens: 186 }],
+		] as const)("accepts a silent empty stop with %s as a successful review", async (_case, usage) => {
 			const promptInputs: string[] = [];
 			const turnErrors: unknown[] = [];
 			const failures: unknown[] = [];
@@ -1979,11 +1982,9 @@ describe("advisor", () => {
 						model: "mock-advisor",
 						usage: {
 							input: 120,
-							output: 0,
 							cacheRead: 0,
 							cacheWrite: 0,
-							reasoningTokens: 640,
-							totalTokens: 760,
+							...usage,
 						},
 						stopReason: "stop",
 						timestamp: promptCalls * 2,
@@ -2013,8 +2014,8 @@ describe("advisor", () => {
 			runtime.onTurnEnd(messages);
 			await runtime.waitForCatchup(1000, 1);
 
-			// A reasoning model that thought (reasoningTokens > 0) then chose to stay
-			// silent is a valid review, not a failed turn — no retry, no failure.
+			// Substantive output or explicit reasoning means the model reviewed the
+			// turn and chose silence, so the advisor must not retry or fail.
 			expect(promptInputs).toHaveLength(1);
 			expect(turnErrors).toEqual([]);
 			expect(failures).toEqual([]);

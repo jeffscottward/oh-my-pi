@@ -601,13 +601,12 @@ function getAdvisorEmptyResponseError(messages: readonly AgentMessage[]): Error 
 		sawAssistant = true;
 		if (message.stopReason !== "stop") return undefined;
 		if (hasAdvisorResponseContent(message)) return undefined;
-		// An empty-content stop that still burned output/reasoning tokens is a
-		// deliberate silent review: the advisor is instructed to "prefer silence
-		// when the agent is on track", and reasoning models (e.g. codex
-		// gpt-5.6) routinely spend their turn thinking, then emit no visible
-		// content and skip `advise`. Only a stop with zero output tokens is the
-		// broken provider response from #5212 (HTTP 200, `content: []`, zero
-		// usage) that must be treated as a failed turn.
+		// An empty-content stop can be a deliberate silent review: the advisor is
+		// instructed to "prefer silence when the agent is on track", and reasoning
+		// models may spend their turn thinking before emitting no visible content.
+		// Preserve the provider retry boundary: zero or one invisible output token
+		// can be a terminal EOS, while explicit reasoning tokens or more than one
+		// output token indicate substantive billed model work.
 		if (advisorTurnDidWork(message)) return undefined;
 	}
 	if (sawAssistant) return new Error("Advisor turn returned an empty stop response without advice");
@@ -616,15 +615,14 @@ function getAdvisorEmptyResponseError(messages: readonly AgentMessage[]): Error 
 }
 
 /**
- * Whether an advisor assistant turn actually produced model output, measured by
- * billed output/reasoning tokens. Distinguishes a deliberate silent review from
- * a content-less HTTP-200 with zero usage (the broken provider response of
- * #5212).
+ * Whether an advisor assistant turn performed substantive model work despite
+ * producing no visible content. Zero or one output token without reported
+ * reasoning matches the provider stack's empty-completion/EOS failure boundary.
  */
 function advisorTurnDidWork(message: AssistantMessage): boolean {
 	const usage = message.usage;
 	if (!usage) return false;
-	return usage.output > 0 || (usage.reasoningTokens ?? 0) > 0;
+	return usage.output > 1 || (usage.reasoningTokens ?? 0) > 0;
 }
 
 function hasAdvisorResponseContent(message: AssistantMessage): boolean {
