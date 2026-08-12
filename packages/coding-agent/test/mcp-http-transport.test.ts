@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import { HttpTransport } from "@oh-my-pi/pi-coding-agent/mcp/transports/http";
 
 const encoder = new TextEncoder();
@@ -255,6 +255,65 @@ describe("MCP Streamable HTTP POST response resumption", () => {
 		expect(observed.gets).toBe(2);
 		expect(observed.auth).toEqual(["Bearer stale", "Bearer fresh"]);
 		expect(observed.lastEventId).toBe("stream-1");
+	});
+
+	it("resumes after an abrupt stream drop once an event ID exists", async () => {
+		// A controlled response body keeps the transport boundary deterministic:
+		// the first read delivers a complete resumable event, and the next read
+		// fails. A raw socket that writes the event and closes in one callback can
+		// make Bun reject fetch before it exposes the response body, so the client
+		// never receives the event ID and that fixture does not exercise resumption.
+		const observed = { posts: 0, gets: 0, postReads: 0, lastEventId: null as string | null };
+		const fetchMock: typeof globalThis.fetch = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit | BunFetchRequestInit): Promise<Response> => {
+				if (init?.method === "POST") {
+					observed.posts++;
+					return new Response(
+						new ReadableStream<Uint8Array>({
+							pull(controller) {
+								observed.postReads++;
+								if (observed.postReads === 1) {
+									controller.enqueue(encoder.encode("id: stream-1\nretry: 0\ndata:\n\n"));
+									return;
+								}
+								controller.error(new Error("abrupt stream drop"));
+							},
+						}),
+						{ headers: { "Content-Type": "text/event-stream" } },
+					);
+				}
+				if (init?.method !== "GET") throw new Error(`Unexpected MCP HTTP method: ${init?.method}`);
+				observed.gets++;
+				observed.lastEventId = new Headers(init.headers).get("Last-Event-ID");
+				return new Response(
+					'id: stream-2\ndata: {"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"resumed","inputSchema":{"type":"object"}}]}}\n\n',
+					{ headers: { "Content-Type": "text/event-stream" } },
+				);
+			},
+			{ preconnect: globalThis.fetch.preconnect },
+		);
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock);
+		const transport = new HttpTransport({
+			type: "http",
+			url: "http://mcp.test/mcp",
+			timeout: GUARD_TIMEOUT_MS,
+		});
+		try {
+			await transport.connect();
+
+			await expect(withPendingGuard(transport.request<ToolList>("tools/list"), "request")).resolves.toEqual({
+				tools: [{ name: "resumed", inputSchema: { type: "object" } }],
+			});
+			expect(observed).toEqual({
+				posts: 1,
+				gets: 1,
+				postReads: 2,
+				lastEventId: "stream-1",
+			});
+		} finally {
+			await transport.close();
+			fetchSpy.mockRestore();
+		}
 	});
 });
 
