@@ -1120,6 +1120,9 @@ export class InteractiveMode implements InteractiveModeContext {
 			await this.#quiesceVibeForSessionSwitch();
 		});
 		this.session.setSessionSwitchReconciler?.(() => this.#reconcileModeFromSession({ preserveActiveGoal: true }));
+		this.session.setNewSessionTransitionReconciler?.(outcome =>
+			outcome.committed ? this.reconcileModeAfterNewSession() : this.reconcileModeAfterFailedNewSession(false),
+		);
 		await this.#reconcileModeFromSession();
 
 		// Brand-new sessions optionally start in plan mode when the user has made it
@@ -4166,6 +4169,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 		this.#extensionUiController.clearExtensionTerminalInputListeners();
 		this.#extensionUiController.clearHookWidgets();
+		this.session.setNewSessionTransitionReconciler?.(null);
 		for (const unsubscribe of this.#eventBusUnsubscribers) {
 			unsubscribe();
 		}
