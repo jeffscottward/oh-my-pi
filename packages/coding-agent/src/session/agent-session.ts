@@ -5488,10 +5488,7 @@ export class AgentSession {
 				!turnHasPendingUserDirective &&
 				this.settings.get("externalThinking") &&
 				this.getEnabledToolNames().includes("think") &&
-				activeModel &&
-				(activeModel.api === "openai-responses" ||
-					activeModel.api === "azure-openai-responses" ||
-					activeModel.api === "openai-codex-responses")
+				supportsExternalThinking(activeModel)
 					? buildNamedToolChoice("think", activeModel)
 					: undefined;
 			if (externalThinkingToolChoice) {
