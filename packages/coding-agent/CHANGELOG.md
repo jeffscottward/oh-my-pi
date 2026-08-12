@@ -4,7 +4,7 @@
 
 ### Added
 
-- Added default-on plan-first suggestions before substantial work in fresh interactive main-agent sessions.
+- Added default-on plan-first suggestions with research-first, immediate-questionnaire, and direct-work paths before substantial work in fresh interactive main-agent sessions.
 
 ## [17.2.15] - 2026-08-12
 
