@@ -9,7 +9,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "check:types": "tsc --noEmit",
+    "check:types": "tsrs --noEmit",
     "test": "bun test"
   },
   "dependencies": {
@@ -19,7 +19,7 @@
     "@tailwindcss/vite": "catalog:",
     "@types/bun": "catalog:",
     "tailwindcss": "catalog:",
-    "typescript": "catalog:",
+    "tsrs": "^0.23.0-ts7.1.0-beta",
     "vite": "catalog:",
     "vite-plugin-solid": "catalog:"
   }
