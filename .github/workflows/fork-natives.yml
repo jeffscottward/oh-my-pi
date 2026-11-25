@@ -1,46 +1,40 @@
-# Fork-only: seed the main-built native addon cache that PR CI restores.
+# Fork-only: copy upstream's main-built native addons into this fork's cache.
 #
 # Upstream CI (ci.yml, job `native_addons`) never builds the native addons on
 # pull requests. A PR restores the linux-x64 addon pair that a `main` push run
-# saved to actions/cache under `natives-linux-x64-v1-<hash of native inputs>`,
-# and without any entry it falls back to the latest npm release. In upstream
-# that `main` build runs on `vmon-large/from=omp-ci` self-hosted runners. This
-# fork has no vmon runner, so `main` never saves an entry and every fork PR
-# tests against the npm release addons. PRs that depend on merged but
-# unreleased native code (for example `renderHtml`) then fail.
+# saved to actions/cache under `natives-linux-x64-v1-<hash of native inputs>`
+# (exact key, else the newest entry with that prefix), and without any entry it
+# falls back to the latest npm release. In upstream that `main` run executes on
+# `vmon-large/from=omp-ci` self-hosted runners. This fork has no vmon runner
+# and its own `main` is not synced with upstream, so it never saves an entry,
+# and every fork PR tests against the npm release addons. A PR that needs
+# merged but unreleased native code then fails.
 #
-# This workflow builds the same pair on a GitHub-hosted runner (free for this
-# public fork) and saves it under the same key on `refs/heads/main`, so PRs
-# that target `main` restore it. By default it builds upstream `main`
-# (can1357/oh-my-pi), because fork branches start from upstream `main`.
-# Dispatch with `repository`/`ref` inputs to build another commit, for example
-# this fork's `main` after a sync.
+# Upstream `main` runs also upload the same pair as the public artifact
+# `natives-linux-x64` (kept 1 day). This workflow copies the newest such
+# artifact into this fork's cache on `refs/heads/main`, under the key that
+# ci.yml computes for that artifact's commit. Entries saved on the default
+# branch are readable by every PR. Nothing is built here, so a run takes about
+# a minute on a GitHub-hosted runner. Same idea as upstream's
+# bun-cache-warm.yml: one hosted producer of a `main` cache entry for PRs.
 #
-# Keep the key in step with upstream ci.yml: the `Check upstream cache key`
-# step fails when ci.yml no longer defines the key this workflow writes.
+# Keep this file on the fork's `main`: schedules run only on the default
+# branch. Sync `main` with upstream by merge ("Sync fork" > "Update branch");
+# a forced sync deletes this file.
 name: Fork native addon cache
 
 on:
    schedule:
-      # Every 6 hours. A run that finds the exact key already cached exits
-      # after the probe, so idle runs take about a minute.
-      - cron: "17 */6 * * *"
+      # Hourly. When the newest upstream artifact is already cached, the run
+      # stops after the cache probe.
+      - cron: "17 * * * *"
    workflow_dispatch:
-      inputs:
-         repository:
-            description: "Repository to build (owner/name)"
-            type: string
-            default: can1357/oh-my-pi
-         ref:
-            description: "Branch, tag or commit SHA to build"
-            type: string
-            default: main
    push:
       branches: [main]
       paths:
          - ".github/workflows/fork-natives.yml"
-   # Validation only: builds and smoke-tests, never saves (an entry saved on a
-   # PR ref is readable by that ref alone).
+   # Validation only: finds, downloads and smoke-tests the artifact, never
+   # saves (an entry saved on a PR ref is readable by that ref alone).
    pull_request:
       branches: [main]
       paths:
@@ -54,65 +48,104 @@ concurrency:
    cancel-in-progress: false
 
 env:
-   NATIVES_X64_TARGETS: natives-linux-x64-baseline natives-linux-x64-modern
-   # Must equal the prefix and hashFiles() list of the `natives-key` step in
-   # upstream ci.yml; the drift check below compares them.
+   UPSTREAM_REPO: can1357/oh-my-pi
+   ARTIFACT_NAME: natives-linux-x64
+   # Must equal the `natives-key` step and the restore step of upstream
+   # ci.yml; the drift check below compares them.
    NATIVES_KEY_PREFIX: natives-linux-x64-v1-
+   CACHE_RESTORE_PIN: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
    NATIVES_HASH_EXPR: "hashFiles('Cargo.toml', 'Cargo.lock', 'MODULE.bazel', 'MODULE.bazel.lock', 'rust-toolchain.toml', 'rustfmt.toml', '.bazelrc', '.bazelignore', '.bazelversion', 'bazel/**', 'crates/**', 'BUILD.bazel')"
 
 jobs:
    seed:
-      name: Build and cache linux-x64 native addons
-      # Upstream has vmon runners and its own main build; run only in forks.
+      name: Copy upstream linux-x64 native addons to the cache
+      # Upstream has its own `main` build; run only in forks.
       if: github.repository_owner != 'can1357'
       runs-on: ubuntu-22.04
-      timeout-minutes: 300
-      permissions:
-         contents: read
-         # actions: write lets the prune step delete superseded entries.
-         actions: write
+      timeout-minutes: 30
+      outputs:
+         saved: ${{ steps.save.outcome == 'success' }}
+         prefix: ${{ steps.natives-key.outputs.prefix }}
       steps:
-         - name: Check out the source to build
+         # Upstream `main` push runs only, newest first. The artifact exists
+         # only when that run's native build passed, so a broken upstream
+         # build is skipped instead of copied.
+         - name: Find newest upstream native addon artifact
+           id: find
+           shell: bash
+           env:
+              GH_TOKEN: ${{ github.token }}
+           run: |
+              set -euo pipefail
+              runs=$(gh api "repos/$UPSTREAM_REPO/actions/workflows/ci.yml/runs?branch=main&event=push&per_page=30" \
+                  --jq '.workflow_runs[] | "\(.id) \(.head_sha)"')
+              while read -r run_id head_sha; do
+                [ -n "$run_id" ] || continue
+                found=$(gh api "repos/$UPSTREAM_REPO/actions/runs/$run_id/artifacts?name=$ARTIFACT_NAME" \
+                    --jq '[.artifacts[] | select(.expired == false)] | length')
+                if [ "$found" -gt 0 ]; then
+                  echo "Using artifact $ARTIFACT_NAME from $UPSTREAM_REPO run $run_id (commit $head_sha)."
+                  {
+                    echo "run-id=$run_id"
+                    echo "head-sha=$head_sha"
+                  } >> "$GITHUB_OUTPUT"
+                  exit 0
+                fi
+              done <<< "$runs"
+              echo "::error::None of the newest 30 upstream main runs has an unexpired $ARTIFACT_NAME artifact."
+              exit 1
+
+         - name: Check out the artifact's upstream commit
            uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
            with:
-              repository: ${{ inputs.repository || 'can1357/oh-my-pi' }}
-              ref: ${{ inputs.ref || 'main' }}
+              repository: ${{ env.UPSTREAM_REPO }}
+              ref: ${{ steps.find.outputs.head-sha }}
               persist-credentials: false
 
-         - name: Check upstream cache key definition
+         # A changed prefix, path, action pin or artifact name breaks the
+         # restore in every fork PR, so it fails here. A changed hashFiles()
+         # list only loses exact-key hits (PRs still get the newest entry by
+         # prefix), so it only warns.
+         - name: Check upstream cache contract
            shell: bash
            run: |
               set -euo pipefail
               ci=.github/workflows/ci.yml
+              fail=0
+              for needle in "prefix=$NATIVES_KEY_PREFIX" "path: ci-natives" "$CACHE_RESTORE_PIN" "name: $ARTIFACT_NAME"; do
+                if ! grep -qF -- "$needle" "$ci"; then
+                  echo "::error::$ci no longer contains '$needle'. Update fork-natives.yml to match upstream."
+                  fail=1
+                fi
+              done
               # Built with ${dollar} so this script holds no literal
               # expression opener for the workflow parser to evaluate.
               dollar='$'
               if ! grep -qF "NATIVE_INPUTS_HASH: ${dollar}{{ $NATIVES_HASH_EXPR }}" "$ci"; then
-                echo "::error::$ci no longer hashes the native inputs this workflow expects. Update NATIVES_HASH_EXPR and the key step in fork-natives.yml."
-                exit 1
+                echo "::warning::$ci hashes different native inputs. Update NATIVES_HASH_EXPR and the natives-key step in fork-natives.yml; until then PRs get prefix matches only."
               fi
-              if ! grep -qF "prefix=$NATIVES_KEY_PREFIX" "$ci"; then
-                echo "::error::$ci no longer uses the cache key prefix $NATIVES_KEY_PREFIX. Update NATIVES_KEY_PREFIX in fork-natives.yml."
-                exit 1
-              fi
+              exit "$fail"
 
          - name: Compute native addon cache key
            id: natives-key
            shell: bash
            env:
-              # Literal copy of the expression in NATIVES_HASH_EXPR (workflow
-              # expressions cannot be evaluated from a variable).
+              # Literal copy of NATIVES_HASH_EXPR (workflow expressions cannot
+              # be evaluated from a variable). Edit both together.
               NATIVE_INPUTS_HASH: ${{ hashFiles('Cargo.toml', 'Cargo.lock', 'MODULE.bazel', 'MODULE.bazel.lock', 'rust-toolchain.toml', 'rustfmt.toml', '.bazelrc', '.bazelignore', '.bazelversion', 'bazel/**', 'crates/**', 'BUILD.bazel') }}
            run: |
               set -euo pipefail
               if [ -z "$NATIVE_INPUTS_HASH" ]; then
-                echo "::error::No native inputs found in the checkout; this ref predates the Bazel native build."
+                echo "::error::No native inputs found in the checkout."
                 exit 1
               fi
               echo "prefix=$NATIVES_KEY_PREFIX" >> "$GITHUB_OUTPUT"
               echo "key=$NATIVES_KEY_PREFIX$NATIVE_INPUTS_HASH" >> "$GITHUB_OUTPUT"
-              echo "Built source: $(git rev-parse HEAD); cache key: $NATIVES_KEY_PREFIX$NATIVE_INPUTS_HASH"
 
+         # Same path spelling (`ci-natives`) and action pin as the PR restore
+         # step in ci.yml. The cache version hashes the path list, the
+         # compression method and the cross-OS flag; this job and the PR
+         # restore both run on GitHub-hosted ubuntu-22.04, so all three match.
          - name: Probe native addon cache entry
            id: probe
            if: github.event_name != 'pull_request'
@@ -127,48 +160,35 @@ jobs:
            env:
               HIT: ${{ steps.probe.outputs.cache-hit }}
               KEY: ${{ steps.natives-key.outputs.key }}
+              RUN_ID: ${{ steps.find.outputs.run-id }}
            run: |
-              if [ "$HIT" = true ]; then
-                echo "::notice title=Native addon cache::$KEY is already cached on main; nothing to build."
+              if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+                echo "::notice title=Native addon cache::Validation run; cache not probed. Copying $UPSTREAM_REPO run $RUN_ID as $KEY without saving."
+              elif [ "$HIT" = true ]; then
+                echo "::notice title=Native addon cache::$KEY is already cached on main; nothing to copy."
               else
-                echo "::notice title=Native addon cache::$KEY is not cached; building the linux-x64 pair."
+                echo "::notice title=Native addon cache::Copying $UPSTREAM_REPO run $RUN_ID into the cache as $KEY."
               fi
 
-         # GitHub-hosted images keep about 20 GB free; a cold Bazel build of
-         # the Rust addons needs more. Drop toolchains this job never uses.
-         - name: Free runner disk space
+         # Upload layout: natives-linux-x64-{baseline,modern}/<addon>.node,
+         # which is the `ci-natives` layout ci.yml restores.
+         - name: Download upstream native addon artifact
            if: steps.probe.outputs.cache-hit != 'true'
-           shell: bash
-           run: |
-              df -h /
-              sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL || true
-              df -h /
+           uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+           with:
+              name: ${{ env.ARTIFACT_NAME }}
+              path: ci-natives
+              repository: ${{ env.UPSTREAM_REPO }}
+              run-id: ${{ steps.find.outputs.run-id }}
+              github-token: ${{ github.token }}
 
-         - name: Build linux-x64 native addons
-           if: steps.probe.outputs.cache-hit != 'true'
-           shell: bash
-           run: |
-              set -eo pipefail
-              if [ "$(ulimit -Sn)" != unlimited ] && [ "$(ulimit -Sn)" -lt 65536 ]; then ulimit -Sn 65536 || true; fi
-              # One addon per invocation, as in upstream ci.yml: concurrent
-              # cdylib links each peak at several GiB of rustc RSS and the
-              # hosted runner has 16 GiB.
-              : > "$RUNNER_TEMP/bazel-build.log"
-              for target in $NATIVES_X64_TARGETS; do
-                bazelisk build --config=ci "//:$target" 2>&1 | tee -a "$RUNNER_TEMP/bazel-build.log"
-              done
-              for target in $NATIVES_X64_TARGETS; do
-                mkdir -p "ci-natives/$target"
-                cp -L bazel-bin/"$target"/*.node "ci-natives/$target/"
-              done
-              ls -l ci-natives/*/
-
-         # A corrupt build must fail here, not as a dlopen error in every PR.
+         # A corrupt download must fail here, not as a dlopen error in every PR.
          - name: Smoke native addons
            if: steps.probe.outputs.cache-hit != 'true'
            shell: bash
            run: |
               set -euo pipefail
+              ls -l ci-natives/*/
               cat > "$RUNNER_TEMP/smoke-addons.js" <<'EOF'
               for (const f of process.argv.slice(2)) {
                const m = require(f);
@@ -183,27 +203,34 @@ jobs:
                 "$PWD/ci-natives/natives-linux-x64-baseline/pi_natives.linux-x64-baseline.node" \
                 "$PWD/ci-natives/natives-linux-x64-modern/pi_natives.linux-x64-modern.node"
 
-         # Same path spelling (`ci-natives`) and action version as the PR
-         # restore step in ci.yml: the cache version hashes the path list.
          - name: Save native addon cache entry
+           id: save
            if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && steps.probe.outputs.cache-hit != 'true'
            uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
            with:
               path: ci-natives
               key: ${{ steps.natives-key.outputs.key }}
 
-         # Keep the newest three entries (~150 MB) so PRs on slightly older
-         # upstream commits can still hit an exact key.
-         - name: Prune superseded native addon cache entries
-           if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && steps.probe.outputs.cache-hit != 'true'
-           continue-on-error: true
+   # Separate job so only this step holds `actions: write`. Keeps the newest
+   # two entries, as upstream does (each entry is about 120 MB compressed).
+   prune:
+      name: Prune superseded native addon cache entries
+      needs: seed
+      if: needs.seed.outputs.saved == 'true'
+      runs-on: ubuntu-22.04
+      timeout-minutes: 10
+      permissions:
+         actions: write
+      steps:
+         - name: Delete all but the newest two entries
            shell: bash
            env:
               GH_TOKEN: ${{ github.token }}
-              PREFIX: ${{ steps.natives-key.outputs.prefix }}
+              PREFIX: ${{ needs.seed.outputs.prefix }}
            run: |
+              set -euo pipefail
               gh cache list --repo "$GITHUB_REPOSITORY" --ref refs/heads/main --key "$PREFIX" \
-                  --sort created_at --order desc --limit 100 --json id --jq '.[3:][].id' \
+                  --sort created_at --order desc --limit 100 --json id --jq '.[2:][].id' \
                 | while read -r id; do
-                    gh cache delete "$id" --repo "$GITHUB_REPOSITORY" || true
-                  done || true
+                    gh cache delete "$id" --repo "$GITHUB_REPOSITORY"
+                  done
