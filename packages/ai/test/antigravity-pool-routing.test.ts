@@ -4,7 +4,7 @@
 // last, and among unmeasured ones the cooler primary window first. The real fix lives in
 // claude-quota-failover (`anti_models_from_pool` + `probe_model_only`), not here.
 import { describe, expect, test } from "bun:test";
-import { orderUsageRankedCandidates } from "../src/auth/rank";
+import { orderUsageRankedCandidates, type RankedOAuthCandidate } from "../src/auth/rank";
 
 type CandidateOptions = {
 	accountPriority?: number;
@@ -15,7 +15,7 @@ type CandidateOptions = {
 };
 
 /** One ranked candidate with the fields the comparator reads; defaults describe a measured, cool account. */
-function candidate(index: number, o: CandidateOptions = {}) {
+function candidate(index: number, o: CandidateOptions = {}): RankedOAuthCandidate {
 	return {
 		selection: {
 			credential: {
@@ -23,6 +23,7 @@ function candidate(index: number, o: CandidateOptions = {}) {
 				access: `token-${index}`,
 				refresh: `refresh-${index}`,
 				accountId: `acct-${index}`,
+				expires: 0,
 			},
 			index,
 		},
@@ -45,9 +46,9 @@ function candidate(index: number, o: CandidateOptions = {}) {
 	};
 }
 
-const chosen = (candidates: ReturnType<typeof candidate>[]): number => {
-	const ordered = orderUsageRankedCandidates(candidates as never, false);
-	return (ordered[0] as unknown as { selection: { index: number } }).selection.index;
+const chosen = (candidates: RankedOAuthCandidate[]): number => {
+	const ordered = orderUsageRankedCandidates(candidates, false);
+	return ordered[0].selection.index;
 };
 
 describe("Account ranking used by the Antigravity fleet fix", () => {
