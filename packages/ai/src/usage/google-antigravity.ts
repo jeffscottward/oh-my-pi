@@ -84,6 +84,10 @@ interface AntigravityEndpointResult {
 
 const DEFAULT_ENDPOINT = "https://daily-cloudcode-pa.googleapis.com";
 const FETCH_AVAILABLE_MODELS_PATH = "/v1internal:fetchAvailableModels";
+/** Quota endpoints in probe order. The daily host serves the client version OMP sends (a newer stamp
+ * answers "This version of Antigravity is no longer supported", measured 2026-11-25); with only the
+ * bare host here, no usage report came back for antigravity-cli at all. */
+const DEFAULT_ENDPOINTS = [DEFAULT_ENDPOINT, "https://daily-cloudcode-pa.sandbox.googleapis.com"] as const;
 const RETRIEVE_USER_QUOTA_SUMMARY_PATH = "/v1internal:retrieveUserQuotaSummary";
 /** `UsageReport.metadata.quotaSource` of reports built from `retrieveUserQuotaSummary`. */
 const QUOTA_SUMMARY_SOURCE = "quota-summary";
@@ -485,9 +489,8 @@ async function fetchAntigravityUsage(params: UsageFetchParams, ctx: UsageFetchCo
 	if (!accessToken) return null;
 
 	const baseUrl = params.baseUrl?.replace(/\/+$/, "");
-	const endpoints = baseUrl ? [baseUrl] : [DEFAULT_ENDPOINT, "https://daily-cloudcode-pa.sandbox.googleapis.com"];
 	const endpointRequest = {
-		endpoints,
+		endpoints: baseUrl ? [baseUrl] : DEFAULT_ENDPOINTS,
 		projectId: credential.projectId,
 		accessToken,
 		signal: params.signal,
@@ -664,7 +667,12 @@ export const antigravityUsageProvider: UsageProvider = {
 	id: "google-antigravity",
 	cacheVersion: 3,
 	fetchUsage: fetchAntigravityUsage,
-	supports: params => params.provider === "google-antigravity",
+	// Card agy-fleet-fallback (owner 2026-11-25): the same Antigravity OAuth accounts also back the
+	// `antigravity-cli` provider (ACP over the official agy CLI) against the same Cloud Code Assist
+	// project, and `fetchAntigravityUsage` reads fetchAvailableModels per credential, which both serve.
+	// Without a usage report there, account ranking carried no numbers and two accounts could not be
+	// balanced: every request went to one drained account while the other held 90% of its Gemini quota.
+	supports: params => params.provider === "google-antigravity" || params.provider === "antigravity-cli",
 };
 
 /** Map an Antigravity model id to its backend quota-counter key. */

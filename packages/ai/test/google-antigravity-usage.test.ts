@@ -645,4 +645,16 @@ describe("antigravity ranking strategy", () => {
 		expect(primary).toBeUndefined();
 		expect(secondary).toBeUndefined();
 	});
+	// Card agy-fleet-fallback (owner 2026-11-25): the `antigravity-cli` provider shares these OAuth
+	// accounts; without a usage provider its ranked candidates carried no numbers and two accounts could
+	// not be balanced (every request went to one drained account).
+	it("serves usage for the antigravity-cli provider from the same accounts", () => {
+		expect(antigravityUsageProvider.supports?.({ provider: "antigravity-cli", credential: makeCredential() })).toBe(
+			true,
+		);
+		expect(
+			antigravityUsageProvider.supports?.({ provider: "google-antigravity", credential: makeCredential() }),
+		).toBe(true);
+		expect(antigravityUsageProvider.supports?.({ provider: "anthropic", credential: makeCredential() })).toBe(false);
+	});
 });
