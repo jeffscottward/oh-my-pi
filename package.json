@@ -199,11 +199,10 @@
   "devDependencies": {
     "@biomejs/biome": "catalog:",
     "@types/bun": "catalog:",
-    "@typescript/native-preview": "catalog:",
+    "tsrs": "^0.23.0-ts7.1.0-beta",
     "lint-staged": "catalog:",
     "prettier": "catalog:",
-    "ts-morph": "catalog:",
-    "typescript": "catalog:"
+    "ts-morph": "catalog:"
   },
   "lint-staged": {
     "*.{js,ts,jsx,tsx,json,jsonc,css}": "biome check --write --no-errors-on-unmatched"

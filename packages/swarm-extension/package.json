@@ -25,7 +25,7 @@
   },
   "scripts": {
     "check": "biome check . && bun run check:types",
-    "check:types": "tsgo -p tsconfig.json --noEmit",
+    "check:types": "tsrs -p tsconfig.json --noEmit",
     "lint": "biome lint .",
     "fix": "biome check --write --unsafe .",
     "fmt": "biome format --write ."
