@@ -1,0 +1,47 @@
+# Fork-only: check the CI flake retry that scripts/ci-test-ts.ts calls after its
+# test pool ends (scripts/fork-ci-flake-retry.ts).
+#
+# Upstream CI runs no scripts/*.test.ts file, so without this job nothing would
+# notice when an upstream sync or a new bun release changes the bun output that
+# the retry reads (the `(fail)` markers, the `N fail` / `N error` summary, the
+# junit report). Each test here runs real `bun test` fixtures; it needs bun and
+# no workspace packages or native addons.
+name: Fork CI flake retry
+
+on:
+   pull_request:
+      branches: [main]
+      paths:
+         - ".github/workflows/fork-ci-flake-retry.yml"
+         - "scripts/ci-test-ts.ts"
+         - "scripts/fork-ci-flake-retry.ts"
+         - "scripts/fork-ci-flake-retry.test.ts"
+         - "package.json"
+         - "bunfig.toml"
+   push:
+      branches: [main]
+      paths:
+         - ".github/workflows/fork-ci-flake-retry.yml"
+         - "scripts/ci-test-ts.ts"
+         - "scripts/fork-ci-flake-retry.ts"
+         - "scripts/fork-ci-flake-retry.test.ts"
+         - "package.json"
+         - "bunfig.toml"
+
+permissions:
+   contents: read
+
+concurrency:
+   group: fork-ci-flake-retry-${{ github.ref }}
+   cancel-in-progress: true
+
+jobs:
+   contract:
+      name: Fork CI flake retry contract
+      runs-on: ubuntu-22.04
+      timeout-minutes: 10
+      steps:
+         - uses: actions/checkout@v4
+         - uses: ./.github/actions/bun-install
+         - name: Test the retry contract
+           run: bun test scripts/fork-ci-flake-retry.test.ts
