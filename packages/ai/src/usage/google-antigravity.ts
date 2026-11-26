@@ -1,6 +1,7 @@
 import { quotaTierFor } from "@oh-my-pi/pi-catalog/compat/behavior";
 import { getAntigravityHeaders } from "@oh-my-pi/pi-catalog/wire/gemini-headers";
 import * as AIError from "../error";
+import { ANTIGRAVITY_LOAD_CODE_ASSIST_METADATA } from "../registry/oauth/google-antigravity";
 import type {
 	CredentialRankingContext,
 	CredentialRankingStrategy,
@@ -72,7 +73,7 @@ interface AntigravityQuotaSummaryResponse {
 interface AntigravityEndpointRequest {
 	endpoints: readonly string[];
 	path: string;
-	projectId: string;
+	body: Record<string, unknown>;
 	accessToken: string;
 	signal?: AbortSignal;
 }
@@ -84,10 +85,9 @@ interface AntigravityEndpointResult {
 
 const DEFAULT_ENDPOINT = "https://daily-cloudcode-pa.googleapis.com";
 const FETCH_AVAILABLE_MODELS_PATH = "/v1internal:fetchAvailableModels";
-/** Quota endpoints in probe order. The daily host serves the client version OMP sends (a newer stamp
- * answers "This version of Antigravity is no longer supported", measured 2026-11-25); with only the
- * bare host here, no usage report came back for antigravity-cli at all. */
+/** Quota endpoints in probe order. */
 const DEFAULT_ENDPOINTS = [DEFAULT_ENDPOINT, "https://daily-cloudcode-pa.sandbox.googleapis.com"] as const;
+const LOAD_CODE_ASSIST_PATH = "/v1internal:loadCodeAssist";
 const RETRIEVE_USER_QUOTA_SUMMARY_PATH = "/v1internal:retrieveUserQuotaSummary";
 /** `UsageReport.metadata.quotaSource` of reports built from `retrieveUserQuotaSummary`. */
 const QUOTA_SUMMARY_SOURCE = "quota-summary";
@@ -449,7 +449,7 @@ async function fetchAntigravityEndpoint(
 					"Content-Type": "application/json",
 					...getAntigravityHeaders(),
 				},
-				body: JSON.stringify({ project: request.projectId }),
+				body: JSON.stringify(request.body),
 				signal: request.signal,
 			});
 		} catch (error) {
@@ -479,22 +479,59 @@ function resolveAccessToken(params: UsageFetchParams): string | undefined {
 	return credential.accessToken;
 }
 
+/** Cloud Code Assist projects found by {@link resolveProjectId}, keyed by account. */
+const discoveredProjects = new Map<string, string>();
+
+/**
+ * The Cloud Code Assist project to read quota for. `google-antigravity` stores the project at login.
+ * `antigravity-cli` stores agy's own OAuth grant, which has no project, so ask `loadCodeAssist` for
+ * the project the account already has. This call only reads: it never onboards an account.
+ */
+async function resolveProjectId(
+	params: UsageFetchParams,
+	request: Omit<AntigravityEndpointRequest, "path" | "body">,
+	ctx: UsageFetchContext,
+): Promise<string | undefined> {
+	const { credential } = params;
+	if (credential.projectId) return credential.projectId;
+	const accountKey = credential.accountId ?? credential.email;
+	const known = accountKey ? discoveredProjects.get(accountKey) : undefined;
+	if (known) return known;
+
+	const { response } = await fetchAntigravityEndpoint(
+		{ ...request, path: LOAD_CODE_ASSIST_PATH, body: { metadata: ANTIGRAVITY_LOAD_CODE_ASSIST_METADATA } },
+		ctx,
+	);
+	if (!response?.ok) {
+		ctx.logger?.warn("Antigravity project lookup failed", {
+			provider: params.provider,
+			status: response?.status ?? 0,
+		});
+		return undefined;
+	}
+	const payload = (await response.json()) as { cloudaicompanionProject?: unknown };
+	const projectId = payload.cloudaicompanionProject;
+	if (typeof projectId !== "string" || projectId.length === 0) return undefined;
+	if (accountKey) discoveredProjects.set(accountKey, projectId);
+	return projectId;
+}
+
 async function fetchAntigravityUsage(params: UsageFetchParams, ctx: UsageFetchContext): Promise<UsageReport | null> {
 	const credential = params.credential;
-	if (!credential.projectId) return null;
-
 	const nowMs = Date.now();
 
 	const accessToken = resolveAccessToken(params);
 	if (!accessToken) return null;
 
 	const baseUrl = params.baseUrl?.replace(/\/+$/, "");
-	const endpointRequest = {
+	const connection = {
 		endpoints: baseUrl ? [baseUrl] : DEFAULT_ENDPOINTS,
-		projectId: credential.projectId,
 		accessToken,
 		signal: params.signal,
 	};
+	const projectId = await resolveProjectId(params, connection, ctx);
+	if (!projectId) return null;
+	const endpointRequest = { ...connection, body: { project: projectId } };
 
 	// This is the endpoint Antigravity's own quota UI uses. Unlike the legacy
 	// model catalog response, it reports both the rolling five-hour and weekly
@@ -505,7 +542,12 @@ async function fetchAntigravityUsage(params: UsageFetchParams, ctx: UsageFetchCo
 	);
 	if (summaryResult.response?.ok) {
 		const summaryData = (await summaryResult.response.json()) as AntigravityQuotaSummaryResponse;
-		const summaryReport = buildQuotaSummaryReport(summaryData, params, summaryResult.endpoint, nowMs);
+		const summaryReport = buildQuotaSummaryReport(
+			summaryData,
+			{ ...params, credential: { ...credential, projectId } },
+			summaryResult.endpoint,
+			nowMs,
+		);
 		if (summaryReport) return summaryReport;
 	}
 
@@ -629,7 +671,7 @@ async function fetchAntigravityUsage(params: UsageFetchParams, ctx: UsageFetchCo
 			scope: {
 				provider: params.provider,
 				accountId: credential.accountId,
-				projectId: credential.projectId,
+				projectId,
 				tier: entry.tier,
 				windowId: entry.windowId,
 			},
@@ -647,7 +689,7 @@ async function fetchAntigravityUsage(params: UsageFetchParams, ctx: UsageFetchCo
 
 	const metadata: UsageReport["metadata"] = {
 		endpoint: successfulEndpoint,
-		projectId: credential.projectId,
+		projectId,
 	};
 	if (credential.email) metadata.email = credential.email;
 	if (credential.accountId) metadata.accountId = credential.accountId;
@@ -667,12 +709,19 @@ export const antigravityUsageProvider: UsageProvider = {
 	id: "google-antigravity",
 	cacheVersion: 3,
 	fetchUsage: fetchAntigravityUsage,
-	// Card agy-fleet-fallback (owner 2026-11-25): the same Antigravity OAuth accounts also back the
-	// `antigravity-cli` provider (ACP over the official agy CLI) against the same Cloud Code Assist
-	// project, and `fetchAntigravityUsage` reads fetchAvailableModels per credential, which both serve.
-	// Without a usage report there, account ranking carried no numbers and two accounts could not be
-	// balanced: every request went to one drained account while the other held 90% of its Gemini quota.
-	supports: params => params.provider === "google-antigravity" || params.provider === "antigravity-cli",
+	supports: params => params.provider === "google-antigravity",
+};
+
+/**
+ * Usage for `antigravity-cli` (ACP over the official agy CLI). Its accounts draw on the same Cloud
+ * Code Assist quota as `google-antigravity`. Without a report, account ranking had no numbers and
+ * sent every request to one drained account while another still had quota.
+ */
+export const antigravityCliUsageProvider: UsageProvider = {
+	id: "antigravity-cli",
+	cacheVersion: 1,
+	fetchUsage: fetchAntigravityUsage,
+	supports: params => params.provider === "antigravity-cli",
 };
 
 /** Map an Antigravity model id to its backend quota-counter key. */

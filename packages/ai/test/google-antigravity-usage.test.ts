@@ -12,6 +12,7 @@ import {
 	antigravityUsageProvider,
 	scopeAntigravityLimitsForModel,
 } from "@oh-my-pi/pi-ai/usage/google-antigravity";
+import { defaultRankingStrategy, defaultUsageProvider } from "@oh-my-pi/pi-ai/usage/registry";
 
 const accessTokenFixture = (() => {
 	const header = Buffer.from(JSON.stringify({ alg: "none", typ: "JWT" })).toString("base64url");
@@ -560,16 +561,89 @@ describe("antigravity usage provider", () => {
 		expect(report!.limits[2]!.amount.remainingFraction).toBe(0.9);
 	});
 
-	it("returns null when credential has no projectId", async () => {
+	it("returns null without a quota request when the account has no Cloud Code Assist project", async () => {
+		const requestedUrls: string[] = [];
+		const fetchImpl: FetchImpl = async input => {
+			requestedUrls.push(String(input));
+			return Response.json({});
+		};
 		const report = await antigravityUsageProvider.fetchUsage!(
 			{
 				provider: "google-antigravity",
-				credential: makeCredential({ projectId: undefined }),
+				credential: makeCredential({ projectId: undefined, accountId: "acct-no-project" }),
 				signal: undefined,
 			},
-			makeCtx(),
+			makeCtx(fetchImpl),
 		);
 		expect(report).toBeNull();
+		expect(requestedUrls).toEqual(["https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"]);
+	});
+});
+
+// Card agy-fleet-fallback (owner 2026-11-25): `antigravity-cli` accounts had no usage provider, so
+// account ranking had no numbers and sent every request to one drained account.
+describe("antigravity-cli usage", () => {
+	it("reads quota for the project loadCodeAssist names, once per account, and ranks by it", async () => {
+		const requests: { url: string; body: unknown }[] = [];
+		const fetchImpl: FetchImpl = async (input, init) => {
+			const url = String(input);
+			requests.push({ url, body: JSON.parse(String(init?.body)) });
+			if (url.endsWith(":loadCodeAssist")) return Response.json({ cloudaicompanionProject: "agy-project" });
+			return Response.json({
+				groups: [
+					{
+						displayName: "Gemini Models",
+						buckets: [
+							{
+								bucketId: "gemini-weekly",
+								displayName: "Weekly Limit Remaining",
+								window: "weekly",
+								remainingFraction: 0.9,
+								resetTime: "2026-09-10T00:00:00Z",
+							},
+							{
+								bucketId: "gemini-5h",
+								displayName: "Five Hour Limit Remaining",
+								window: "5h",
+								remainingFraction: 0.014,
+								resetTime: "2026-09-03T12:00:00Z",
+							},
+						],
+					},
+				],
+			});
+		};
+		const provider = defaultUsageProvider("antigravity-cli");
+		const fetchParams = {
+			provider: "antigravity-cli",
+			credential: makeCredential({ projectId: undefined, accountId: "acct-agy" }),
+			signal: undefined,
+		} satisfies UsageFetchParams;
+		expect(provider?.supports?.(fetchParams)).toBeTrue();
+
+		const report = await provider!.fetchUsage!(fetchParams, makeCtx(fetchImpl));
+		await provider!.fetchUsage!(fetchParams, makeCtx(fetchImpl));
+
+		expect(requests).toEqual([
+			{
+				url: "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+				body: { metadata: { ideType: "ANTIGRAVITY" } },
+			},
+			{
+				url: "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+				body: { project: "agy-project" },
+			},
+			{
+				url: "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+				body: { project: "agy-project" },
+			},
+		]);
+		expect(report?.provider).toBe("antigravity-cli");
+		const { primary } = defaultRankingStrategy("antigravity-cli")!.findWindowLimits(report!, {
+			modelId: "gemini-3.8-flash",
+		});
+		expect(primary?.scope.windowId).toBe("5h");
+		expect(primary?.amount.remainingFraction).toBeCloseTo(0.014);
 	});
 });
 
@@ -644,17 +718,5 @@ describe("antigravity ranking strategy", () => {
 		const { primary, secondary } = antigravityRankingStrategy.findWindowLimits(report);
 		expect(primary).toBeUndefined();
 		expect(secondary).toBeUndefined();
-	});
-	// Card agy-fleet-fallback (owner 2026-11-25): the `antigravity-cli` provider shares these OAuth
-	// accounts; without a usage provider its ranked candidates carried no numbers and two accounts could
-	// not be balanced (every request went to one drained account).
-	it("serves usage for the antigravity-cli provider from the same accounts", () => {
-		expect(antigravityUsageProvider.supports?.({ provider: "antigravity-cli", credential: makeCredential() })).toBe(
-			true,
-		);
-		expect(
-			antigravityUsageProvider.supports?.({ provider: "google-antigravity", credential: makeCredential() }),
-		).toBe(true);
-		expect(antigravityUsageProvider.supports?.({ provider: "anthropic", credential: makeCredential() })).toBe(false);
 	});
 });

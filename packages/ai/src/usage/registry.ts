@@ -9,7 +9,11 @@ import { cursorRankingStrategy, cursorUsageProvider } from "./cursor";
 import { devinRankingStrategy, devinUsageProvider } from "./devin";
 import { factoryDroidRankingStrategy, factoryDroidUsageProvider } from "./factory-droid";
 import { githubCopilotUsageProvider } from "./github-copilot";
-import { antigravityRankingStrategy, antigravityUsageProvider } from "./google-antigravity";
+import {
+	antigravityCliUsageProvider,
+	antigravityRankingStrategy,
+	antigravityUsageProvider,
+} from "./google-antigravity";
 import { kimiRankingStrategy, kimiUsageProvider } from "./kimi";
 import { kiroRankingStrategy, kiroUsageProvider } from "./kiro";
 import { museCodeUsageProvider } from "./muse-code";
@@ -33,6 +37,7 @@ export const DEFAULT_USAGE_PROVIDERS: readonly UsageProvider[] = [
 	minimaxCodeUsageProvider,
 	museCodeUsageProvider,
 	antigravityUsageProvider,
+	antigravityCliUsageProvider,
 	ollamaUsageProvider,
 	factoryDroidUsageProvider,
 	ollamaCloudUsageProvider,
@@ -66,6 +71,7 @@ const DEFAULT_RANKING_STRATEGIES = new Map<Provider, CredentialRankingStrategy>(
 	["anthropic", claudeRankingStrategy],
 	["cursor", cursorRankingStrategy],
 	["google-antigravity", antigravityRankingStrategy],
+	["antigravity-cli", antigravityRankingStrategy],
 	["factory-droid", factoryDroidRankingStrategy],
 	["kimi-code", kimiRankingStrategy],
 	["zai", zaiRankingStrategy],
