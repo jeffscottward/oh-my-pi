@@ -716,11 +716,15 @@ export const antigravityUsageProvider: UsageProvider = {
  * Usage for `antigravity-cli` (ACP over the official agy CLI). Its accounts draw on the same Cloud
  * Code Assist quota as `google-antigravity`. Without a report, account ranking had no numbers and
  * sent every request to one drained account while another still had quota.
+ *
+ * The provider's model `baseUrl` is the agy ACP host, not a Cloud Code Assist API, so it is
+ * dropped: quota always goes to the Cloud Code Assist endpoints, and the account's token never
+ * goes to the ACP host.
  */
 export const antigravityCliUsageProvider: UsageProvider = {
 	id: "antigravity-cli",
-	cacheVersion: 1,
-	fetchUsage: fetchAntigravityUsage,
+	cacheVersion: 2,
+	fetchUsage: (params, ctx) => fetchAntigravityUsage({ ...params, baseUrl: undefined }, ctx),
 	supports: params => params.provider === "antigravity-cli",
 };
 

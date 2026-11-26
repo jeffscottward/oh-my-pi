@@ -614,9 +614,11 @@ describe("antigravity-cli usage", () => {
 			});
 		};
 		const provider = defaultUsageProvider("antigravity-cli");
+		// The model registry passes the catalog baseUrl (the agy ACP host) on every real call path.
 		const fetchParams = {
 			provider: "antigravity-cli",
 			credential: makeCredential({ projectId: undefined, accountId: "acct-agy" }),
+			baseUrl: "https://antigravity.google",
 			signal: undefined,
 		} satisfies UsageFetchParams;
 		expect(provider?.supports?.(fetchParams)).toBeTrue();
