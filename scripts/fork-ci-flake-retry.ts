@@ -87,8 +87,11 @@ const TEST_FILE_RE = /\.test\.[cm]?[jt]sx?$/;
 const FAIL_COUNT_RE = /^\s*(\d+) fail\s*$/gm;
 const ERROR_COUNT_RE = /^\s*(\d+) errors?\s*$/gm;
 const UNHANDLED_ERROR_RE = /Unhandled error/;
-// A bun `--parallel` worker that dies after a test failed prints this and still exits 1.
-const CRASH_RE = /worker crashed|Bun has crashed|panic\(/;
+// A bun `--parallel` worker that dies after a test failed prints these and still exits 1.
+// Kept specific: test sources quote `worker crashed: <message>` (subagent workers).
+const CRASH_RE = /\(worker crashed: SIG|a test worker process crashed|Bun has crashed|panic\(main thread\)/;
+// Bun names a failed `beforeAll`/`afterAll` hook `<file> > <describes> > (unnamed)`.
+const HOOK_FAILURE_SUFFIX = " > (unnamed)";
 const JUNIT_TESTCASE_RE = /<testcase\b([^>]*?)(\/>|>([\s\S]*?)<\/testcase>)/g;
 const XML_ATTR_RE = /([\w:-]+)="([^"]*)"/g;
 const XML_ENTITY_RE = /&(?:#(\d+)|#x([0-9a-fA-F]+)|(amp|lt|gt|quot|apos));/g;
@@ -221,24 +224,38 @@ async function runOnce(
 	return { exitCode, timedOut };
 }
 
-/** Why a retried file does not count as passed, or undefined when it does. */
+/**
+ * Whether the junit report proves that `test` passed. A failed `beforeAll`/`afterAll` hook
+ * has no junit test case of its own; it counts as proven when a test under the same
+ * describe passed, because the hook runs before (or after) that test.
+ */
+function provenPassed(test: string, passed: Set<string>): boolean {
+	if (passed.has(test)) return true;
+	if (!test.endsWith(HOOK_FAILURE_SUFFIX)) return false;
+	const scope = `${test.slice(0, -HOOK_FAILURE_SUFFIX.length)} > `;
+	return [...passed].some(name => name.startsWith(scope));
+}
+
+/** Why a retried file does not count as passed (a log phrase), or undefined when it does. */
 async function retryVerdict(
 	result: { exitCode: number; timedOut: boolean },
 	junitPath: string,
 	tests: string[],
 	timeoutMs: number,
 ): Promise<string | undefined> {
-	if (result.timedOut) return `killed after ${Math.round(timeoutMs / 1000)}s`;
-	if (result.exitCode !== 0) return `exit ${result.exitCode}`;
+	if (result.timedOut) return `failed again on retry (killed after ${Math.round(timeoutMs / 1000)}s)`;
+	if (result.exitCode !== 0) return `failed again on retry (exit ${result.exitCode})`;
 	let xml: string;
 	try {
 		xml = await Bun.file(junitPath).text();
 	} catch {
-		return "it wrote no junit report";
+		return "exited 0 on retry but wrote no junit report";
 	}
 	const passed = passedTestsInJunit(xml);
-	const missing = tests.filter(test => !passed.has(test));
-	return missing.length > 0 ? `its junit report does not list as passed: ${missing.join("; ")}` : undefined;
+	const missing = tests.filter(test => !provenPassed(test, passed));
+	return missing.length > 0
+		? `exited 0 on retry, but its junit report does not list as passed: ${missing.join("; ")}`
+		: undefined;
 }
 
 /**
@@ -259,9 +276,10 @@ export async function retryFailedTestFiles<T extends FailedChunk>(options: Retry
 
 	const annotate = parentEnv.GITHUB_ACTIONS === "true";
 	const timeoutMs = Math.min(options.timeoutMs, RETRY_FILE_TIMEOUT_MS);
-	const junitDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-flake-retry-"));
 	const recovered = new Set<T>();
+	let junitDir: string | undefined;
 	try {
+		junitDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-flake-retry-"));
 		let index = 0;
 		for (const retry of plan.retries) {
 			let allPassed = true;
@@ -291,7 +309,7 @@ export async function retryFailedTestFiles<T extends FailedChunk>(options: Retry
 					}
 				} else {
 					allPassed = false;
-					log(`✗ ${shown} failed again on retry (${reason}) [${seconds}s]`);
+					log(`✗ ${shown} ${reason} [${seconds}s]`);
 				}
 			}
 			if (allPassed) {
@@ -301,8 +319,12 @@ export async function retryFailedTestFiles<T extends FailedChunk>(options: Retry
 				log(`✗ ${retry.failure.label}: still failing after retry`);
 			}
 		}
+	} catch (error) {
+		// The runner must still print its summary and set the exit code: keep every failure.
+		log(`✗ fork flake retry stopped: ${error instanceof Error ? error.message : String(error)}`);
+		return failures;
 	} finally {
-		await fs.rm(junitDir, { recursive: true, force: true });
+		if (junitDir) await fs.rm(junitDir, { recursive: true, force: true });
 	}
 	return failures.filter(failure => !recovered.has(failure));
 }

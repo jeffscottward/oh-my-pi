@@ -79,6 +79,21 @@ test("crashes the worker", () => {
 });
 `;
 
+const HOOK_FAILS_ON_FIRST_RUN = `import { beforeAll, describe, expect, test } from "bun:test";
+import * as fs from "node:fs";
+describe("server suite", () => {
+	beforeAll(() => {
+		const marker = \`\${process.env.FLAKE_DIR}/\${import.meta.file}.ran\`;
+		const firstRun = !fs.existsSync(marker);
+		fs.writeFileSync(marker, "");
+		if (firstRun) throw new Error("server did not start in time");
+	});
+	test("answers", () => {
+		expect(1).toBe(1);
+	});
+});
+`;
+
 interface Fixture {
 	dir: string;
 	env: Record<string, string | undefined>;
@@ -167,6 +182,20 @@ test("a retry that exits 0 without running the failed test keeps the chunk faile
 		"its junit report does not list as passed: test/flaky.test.ts > flaky suite > a test in another file",
 	);
 	expect(log).not.toContain("::warning");
+});
+
+test("a flaky beforeAll hook recovers its chunk only when a test under it passes on retry", async () => {
+	const fixture = await failedChunk({ "hook.test.ts": HOOK_FAILS_ON_FIRST_RUN });
+	expect(fixture.failure.output).toContain("(fail) server suite > (unnamed)");
+
+	const { remaining } = await retry(fixture, PR_RUN);
+	expect(remaining).toEqual([]);
+
+	// The same hook failure named under a describe that has no passing test stays unproven.
+	const output = fixture.failure.output.replace("(fail) server suite > (unnamed)", "(fail) other suite > (unnamed)");
+	const elsewhere = await retry({ ...fixture, failure: { ...fixture.failure, output } }, PR_RUN);
+	expect(elsewhere.remaining).toEqual(elsewhere.failures);
+	expect(elsewhere.log).toContain("exited 0 on retry, but its junit report does not list as passed");
 });
 
 test("failures bun cannot pin to one test in a test file are never retried", async () => {
