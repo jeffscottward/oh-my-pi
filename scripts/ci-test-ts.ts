@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { isEnoent } from "@oh-my-pi/pi-utils/fs-error";
+import { retryFailedTestFiles } from "./fork-ci-flake-retry";
 
 type Mode =
 	| "all"
@@ -1279,6 +1280,19 @@ async function runTestCommandsInParallel(
 
 	const runStartedAt = performance.now();
 	await Promise.all(Array.from({ length: concurrency }, () => worker()));
+	// Fork-only (jeffscottward/oh-my-pi): retry each failing test file once, alone; see fork-ci-flake-retry.ts.
+	failures.splice(
+		0,
+		failures.length,
+		...(await retryFailedTestFiles({
+			failures,
+			commands,
+			env,
+			repoRoot,
+			extractFailingTests,
+			timeoutMs: chunkTimeoutMs(),
+		})),
+	);
 
 	process.stdout.write(formatSlowTests(runs));
 
