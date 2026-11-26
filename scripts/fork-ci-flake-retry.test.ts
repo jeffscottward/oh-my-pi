@@ -79,6 +79,15 @@ test("crashes the worker", () => {
 });
 `;
 
+const FAILS_THEN_EXITS_WORKER = `import { expect, test } from "bun:test";
+test("fails before the exit", () => {
+	expect(1).toBe(2);
+});
+test("exits the worker", () => {
+	process.exit(1);
+});
+`;
+
 const HOOK_FAILS_ON_FIRST_RUN = `import { beforeAll, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 describe("server suite", () => {
@@ -204,12 +213,14 @@ test("failures bun cannot pin to one test in a test file are never retried", asy
 		"import-error.test.ts": THROWS_AT_IMPORT,
 	});
 	const workerCrash = await failedChunk({ "crash.test.ts": FAILS_THEN_CRASHES_WORKER, "steady.test.ts": PASSES });
+	const workerExit = await failedChunk({ "exit.test.ts": FAILS_THEN_EXITS_WORKER, "steady.test.ts": PASSES });
 	const watchdogKill = await failedChunk({ "flaky.test.ts": FAILS_ON_FIRST_RUN });
 	watchdogKill.failure = { ...watchdogKill.failure, exitCode: 137 };
-	// Bun exits 1 and counts one failure for the crashed worker, so only its crash notice tells it apart.
+	// Bun exits 1 and counts one failure for a crashed or exited worker, so only its crash notice tells it apart.
 	expect(workerCrash.failure.exitCode).toBe(1);
+	expect(workerExit.failure.exitCode).toBe(1);
 
-	for (const fixture of [importError, workerCrash, watchdogKill]) {
+	for (const fixture of [importError, workerCrash, workerExit, watchdogKill]) {
 		const { remaining, failures, log } = await retry(fixture, PR_RUN);
 		expect(remaining).toEqual(failures);
 		expect(log).not.toContain("==> retry");

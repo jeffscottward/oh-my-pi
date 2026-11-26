@@ -88,8 +88,10 @@ const FAIL_COUNT_RE = /^\s*(\d+) fail\s*$/gm;
 const ERROR_COUNT_RE = /^\s*(\d+) errors?\s*$/gm;
 const UNHANDLED_ERROR_RE = /Unhandled error/;
 // A bun `--parallel` worker that dies after a test failed prints these and still exits 1.
-// Kept specific: test sources quote `worker crashed: <message>` (subagent workers).
-const CRASH_RE = /\(worker crashed: SIG|a test worker process crashed|Bun has crashed|panic\(main thread\)/;
+// Kept specific: test sources quote `worker crashed: <message>`, never `(worker crashed: `.
+// Bun prints `(worker crashed: SIGSEGV)` for a signal and `(worker crashed: exit code N)`
+// for a worker that called process.exit.
+const CRASH_RE = /\(worker crashed: |a test worker process crashed|Bun has crashed|panic\(main thread\)/;
 // Bun names a failed `beforeAll`/`afterAll` hook `<file> > <describes> > (unnamed)`.
 const HOOK_FAILURE_SUFFIX = " > (unnamed)";
 const JUNIT_TESTCASE_RE = /<testcase\b([^>]*?)(\/>|>([\s\S]*?)<\/testcase>)/g;
@@ -320,11 +322,14 @@ export async function retryFailedTestFiles<T extends FailedChunk>(options: Retry
 			}
 		}
 	} catch (error) {
-		// The runner must still print its summary and set the exit code: keep every failure.
-		log(`✗ fork flake retry stopped: ${error instanceof Error ? error.message : String(error)}`);
+		// The runner must still print its summary and set the exit code: keep every failure,
+		// also chunks logged as passed above.
+		log(
+			`✗ fork flake retry stopped, every failure is kept: ${error instanceof Error ? error.message : String(error)}`,
+		);
 		return failures;
 	} finally {
-		if (junitDir) await fs.rm(junitDir, { recursive: true, force: true });
+		if (junitDir) await fs.rm(junitDir, { recursive: true, force: true }).catch(() => {});
 	}
 	return failures.filter(failure => !recovered.has(failure));
 }
