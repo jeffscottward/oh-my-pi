@@ -1,5 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
-import * as path from "node:path";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -7,18 +6,21 @@ import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import type { ExtensionEvent } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import type { AgentEndEvent } from "@oh-my-pi/pi-coding-agent/extensibility/shared-events";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { TempDir, withTimeout } from "@oh-my-pi/pi-utils";
+import { TodoTool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { TempDir } from "@oh-my-pi/pi-utils";
+import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
 /**
- * Regression coverage for the `#hasPendingAsyncWake()` gate shared by the
- * stop-time passes in the `agent_end` settle path: a background async job
- * (bash/task) owned by this agent re-wakes the loop when it completes — its
- * result delivery enqueues an async-result follow-up that continues the run,
- * and the stop-time passes re-run at that settle. A text-only stop with such a
- * job in flight is a scheduling pause, not a terminal stop, so both:
+ * Regression coverage for the wake-source gate shared by the stop-time passes
+ * of loop-end routing: a background async job (bash/task) owned by this agent
+ * re-wakes the run when it completes — its result delivery enqueues an
+ * async-result follow-up that continues the run, and the stop-time passes
+ * re-run at that loop's end. A text-only stop with such a job in flight pauses
+ * the run instead of ending it, so both:
  *
  * - the todo reminder (`todo_reminder` event + injected `<system-reminder>`
  *   continuation in `#checkTodoCompletion`), and
@@ -47,19 +49,26 @@ import { TempDir, withTimeout } from "@oh-my-pi/pi-utils";
  * the same way — so once `waitForIdle()` resolves, the settle has definitively
  * decided whether to fire the stop-time passes. No wall-clock sleeps needed.
  */
+const sharedAuthStorage = createInMemoryAuthStorage();
+sharedAuthStorage.keys.setRuntime("anthropic", "test-key");
+const sharedModelRegistry = new ModelRegistry(sharedAuthStorage);
+
+afterAll(() => {
+	sharedAuthStorage.close();
+});
+
 describe("AgentSession todo reminder async-job deferral", () => {
 	let tempDir: TempDir;
 	let session: AgentSession;
 	let sessionManager: SessionManager;
-	let authStorage: AuthStorage;
-	let modelRegistry: ModelRegistry;
 	let manager: AsyncJobManager;
 	let extensionRunner: ExtensionRunner;
+	let extensionEnds: AgentEndEvent[];
 	let gates: Array<PromiseWithResolvers<string>>;
 	let reminderAttempts: number[];
-	let firstReminderPromise: Promise<void>;
-	let agentEndTerminalStates: Array<boolean | undefined>;
-	let resolveFirstReminder: () => void;
+	/** `yielded` of every `agent_pause`. */
+	let pauses: boolean[];
+	let agentEnds: number;
 
 	function textOnlyAssistantMessage(): AssistantMessage {
 		return {
@@ -108,16 +117,16 @@ describe("AgentSession todo reminder async-job deferral", () => {
 		]);
 	}
 
-	beforeEach(async () => {
+	beforeEach(() => {
 		tempDir = TempDir.createSync("@pi-todo-reminder-async-jobs-");
-		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
-		authStorage.setRuntimeApiKey("anthropic", "test-key");
-		modelRegistry = new ModelRegistry(authStorage);
-		sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
+		sessionManager = SessionManager.inMemory(tempDir.path());
 		manager = new AsyncJobManager({});
 		gates = [];
+		extensionEnds = [];
 		extensionRunner = {
-			emit: vi.fn().mockResolvedValue(undefined),
+			emit: vi.fn(async (event: ExtensionEvent) => {
+				if (event.type === "agent_end") extensionEnds.push(event);
+			}),
 			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
 			hasHandlers: vi.fn((eventType: string) => eventType === "session_stop"),
 			emitSessionStop: vi.fn().mockResolvedValue(undefined),
@@ -126,11 +135,25 @@ describe("AgentSession todo reminder async-job deferral", () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected built-in anthropic model to exist");
 
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"todo.enabled": true,
+			"todo.reminders": true,
+			"todo.remindersMax": 3,
+		});
+		const toolSession: ToolSession = {
+			cwd: tempDir.path(),
+			hasUI: false,
+			getSessionFile: () => sessionManager.getSessionFile() ?? null,
+			getSessionSpawns: () => "*",
+			settings,
+		};
+
 		const agent = new Agent({
 			initialState: {
 				model,
 				systemPrompt: ["Test"],
-				tools: [],
+				tools: [new TodoTool(toolSession)],
 				messages: [],
 			},
 		});
@@ -138,13 +161,8 @@ describe("AgentSession todo reminder async-job deferral", () => {
 		session = new AgentSession({
 			agent,
 			sessionManager,
-			settings: Settings.isolated({
-				"compaction.enabled": false,
-				"todo.enabled": true,
-				"todo.reminders": true,
-				"todo.remindersMax": 3,
-			}),
-			modelRegistry,
+			settings,
+			modelRegistry: sharedModelRegistry,
 			agentId: "Main",
 			asyncJobManager: manager,
 			extensionRunner,
@@ -154,18 +172,12 @@ describe("AgentSession todo reminder async-job deferral", () => {
 		manager.registerDeliverySink("Main", () => {});
 
 		reminderAttempts = [];
-		agentEndTerminalStates = [];
-		({ promise: firstReminderPromise, resolve: resolveFirstReminder } = Promise.withResolvers<void>());
+		pauses = [];
+		agentEnds = 0;
 		session.subscribe((event: AgentSessionEvent) => {
-			if (event.type === "todo_reminder") {
-				reminderAttempts.push(event.attempt);
-				if (reminderAttempts.length === 1) resolveFirstReminder();
-			}
-			if (event.type === "agent_end") {
-				agentEndTerminalStates.push(
-					(event as Extract<AgentSessionEvent, { type: "agent_end" }> & { isTerminal?: boolean }).isTerminal,
-				);
-			}
+			if (event.type === "todo_reminder") reminderAttempts.push(event.attempt);
+			if (event.type === "agent_pause") pauses.push(event.yielded);
+			if (event.type === "agent_end") agentEnds++;
 		});
 	});
 
@@ -175,7 +187,6 @@ describe("AgentSession todo reminder async-job deferral", () => {
 		await session.dispose();
 		manager.cancelAll();
 		await manager.dispose();
-		authStorage.close();
 		try {
 			await tempDir.remove();
 		} catch {}
@@ -192,7 +203,13 @@ describe("AgentSession todo reminder async-job deferral", () => {
 
 		expect(reminderAttempts).toEqual([]);
 		expect(continueSpy).not.toHaveBeenCalled();
-		expect(agentEndTerminalStates).toEqual([false]);
+		// The model yielded and only the job's result can resume the run: it pauses, open.
+		expect(pauses).toEqual([true]);
+		expect(agentEnds).toBe(0);
+		expect(session.isRunActive).toBe(true);
+		expect(session.wakeSources?.jobs).toHaveLength(1);
+		// Extensions keep their per-loop agent_end: this one continues, waiting on background work.
+		expect(extensionEnds).toEqual([expect.objectContaining({ willContinue: true, awaitingAsyncWork: true })]);
 	});
 
 	it("does not defer for a running job owned by a different agent", async () => {
@@ -201,9 +218,16 @@ describe("AgentSession todo reminder async-job deferral", () => {
 		registerGatedJob("OtherAgent");
 
 		emitTextOnlyStop();
-		await withTimeout(firstReminderPromise, 1000, "todo_reminder never fired");
+		await session.waitForIdle();
 
 		expect(reminderAttempts).toEqual([1]);
+		// The reminder is the agent's own continuation: the loop pauses without yielding. The
+		// mocked continue never starts a loop, so nothing is left and the run ends once.
+		expect(pauses).toEqual([false]);
+		expect(agentEnds).toBe(1);
+		// Extensions see the continuing loop, then the run's end.
+		expect(extensionEnds.map(event => event.willContinue)).toEqual([true, undefined]);
+		expect(extensionEnds[0]).not.toHaveProperty("awaitingAsyncWork");
 	});
 
 	it("fires the reminder on the next stop once the owned job completes and its delivery drains", async () => {
@@ -223,7 +247,7 @@ describe("AgentSession todo reminder async-job deferral", () => {
 		await manager.drainDeliveries();
 
 		emitTextOnlyStop();
-		await withTimeout(firstReminderPromise, 1000, "todo_reminder never fired after job drained");
+		await session.waitForIdle();
 
 		expect(reminderAttempts).toEqual([1]);
 	});

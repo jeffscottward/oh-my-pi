@@ -5,10 +5,14 @@ Native Rust functionality via N-API.
 ## What's Inside
 
 - **Grep**: Regex-based search powered by ripgrep's engine with native file walking and matching
-- **Find**: Glob-based file/directory discovery with gitignore support (pure TypeScript via `globPaths`)
+- **Find**: Native glob-based file/directory discovery with gitignore support
 - **SIXEL**: Terminal image encoding for SIXEL-capable terminals (decode, resize, encode in one pass)
 - **Audio**: Cross-platform low-latency microphone capture and gapless speaker playback
 - **WebRTC**: Native Opus media, SDP offer/answer negotiation, and data-channel events for live sessions
+- **File locking**: Process-owned cross-process locks with in-memory kernel names on Windows, open-file-description lock sidecars on Linux and `flock(2)` sidecars on other Unix platforms
+- **Local IPC**: `IpcServer`/`IpcConnection` over Unix sockets and Windows named pipes — owner-only access, single-instance binding with stale-endpoint takeover, newline or raw framing; `ipcEndpoint(dir, name)` names endpoints per platform
+- **PDF**: In-memory PDF-to-Markdown extraction with OCR-page classification via `pdf-inspector`
+- **Binary patches**: `applyBinaryPatch(oldPath, patchPath, outPath)` applies an HDiffPatch single-stream patch (HDIFFSF20, zstd or uncompressed), streaming from files; callers verify digests
 
 General-purpose image processing (decode/resize/encode for files and buffers)
 lives in [`Bun.Image`](https://bun.com/docs/runtime/image) on the JS side; this
@@ -18,7 +22,7 @@ that terminal protocol.
 ## Usage
 
 ```typescript
-import { grep, find, encodeSixel } from "@oh-my-pi/pi-natives";
+import { encodeSixelAsync, grep, pdfToMarkdown } from "@oh-my-pi/pi-natives";
 
 // Grep for a pattern
 const results = await grep({
@@ -35,9 +39,74 @@ const files = await find({
 	fileType: "file",
 });
 
-// SIXEL encode for a terminal cell box (px)
-const sequence = encodeSixel(pngBytes, widthPx, heightPx);
+// SIXEL encode for a terminal cell box (px), off the JS thread
+// (`encodeSixel` is the synchronous form)
+const backgroundRgb = 0x202040; // Actual terminal background, packed 0xRRGGBB
+const sequence = await encodeSixelAsync(pngBytes, widthPx, heightPx, backgroundRgb);
+
+// Extract PDF text and identify pages that still need OCR
+const pdf = await pdfToMarkdown(pdfBytes);
+console.log(pdf.markdown, pdf.pagesNeedingOcr);
 ```
+
+Both SIXEL encoder forms require the terminal background as a fourth argument,
+packed as a 24-bit `0xRRGGBB` number. When resizing images with alpha, RGB is
+premultiplied before Lanczos filtering so transparent pixels cannot darken or
+discolor visible edges. After resizing, the terminal background is composited
+without applying alpha twice. Fully transparent pixels remain transparent;
+unscaled images retain their existing blending path. Re-encode when the terminal
+background RGB changes.
+
+### Web reader
+
+Use `renderHtml` to convert HTML you already have to Markdown or plain text without making network requests.
+
+```typescript
+import { renderHtml } from "@oh-my-pi/pi-natives";
+
+const markdown = await renderHtml(html, {
+	baseUrl: "https://example.org/docs/",
+	mode: "auto",
+});
+```
+
+Markdown, reader content selection (`mode: "auto"`), and dropping hidden content are the defaults.
+Use `mode: "full"` to keep all visible content.
+Set `hidden: "reachable"` to include collapsed sections or `"all"` to include content
+that the page cannot reveal. Set `images: false` to skip images in Markdown.
+Set `format: "text"` for plain text; `width` defaults to 250 columns.
+
+Use `new Reader(options?)` to read a URL with your own HTTP or browser client:
+
+- `reader.open(url)` returns the first step synchronously.
+- For a `"fetch"` step, send the requested URL, method, headers, and optional body,
+  and cap the response at `maxBytes`. For a `"browse"` step, load the URL in a
+  browser and send back the rendered DOM as a UTF-8 buffer.
+- `await reader.resolve(response)` returns the next step. Pass the HTTP status
+  (or `0` for a transport error), final URL, header array, and optional body,
+  truncation flag, or error. Resolve one step at a time.
+- A `"done"` step contains a rendered page, a blob descriptor, or failure
+  diagnostics. Keep the response bytes yourself if you need to process a blob.
+
+`Reader` accepts the same rendering options except `baseUrl`, plus `raw` for
+decoded source, `browser` to enable browser fallback, and `userAgents` to supply
+HTTP user-agent candidates. The host owns redirects, cookies, and network I/O.
+
+### PTY dimensions
+
+`normalizePtyDimensions(cols, rows)` returns `{ cols, rows }` with fractional
+values truncated toward zero and dimensions clamped to 20–400 columns and
+5–200 rows. It shares the native bounds used by `PtySession.start`,
+`startArgv`, and `resize`. Use the returned dimensions when sizing a screen
+emulator so its viewport matches the native PTY.
+
+### Lazy Windows path helpers
+
+Import `expandWindowsLongPath` and `getWindowsShortPath` from
+`@oh-my-pi/pi-natives/path` when importing a module must not load the native addon.
+The addon loads only when a helper is called on Windows; other platforms preserve
+the input path without loading it. These helpers change long/8.3 spellings without
+resolving symlinks or junctions.
 
 ## Building
 
@@ -55,14 +124,14 @@ bun run check
 platform-specific optional dependency packages:
 
 ```
-crates/pi-natives/       # Rust source (workspace member)
+crates/natives/       # Rust source (workspace member)
   src/lib.rs             # N-API exports
   src/sixel.rs           # SIXEL terminal-image encoding
   Cargo.toml             # Rust dependencies
 native/                  # Core loader files and local/CI native build outputs
   index.js               # Public native export surface
   loader-state.js        # Platform, ISA variant, and addon resolution
-  embedded-addon.js      # Standalone binary embed stub/generated metadata
+  embedded-addon.js      # Null embed stub; binary builds replace it in memory
   pi_natives.<platform>-<arch>-modern.node   # x64 modern ISA (local/CI artifact)
   pi_natives.<platform>-<arch>-baseline.node # x64 baseline ISA (local/CI artifact)
   pi_natives.<platform>-<arch>.node          # non-x64 build artifact

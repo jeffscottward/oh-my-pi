@@ -3,14 +3,16 @@
  */
 import type { AgentTool, AgentToolUpdateCallback, ToolLoadMode } from "@oh-my-pi/pi-agent-core";
 import type { Static, TSchema } from "@oh-my-pi/pi-ai";
-import type { Theme } from "../../modes/theme/theme";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import { applyToolProxy } from "../tool-proxy";
 import type { CustomTool, CustomToolContext } from "./types";
+import type { Theme } from "@oh-my-pi/pi-tui/theme/contract";
 
-export class CustomToolAdapter<TParams extends TSchema = TSchema, TDetails = any, TTheme extends Theme = Theme>
-	implements AgentTool<TParams, TDetails, TTheme>
-{
+export class CustomToolAdapter<
+	TParams extends TSchema = TSchema,
+	TDetails = any,
+	TTheme extends Theme = Theme,
+> implements AgentTool<TParams, TDetails, TTheme> {
 	declare name: string;
 	declare label: string;
 	declare description: string;

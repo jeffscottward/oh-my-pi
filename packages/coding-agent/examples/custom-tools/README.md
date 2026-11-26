@@ -8,49 +8,59 @@ Each example uses the `subdirectory/index.ts` structure required for tool discov
 
 ### hello/
 
-Minimal example showing the basic structure of a custom tool.
-
-### todo/
-
-Full-featured example demonstrating:
-
-- `onSession` for state reconstruction from session history
-- Custom `renderCall` and `renderResult`
-- Proper branching support via details storage
-- State management without external files
+Minimal example showing the basic structure of a custom tool. The factory
+registers one tool named `hello` that takes a name and returns a greeting.
 
 ## Usage
 
-```bash
-# Test directly (can point to any .ts file)
-omp --tool examples/custom-tools/todo/index.ts
+omp discovers custom tools in two places: `.omp/tools/` in the current project
+and `~/.omp/agent/tools/` in your home directory. Both locations pick up `.ts`
+and `.js` modules, plus any immediate subdirectory that contains an `index.ts`.
 
-# Or copy entire folder to tools directory for persistent use
-cp -r todo ~/.omp/agent/tools/
+From this directory, install the example into one project:
+
+```bash
+mkdir -p /path/to/your-project/.omp/tools
+cp -r hello /path/to/your-project/.omp/tools/
+cd /path/to/your-project
+omp --tools hello
 ```
+
+Or install it for every project (default profile):
+
+```bash
+mkdir -p ~/.omp/agent/tools
+cp -r hello ~/.omp/agent/tools/
+```
+
+With a named profile (`OMP_PROFILE` or `--profile`), use that profile's tools
+dir instead: `~/.omp/profiles/<name>/agent/tools`.
+
+`--tools` selects registered tool names, never file paths. `hello` is the name
+the factory in `hello/index.ts` returns. Without the flag the tool is still
+discovered and loaded alongside the built-in tools. `--tools hello` restricts
+the session's tools to just `hello`, which keeps the demo focused but drops
+built-ins such as `read` and `bash`; list them too (`--tools read,bash,hello`)
+to keep them.
 
 Then in omp:
 
 ```
-> add a todo "test custom tools"
-> list todos
-> toggle todo #1
-> clear todos
+> greet Ada with the hello tool
 ```
 
 ## Writing Custom Tools
 
-See [docs/custom-tools.md](../../docs/custom-tools.md) for full documentation.
+See [docs/custom-tools.md](../../../../docs/custom-tools.md) for full documentation.
 
 ### Key Points
 
 **Factory pattern:**
 
 ```typescript
-import { Text } from "@oh-my-pi/pi-tui";
 import type { CustomToolFactory } from "@oh-my-pi/pi-coding-agent";
 
-const factory: CustomToolFactory = (pi) => ({
+const factory: CustomToolFactory = pi => ({
 	name: "my_tool",
 	label: "My Tool",
 	description: "Tool description for LLM",
@@ -66,37 +76,36 @@ const factory: CustomToolFactory = (pi) => ({
 	async execute(toolCallId, params) {
 		return {
 			content: [{ type: "text", text: "Result" }],
-			details: {
-				/* for rendering and state reconstruction */
-			},
+			details: {/* for rendering and state reconstruction */},
 		};
 	},
 });
 
 export default factory;
 ```
+
 **Custom rendering:**
 
-```typescript
-renderCall(args, theme) {
-  return new Text(
-    theme.fg("toolTitle", theme.bold("my_tool ")) + args.action,
-    0, 0  // No padding - Box handles it
-  );
+Renderers return pi-tui nodes (JSX in a `.tsx` file with `/** @jsxImportSource @oh-my-pi/pi-tui */`),
+drawn in the terminal and in Tern, or a rows object `{ render(width): string[] }`, drawn in the
+terminal only. See [Migrating from pi-tui](../../../../docs/extensions.md#migrating-from-pi-tui).
+
+```tsx
+renderCall(args, options, theme) {
+  return <text spans={[{ t: "my_tool ", s: "toolTitle strong" }, { t: args.action }]} />;
 },
 
 renderResult(result, { expanded, isPartial }, theme) {
-  if (isPartial) {
-    return new Text(theme.fg("warning", "Working..."), 0, 0);
-  }
-  return new Text(theme.fg("success", "✓ Done"), 0, 0);
+  // The rows escape hatch: plain strings at the given width.
+  if (isPartial) return { render: () => [theme.fg("warning", "Working...")] };
+  return { render: () => [theme.fg("success", "✓ Done")] };
 },
 ```
 
 **Use `z.enum` for discriminated string tool args:**
 
 ```typescript
-const { z } = pi.zod;
+const z = pi.zod;
 
 parameters: z.object({
 	action: z.enum(["list", "add"]),

@@ -1,10 +1,9 @@
-import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
-import { stripVTControlCharacters } from "node:util";
+import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { ToolExecutionComponent } from "@oh-my-pi/pi-coding-agent/modes/components/tool-execution";
-import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
-import type { AgentProgress, SingleResult, TaskToolDetails } from "@oh-my-pi/pi-coding-agent/task/types";
-import type { TUI } from "@oh-my-pi/pi-tui";
+import type { AgentProgress, SingleResult, TaskToolDetails } from "@oh-my-pi/pi-coding-agent/task/task-details";
+import { currentTheme, setCurrentTheme } from "@oh-my-pi/pi-tui/theme/runtime";
+import type { ToolCall } from "../../../src/ui/transcript/tool-block";
+import { toolCall, toolCallText } from "../../helpers/tool-text";
 
 function progressEntry(description: string): AgentProgress {
 	return {
@@ -25,7 +24,6 @@ function progressEntry(description: string): AgentProgress {
 	};
 }
 
-/** A detached spawn's partial result: `async.state === "running"` plus live progress rows. */
 function asyncSnapshot(description: string): {
 	content: Array<{ type: string; text: string }>;
 	details: TaskToolDetails;
@@ -71,72 +69,36 @@ function finalSnapshot(output: string): {
 	};
 }
 
-// Contract under test: a detached (`async.state === "running"`) task block keeps
-// progress rows static, avoids a redraw driver, freezes once a later partial
-// snapshot observes that it left the live region, drops further partial
-// snapshots, and still applies the final (completed) snapshot.
-describe("ToolExecutionComponent detached task freeze", () => {
+function makeCall(): ToolCall {
+	return toolCall({
+		name: "task",
+		args: { agent: "scout", id: "Anna", description: "scout auth", assignment: "investigate the auth flow" },
+	});
+}
+
+const restoreTheme = currentTheme();
+afterAll(() => setCurrentTheme(restoreTheme));
+
+describe("task tool card detached lifecycle", () => {
 	beforeAll(async () => {
 		await Settings.init({ inMemory: true, cwd: process.cwd() });
-		await initTheme();
 	});
 
-	afterEach(() => {
-		vi.useRealTimers();
-		vi.restoreAllMocks();
+	it("keeps accepting live progress snapshots until settlement", () => {
+		const call = makeCall();
+		call.updateResult(asyncSnapshot("initial progress"), true);
+		call.updateResult(asyncSnapshot("latest progress"), true);
+
+		const rendered = toolCallText(call, 100);
+		expect(rendered).toContain("latest progress");
+		expect(rendered).not.toContain("initial progress");
 	});
 
-	function makeComponent(live: () => boolean) {
-		const requestRender = vi.fn();
-		const requestComponentRender = vi.fn();
-		const ui = { requestRender, requestComponentRender } as unknown as TUI;
-		const component = new ToolExecutionComponent(
-			"task",
-			{ agent: "scout", id: "Anna", description: "scout auth", assignment: "investigate the auth flow" },
-			{ liveRegion: { isBlockInLiveRegion: () => live() } },
-			undefined,
-			ui,
-		);
-		return { component, requestRender, requestComponentRender };
-	}
+	it("applies the terminal result after live progress", () => {
+		const call = makeCall();
+		call.updateResult(asyncSnapshot("scouting the auth flow"), true);
+		call.updateResult(finalSnapshot("found it in src/auth.ts"), false);
 
-	it("does not drive redraws while live and keeps progress bytes static", () => {
-		vi.useFakeTimers();
-		const { component, requestRender, requestComponentRender } = makeComponent(() => true);
-
-		component.updateResult(asyncSnapshot("scouting the auth flow"), true);
-		requestRender.mockClear();
-		requestComponentRender.mockClear();
-		vi.advanceTimersByTime(500);
-		expect(requestRender).not.toHaveBeenCalled();
-		expect(requestComponentRender).not.toHaveBeenCalled();
-
-		vi.spyOn(Date, "now").mockReturnValue(1_000);
-		const frameA = component.render(100).join("\n");
-		vi.spyOn(Date, "now").mockReturnValue(5_000);
-		const frameB = component.render(100).join("\n");
-		expect(frameB).toBe(frameA);
-		expect(stripVTControlCharacters(frameA)).toContain("scouting the auth flow");
-	});
-
-	it("drops partial snapshots after the freeze but still applies the final result", () => {
-		vi.useFakeTimers();
-		let live = true;
-		const { component } = makeComponent(() => live);
-
-		component.updateResult(asyncSnapshot("scouting the auth flow"), true);
-		live = false;
-		vi.advanceTimersByTime(40);
-
-		// Frozen: later progress snapshots must not repaint commit-eligible rows.
-		component.updateResult(asyncSnapshot("a much newer description"), true);
-		const frozen = stripVTControlCharacters(component.render(100).join("\n"));
-		expect(frozen).toContain("scouting the auth flow");
-		expect(frozen).not.toContain("a much newer description");
-
-		// The terminal snapshot is not progress churn — it settles the block.
-		component.updateResult(finalSnapshot("found it in src/auth.ts"), false);
-		const final = stripVTControlCharacters(component.render(100).join("\n"));
-		expect(final).toContain("found it in src/auth.ts");
+		expect(toolCallText(call, 100)).toContain("found it in src/auth.ts");
 	});
 });

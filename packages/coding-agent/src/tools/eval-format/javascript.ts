@@ -249,12 +249,14 @@ interface DisplayBraceNode {
 
 function classifySourceBraces(source: string): boolean[] {
 	const objects: boolean[] = [];
-	const statementWords: string[] = [];
+	// Whether the current statement has seen `class`/`function`/`switch`, whose
+	// next `{` opens a block. A flag instead of a word list keeps each brace O(1).
+	let statementDeclaresBlock = false;
 	let previousToken = "";
 	let previousWord = "";
 	let regexAllowed = true;
 
-	for (let index = 0; index < source.length; ) {
+	for (let index = 0; index < source.length;) {
 		const char = source[index];
 		const next = source[index + 1];
 		if (/\s/.test(char)) {
@@ -287,7 +289,7 @@ function classifySourceBraces(source: string): boolean[] {
 		if (isIdentifierStart(char)) {
 			const end = scanIdentifier(source, index);
 			const word = source.slice(index, end);
-			statementWords.push(word);
+			if (word === "class" || word === "function" || word === "switch") statementDeclaresBlock = true;
 			previousWord = word;
 			previousToken = word;
 			regexAllowed = REGEX_PREFIX_WORDS[word] === true;
@@ -307,7 +309,7 @@ function classifySourceBraces(source: string): boolean[] {
 				previousToken === ")" ||
 				previousToken === "}" ||
 				BLOCK_BRACE_WORDS[previousWord] === true ||
-				statementWords.some(word => word === "class" || word === "function" || word === "switch");
+				statementDeclaresBlock;
 			const isObject =
 				!isBlock &&
 				(previousToken === "=" ||
@@ -319,7 +321,7 @@ function classifySourceBraces(source: string): boolean[] {
 					previousToken === "" ||
 					OBJECT_PREFIX_WORDS[previousWord] === true);
 			objects.push(isObject);
-			if (isBlock) statementWords.length = 0;
+			if (isBlock) statementDeclaresBlock = false;
 			previousToken = "{";
 			previousWord = "";
 			regexAllowed = true;
@@ -334,7 +336,7 @@ function classifySourceBraces(source: string): boolean[] {
 			continue;
 		}
 		if (char === ";") {
-			statementWords.length = 0;
+			statementDeclaresBlock = false;
 			previousToken = ";";
 			previousWord = "";
 			regexAllowed = true;
@@ -375,7 +377,7 @@ function collectDisplayBraceNodes(text: string, objectFlags: readonly boolean[])
 	const stack: DisplayBraceNode[] = [];
 	let openingIndex = 0;
 
-	for (let index = 0; index < text.length; ) {
+	for (let index = 0; index < text.length;) {
 		const char = text[index];
 		const next = text[index + 1];
 		if (char === "/" && next === "/") {
@@ -422,7 +424,7 @@ function collectDisplayBraceNodes(text: string, objectFlags: readonly boolean[])
 function collapseDisplayWhitespace(text: string): string | undefined {
 	const output: string[] = [];
 	let pendingSpace = false;
-	for (let index = 0; index < text.length; ) {
+	for (let index = 0; index < text.length;) {
 		const char = text[index];
 		const next = text[index + 1];
 		if (char === "\n" || char === "\r" || /\s/.test(char)) {

@@ -1,58 +1,58 @@
-import { $env, $flag } from "@oh-my-pi/pi-utils";
+import { classifyModel } from "@oh-my-pi/pi-catalog/identity";
+import { $flag } from "@oh-my-pi/pi-utils";
 
-export type EditMode = "replace" | "patch" | "hashline" | "apply_patch";
+import type { EditMode } from "../tools/details/edit";
+import type { Settings } from "../config/settings";
+import { cfgEditMode, type EditModeSetting, editModelVariants } from "../edit/settings";
+import { matchModelPattern } from "./model-patterns";
 
-export const DEFAULT_EDIT_MODE: EditMode = "hashline";
-
-const EDIT_MODE_IDS = {
-	apply_patch: "apply_patch",
-	hashline: "hashline",
-	patch: "patch",
-	replace: "replace",
-} as const satisfies Record<string, EditMode>;
-
-export const EDIT_MODES = Object.keys(EDIT_MODE_IDS) as EditMode[];
-
-const HASHLINE_EXCLUDED_MODEL_MODES: Array<{ pattern: string; mode: EditMode }> = [
-	{ pattern: "kimi", mode: "replace" },
-];
-
-function resolveHashlineExcludedModelMode(model: string | undefined): EditMode | null {
-	if (!model) return null;
-	const modelLower = model.toLowerCase();
-	for (const entry of HASHLINE_EXCLUDED_MODEL_MODES) {
-		if (modelLower.includes(entry.pattern)) return entry.mode;
-	}
-	return null;
-}
-
-export function normalizeEditMode(mode?: string | null): EditMode | undefined {
-	if (!mode) return undefined;
-	return EDIT_MODE_IDS[mode as keyof typeof EDIT_MODE_IDS];
-}
-
-export interface EditModeSettingsLike {
-	get(key: "edit.mode"): unknown;
-	getEditVariantForModel?(model: string | undefined): EditMode | null;
+/** `edit.modelVariants` entry for `model`: the longest pattern occurring in it (case-insensitive). */
+export function editVariantForModel(settings: Settings, model: string | undefined): EditMode | undefined {
+	return matchModelPattern(editModelVariants.get(settings), model);
 }
 
 export interface EditModeSessionLike {
-	settings: EditModeSettingsLike;
+	settings: Settings;
 	getActiveModelString?: () => string | undefined;
 }
 
-export function resolveEditMode(session: EditModeSessionLike): EditMode {
+/**
+ * Edit tool variant for the active model, or `"none"` when `edit.mode` removes the tool.
+ * `"none"` wins over `edit.modelVariants`: tool registration follows the setting, not the model.
+ */
+export function resolveEditMode(session: EditModeSessionLike): EditModeSetting {
+	const mode = cfgEditMode.get(session.settings);
+	if (mode === "none") return mode;
+
 	const activeModel = session.getActiveModelString?.();
-	const modelVariant = session.settings.getEditVariantForModel?.(activeModel);
+	const modelVariant = editVariantForModel(session.settings, activeModel);
 	if (modelVariant) return modelVariant;
-
-	const envMode = normalizeEditMode($env.PI_EDIT_VARIANT);
-	if (envMode) return envMode;
-
-	const settingsMode = normalizeEditMode(String(session.settings.get("edit.mode") ?? ""));
-	const mode = settingsMode ?? DEFAULT_EDIT_MODE;
-	if (mode === "hashline" && !$flag("PI_STRICT_EDIT_MODE")) {
-		return resolveHashlineExcludedModelMode(activeModel) ?? mode;
+	// `PI_EDIT_VARIANT` pins the mode exactly; only settings-derived hashline adapts to the model.
+	if (cfgEditMode.provenance(session.settings) === "env") return mode;
+	if (mode === "hashline" && !$flag("PI_STRICT_EDIT_MODE") && activeModel) {
+		const identity = classifyModel("", activeModel, { lenient: true });
+		if (
+			identity.class === "kimi" ||
+			identity.class === "mimo" ||
+			identity.class === "minimax" ||
+			identity.class === "deepseek" ||
+			identity.class === "stepfun" ||
+			identity.family === "codex-spark" ||
+			(identity.class === "glm" && identity.family === "flash" && identity.revision === "5.3.0") ||
+			(identity.class === "qwen" && identity.revision === "3.8.0")
+		) {
+			return "replace";
+		}
 	}
 	return mode;
+}
+
+/**
+ * The grammar `edit` calls take under `session`, as an `EditTool` without a pinned mode reads
+ * them: `magic` applies its model-written batch through `replace`, and `none` keeps a valid
+ * schema until the next built-in reconcile unregisters the tool.
+ */
+export function resolveEditToolMode(session: EditModeSessionLike): EditMode {
+	const mode = resolveEditMode(session);
+	return mode === "none" || mode === "magic" ? "replace" : mode;
 }

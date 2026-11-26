@@ -5,10 +5,7 @@
  * The agent loop catches and renders them appropriately.
  */
 
-/**
- * Base error for tool execution failures.
- * Override render() for custom LLM-facing formatting.
- */
+/** Structured tool failure shared by selector parsing and host tool execution. */
 export class ToolError extends Error {
 	constructor(
 		message: string,
@@ -59,4 +56,27 @@ export function renderError(e: unknown): string {
 		return e.message;
 	}
 	return String(e);
+}
+
+/** Clone-safe error metadata a tool worker sends back across the worker boundary. */
+export interface WorkerErrorPayload {
+	name: string;
+	message: string;
+	stack?: string;
+	isToolError: boolean;
+	isAbort: boolean;
+}
+
+/** Serialize a thrown value into {@link WorkerErrorPayload} for a worker `tool-reply`. */
+export function toWorkerErrorPayload(error: unknown): WorkerErrorPayload {
+	if (error instanceof Error) {
+		return {
+			name: error.name,
+			message: error.message,
+			stack: error.stack,
+			isAbort: error.name === "AbortError" || error.name === "ToolAbortError",
+			isToolError: error instanceof ToolError || error.name === "ToolError",
+		};
+	}
+	return { name: "Error", message: String(error), isAbort: false, isToolError: false };
 }

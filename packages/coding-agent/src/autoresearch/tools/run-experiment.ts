@@ -1,29 +1,37 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { Text } from "@oh-my-pi/pi-tui";
-import { formatBytes } from "@oh-my-pi/pi-utils";
-import { type } from "arktype";
-import { executeBash } from "../../exec/bash-executor";
+import { type } from "@oh-my-pi/omptype";
+import * as vcs from "@oh-my-pi/pi-natives/vcs";
+
+import { formatBytes, procmgr } from "@oh-my-pi/pi-utils";
+import { Settings } from "../../config/settings";
+import { executeBash, sessionShellEnv } from "../../exec/bash-executor";
 import type { ToolDefinition } from "../../extensibility/extensions";
-import type { Theme } from "../../modes/theme/theme";
-import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, TailBuffer, truncateTail } from "../../session/streaming-output";
-import { replaceTabs, shortenPath } from "../../tools/render-utils";
-import * as git from "../../utils/git";
+
+import {
+	DEFAULT_MAX_BYTES,
+	DEFAULT_MAX_LINES,
+	TailBuffer,
+	type TruncationResult,
+	truncateTail,
+} from "../../tools/streaming-output";
+
 import { parseWorkDirDirtyPaths } from "../git";
 import {
 	EXPERIMENT_MAX_BYTES,
 	EXPERIMENT_MAX_LINES,
-	formatElapsed,
-	formatNum,
-	parseAsiLines,
-	parseMetricLines,
+	ExperimentOutputScanner,
 	tryGitPrefix,
 	tryGitStatus,
 } from "../helpers";
+import { formatNum } from "../tool-details";
+import { formatElapsed } from "../results-data";
 import { buildExperimentState } from "../state";
+import { quotePosixArgument } from "../../utils/shell-quote";
 import { openAutoresearchStorageIfExists } from "../storage";
-import type { AutoresearchToolFactoryOptions, RunDetails, RunExperimentProgressDetails } from "../types";
-import { DEFAULT_HARNESS_COMMAND } from "./init-experiment";
+import type { AutoresearchToolFactoryOptions } from "../types";
+import type { ASIData, RunDetails, RunExperimentProgressDetails } from "../tool-details";
+import { DEFAULT_HARNESS_COMMAND, HARNESS_FILENAME } from "../tool-details";
 
 const runExperimentSchema = type({
 	"timeout_seconds?": type("number").describe("timeout in seconds (default 600)"),
@@ -33,7 +41,12 @@ interface ProcessExecutionResult {
 	exitCode: number | null;
 	killed: boolean;
 	logPath: string;
-	output: string;
+	/** Tail truncation for the LLM preview ({@link EXPERIMENT_MAX_BYTES}/{@link EXPERIMENT_MAX_LINES}). */
+	llmTruncation: TruncationResult;
+	/** Tail truncation for the rendered output (default budgets). */
+	displayTruncation: TruncationResult;
+	metrics: Map<string, number>;
+	asi: ASIData | null;
 }
 
 interface ProgressSnapshot {
@@ -56,7 +69,7 @@ export function createRunExperimentTool(
 		defaultInactive: true,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const storage = await openAutoresearchStorageIfExists(ctx.cwd);
-			const currentBranch = (await git.branch.current(ctx.cwd)) ?? null;
+			const currentBranch = (await vcs.git(ctx.cwd)?.currentBranch()) ?? null;
 			const session = storage?.getActiveSessionForBranch(currentBranch) ?? null;
 			if (!storage || !session) {
 				return {
@@ -116,8 +129,12 @@ export function createRunExperimentTool(
 			let execution: ProcessExecutionResult;
 			try {
 				execution = await executeProcess({
-					command: resolvedCommand,
+					command: await resolveHarnessExecLine(),
 					cwd: ctx.cwd,
+					env: sessionShellEnv({
+						id: ctx.sessionManager.getSessionId(),
+						file: ctx.sessionManager.getSessionFile(),
+					}),
 					logPath: benchmarkLogPath,
 					timeoutMs,
 					signal,
@@ -145,19 +162,11 @@ export function createRunExperimentTool(
 			const durationSeconds = durationMs / 1000;
 			runtime.lastRunDuration = durationSeconds;
 
-			const llmTruncation = truncateTail(execution.output, {
-				maxBytes: EXPERIMENT_MAX_BYTES,
-				maxLines: EXPERIMENT_MAX_LINES,
-			});
-			const displayTruncation = truncateTail(execution.output, {
-				maxBytes: DEFAULT_MAX_BYTES,
-				maxLines: DEFAULT_MAX_LINES,
-			});
-
-			const parsedMetricsMap = parseMetricLines(execution.output);
+			const { llmTruncation, displayTruncation } = execution;
+			const parsedMetricsMap = execution.metrics;
 			const parsedMetrics = parsedMetricsMap.size > 0 ? Object.fromEntries(parsedMetricsMap.entries()) : null;
 			const parsedPrimary = parsedMetricsMap.get(session.primaryMetric) ?? null;
-			const parsedAsi = parseAsiLines(execution.output);
+			const parsedAsi = execution.asi;
 			runtime.lastRunAsi = parsedAsi;
 
 			storage.markRunCompleted({
@@ -234,47 +243,39 @@ export function createRunExperimentTool(
 				details: resultDetails,
 			};
 		},
-		renderCall(_args, _options, theme): Text {
-			return new Text(
-				`${theme.fg("toolTitle", theme.bold("run_experiment"))} ${theme.fg("muted", DEFAULT_HARNESS_COMMAND)}`,
-				0,
-				0,
-			);
-		},
-		renderResult(result, options, theme): Text {
-			if (isProgressDetails(result.details)) {
-				const header = theme.fg("warning", `Running ${result.details.elapsed}...`);
-				const preview = replaceTabs(result.content.find(part => part.type === "text")?.text ?? "");
-				return new Text(preview ? `${header}\n${theme.fg("dim", preview)}` : header, 0, 0);
-			}
-			const details = result.details;
-			if (!details || !isRunDetails(details)) {
-				return new Text(replaceTabs(result.content.find(part => part.type === "text")?.text ?? ""), 0, 0);
-			}
-			const statusText = renderStatus(details, theme);
-			if (!options.expanded && details.tailOutput.trim().length === 0) {
-				return new Text(statusText, 0, 0);
-			}
-			const preview = replaceTabs(
-				options.expanded ? details.tailOutput : details.tailOutput.split("\n").slice(-5).join("\n"),
-			);
-			const suffix =
-				options.expanded && details.truncation && details.fullOutputPath
-					? `\n${theme.fg("warning", `Full output: ${shortenPath(details.fullOutputPath)}`)}`
-					: "";
-			return new Text(preview ? `${statusText}\n${theme.fg("dim", preview)}${suffix}` : statusText, 0, 0);
-		},
 	};
 }
+
+/**
+ * Shell line that actually runs the harness; the recorded command stays
+ * {@link DEFAULT_HARNESS_COMMAND}. On Windows a bare `bash` resolves through
+ * PATH to the WSL launcher (`WindowsApps\bash.exe` / `System32\bash.exe`),
+ * which runs the harness inside a Linux VM with a different toolchain and env,
+ * or fails outright when WSL is unavailable. Use the resolved host shell (Git
+ * Bash, or the configured `shellPath`) when it is POSIX.
+ */
+async function resolveHarnessExecLine(): Promise<string> {
+	if (process.platform !== "win32") return DEFAULT_HARNESS_COMMAND;
+	const { shell } = (await Settings.init()).getShellConfig();
+	if (!procmgr.isPosixShell(shell)) return DEFAULT_HARNESS_COMMAND;
+	return `${quotePosixArgument(shell)} ${HARNESS_FILENAME}`;
+}
+
 async function executeProcess(opts: {
 	command: string;
 	cwd: string;
+	/** Session identity for the command ({@link sessionShellEnv}). */
+	env: Record<string, string>;
 	logPath: string;
 	timeoutMs: number;
 	signal?: AbortSignal;
 	onProgress?(details: ProgressSnapshot): void;
 }): Promise<ProcessExecutionResult> {
+	// Holds 2× the largest truncation budget, so tail truncations of it equal those of the full log.
 	const tailBuffer = new TailBuffer(DEFAULT_MAX_BYTES * 2);
+	const scanner = new ExperimentOutputScanner();
+	let totalBytes = 0;
+	let newlineCount = 0;
 
 	const startedAt = Date.now();
 	const snapshot = (): ProgressSnapshot => {
@@ -307,6 +308,7 @@ async function executeProcess(opts: {
 	try {
 		const result = await executeBash(opts.command, {
 			cwd: opts.cwd,
+			env: opts.env,
 			sessionKey: `autoresearch:${opts.cwd}`,
 			timeout: opts.timeoutMs > 0 ? opts.timeoutMs : 2_147_000_000,
 			signal: opts.signal,
@@ -314,6 +316,11 @@ async function executeProcess(opts: {
 			onChunk: chunk => {
 				tailBuffer.append(chunk);
 				logSink.write(chunk);
+				scanner.append(chunk);
+				totalBytes += Buffer.byteLength(chunk, "utf-8");
+				for (let index = chunk.indexOf("\n"); index !== -1; index = chunk.indexOf("\n", index + 1)) {
+					newlineCount += 1;
+				}
 			},
 		});
 		await closeLogSink();
@@ -321,13 +328,23 @@ async function executeProcess(opts: {
 			throw new Error("aborted");
 		}
 
-		const output = await fs.promises.readFile(opts.logPath, "utf8");
-
+		const tail = tailBuffer.text();
+		const totals = { totalLines: newlineCount + 1, totalBytes };
+		const { metrics, asi } = scanner.finish();
 		return {
 			exitCode: result.exitCode ?? null,
 			killed: result.cancelled,
 			logPath: opts.logPath,
-			output,
+			llmTruncation: {
+				...truncateTail(tail, { maxBytes: EXPERIMENT_MAX_BYTES, maxLines: EXPERIMENT_MAX_LINES }),
+				...totals,
+			},
+			displayTruncation: {
+				...truncateTail(tail, { maxBytes: DEFAULT_MAX_BYTES, maxLines: DEFAULT_MAX_LINES }),
+				...totals,
+			},
+			metrics,
+			asi,
 		};
 	} finally {
 		if (progressTimer) clearInterval(progressTimer);
@@ -380,28 +397,4 @@ function buildRunText(details: RunDetails, outputPreview: string, bestMetric: nu
 		);
 	}
 	return lines.join("\n").trimEnd();
-}
-
-function renderStatus(details: RunDetails, theme: Theme): string {
-	if (details.timedOut) {
-		return theme.fg("error", `TIMEOUT ${details.durationSeconds.toFixed(1)}s`);
-	}
-	if (details.exitCode !== 0) {
-		return theme.fg("error", `FAIL exit=${details.exitCode} ${details.durationSeconds.toFixed(1)}s`);
-	}
-	const metric =
-		details.parsedPrimary !== null
-			? ` ${details.metricName}=${formatNum(details.parsedPrimary, details.metricUnit)}`
-			: "";
-	return theme.fg("success", `PASS ${details.durationSeconds.toFixed(1)}s${metric}`);
-}
-
-function isRunDetails(value: unknown): value is RunDetails {
-	if (typeof value !== "object" || value === null) return false;
-	return "command" in value && "durationSeconds" in value;
-}
-
-function isProgressDetails(value: unknown): value is RunExperimentProgressDetails {
-	if (typeof value !== "object" || value === null) return false;
-	return "phase" in value && (value as { phase: unknown }).phase === "running";
 }

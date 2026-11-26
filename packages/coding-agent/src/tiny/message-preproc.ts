@@ -5,8 +5,10 @@
  * of a long message survives. The shared pipeline strips ANSI escapes, paired
  * XML/tool envelopes, full commit hashes, and fenced code blocks, then preserves
  * both ends with an explicit omission marker. Title generation, auto-thinking,
- * and the title benchmark MUST use this same policy.
+ * and the title benchmark MUST use this same policy; `archive.transcript`
+ * reuses it with placeholders to compact archived messages.
  */
+import { countNewlines, formatCount } from "@oh-my-pi/pi-utils";
 
 /** Maximum characters emitted by {@link preprocessTinyMessage}. */
 export const MAX_TINY_MESSAGE_CHARS = 2000;
@@ -27,6 +29,36 @@ const XML_BLOCK = /<([a-zA-Z][\w-]*)(?:\s[^>]*)?>[\s\S]*?<\/\1>/g;
 const LONG_HEX_RUN = /\b[0-9a-fA-F]{12,}\b/g;
 /** Short-hash prefix length kept after truncating a long hex run. */
 const SHORT_HASH_CHARS = 7;
+/**
+ * Raw characters kept from each end of an oversized message before any cleanup.
+ * Fenced-block stripping is linear, so this cap is generous: it only bounds total
+ * work on pathological pastes while letting prose between large code blocks survive.
+ */
+const RAW_SCAN_EDGE_CHARS = 262_144;
+/**
+ * Characters kept from each end of the fence-stripped message before paired-tag
+ * stripping. The paired-tag regex is quadratic on unclosed `<Tag>`s (TS generics,
+ * JSX); output is bounded to {@link MAX_TINY_MESSAGE_CHARS} anyway, so the
+ * dropped middle is never emitted.
+ */
+const CLEAN_WINDOW_EDGE_CHARS = 16_384;
+/** Joins the head and tail windows of an oversized message. */
+const WINDOW_SEPARATOR = "\n…\n";
+
+/** How the cleaning helpers mark what they remove. */
+export interface CleanMessageOptions {
+	/**
+	 * Leave `[code, N lines]` where a fenced block was and `<tag/>` where a
+	 * paired tag was, so a reader knows text is missing. Default: a space.
+	 */
+	placeholders?: boolean;
+}
+
+/** Keep `edgeChars` from each end of `message` when it exceeds twice that. */
+function windowEdges(message: string, edgeChars: number): string {
+	if (message.length <= edgeChars * 2) return message;
+	return `${message.slice(0, edgeChars)}${WINDOW_SEPARATOR}${message.slice(-edgeChars)}`;
+}
 
 /** Drop SGR ANSI escape sequences. */
 export function stripAnsi(message: string): string {
@@ -39,8 +71,9 @@ export function stripAnsi(message: string): string {
  * `<div>`) are left in place — only fully paired blocks, whose contents would
  * otherwise dominate the title, are dropped.
  */
-export function stripXmlBlocks(message: string): string {
-	return message.replace(XML_BLOCK, " ");
+export function stripXmlBlocks(message: string, options?: CleanMessageOptions): string {
+	if (!options?.placeholders) return message.replace(XML_BLOCK, " ");
+	return message.replace(XML_BLOCK, (_block, tag: string) => `<${tag}/>`);
 }
 
 /** Truncate full commit-hash-like hex runs (≥12 chars) to a short 7-char prefix. */
@@ -49,12 +82,13 @@ export function shortenHashes(message: string): string {
 }
 
 /**
- * Middle-truncate cleaned text, preserving 2/3 of the available space from the
- * head and 1/3 from the tail. The omission marker counts toward the bound.
+ * Middle-truncate cleaned text to `max` characters, preserving 2/3 of the
+ * available space from the head and 1/3 from the tail. The omission marker
+ * counts toward the bound.
  */
-export function truncateTinyMessage(message: string): string {
-	if (message.length <= MAX_TINY_MESSAGE_CHARS) return message;
-	let omitted = message.length - MAX_TINY_MESSAGE_CHARS;
+export function truncateTinyMessage(message: string, max = MAX_TINY_MESSAGE_CHARS): string {
+	if (message.length <= max) return message;
+	let omitted = message.length - max;
 	let marker = "";
 	let headChars = 0;
 	let tailChars = 0;
@@ -62,13 +96,14 @@ export function truncateTinyMessage(message: string): string {
 	// only the decimal digit count can change.
 	for (let pass = 0; pass < 2; pass++) {
 		marker = `\n[… ${omitted} chars omitted …]\n`;
-		const keptChars = Math.max(0, MAX_TINY_MESSAGE_CHARS - marker.length);
+		const keptChars = Math.max(0, max - marker.length);
 		headChars = Math.ceil((keptChars * 2) / 3);
 		tailChars = keptChars - headChars;
 		omitted = message.length - headChars - tailChars;
 	}
 	marker = `\n[… ${omitted} chars omitted …]\n`;
-	return `${message.slice(0, headChars)}${marker}${message.slice(-tailChars)}`;
+	// `slice(-0)` would keep the whole message.
+	return `${message.slice(0, headChars)}${marker}${tailChars > 0 ? message.slice(-tailChars) : ""}`;
 }
 
 /**
@@ -83,18 +118,40 @@ export function truncateTinyMessage(message: string): string {
  * Falls back to the original message when stripping leaves too little to title
  * (a message that is essentially just a code block).
  */
-export function stripCodeBlocks(message: string): string {
-	const cleaned = message
-		.replace(FENCED_CODE_BLOCK, " ")
-		.replace(/[ \t]+/g, " ")
-		.replace(/\n{3,}/g, "\n\n")
-		.trim();
+export function stripCodeBlocks(message: string, options?: CleanMessageOptions): string {
+	const cleaned = collapseWhitespace(
+		options?.placeholders
+			? message.replace(FENCED_CODE_BLOCK, codePlaceholder)
+			: message.replace(FENCED_CODE_BLOCK, " "),
+	);
 	return cleaned.length >= MIN_STRIPPED_TITLE_CHARS ? cleaned : message;
 }
 
-/** Clean noise from message content without applying the length bound. */
-export function cleanTinyMessage(message: string): string {
-	return stripCodeBlocks(shortenHashes(stripXmlBlocks(stripAnsi(message))));
+/** `[code, N lines]` for a fenced block; the fence lines do not count. */
+function codePlaceholder(block: string): string {
+	return `[code, ${formatCount("line", Math.max(1, countNewlines(block) - 1))}]`;
+}
+
+/** Collapse horizontal whitespace runs and excess blank lines, then trim. */
+function collapseWhitespace(message: string): string {
+	return message
+		.replace(/[ \t]+/g, " ")
+		.replace(/\n{3,}/g, "\n\n")
+		.trim();
+}
+
+/**
+ * Clean noise from message content without applying the length bound.
+ * The raw input is capped at {@link RAW_SCAN_EDGE_CHARS} per end, fenced blocks
+ * are stripped, and only then is the remainder windowed to
+ * {@link CLEAN_WINDOW_EDGE_CHARS} per end before paired-tag stripping, so prose
+ * between large code blocks is preserved.
+ */
+export function cleanTinyMessage(message: string, options?: CleanMessageOptions): string {
+	const fenceStripped = stripCodeBlocks(stripAnsi(windowEdges(message, RAW_SCAN_EDGE_CHARS)), options);
+	return collapseWhitespace(
+		shortenHashes(stripXmlBlocks(windowEdges(fenceStripped, CLEAN_WINDOW_EDGE_CHARS), options)),
+	);
 }
 
 /** Apply the shared tiny-model cleanup and middle-truncation policy. */

@@ -15,6 +15,32 @@ if (Bun.env.MOCK_RPC_IGNORE_SIGTERM === "1") {
 }
 
 const supportsProtocolV2 = Bun.env.MOCK_RPC_V2 === "1";
+const legacyState = {
+	thinkingLevel: "off",
+	isStreaming: false,
+	isCompacting: false,
+	steeringMode: "all",
+	followUpMode: "all",
+	interruptMode: "immediate",
+	sessionId: "mock-session",
+	autoCompactionEnabled: false,
+	messageCount: 0,
+	queuedMessageCount: 0,
+	todoPhases: [],
+};
+
+if (Bun.env.MOCK_RPC_EXIT_BEFORE_READY) {
+	const message = Bun.env.MOCK_RPC_EXIT_STDERR ?? "";
+	if (message) {
+		// Await the pipe write: exiting immediately can drop unflushed stderr
+		// bytes, leaving the client's startup error without the failure text.
+		const { promise, resolve } = Promise.withResolvers<void>();
+		process.stderr.write(message, () => resolve());
+		await promise;
+	}
+	process.exit(Number(Bun.env.MOCK_RPC_EXIT_BEFORE_READY));
+}
+
 let protocolV2Enabled = false;
 process.stdout.write(
 	`${JSON.stringify(
@@ -68,6 +94,29 @@ for await (const raw of console) {
 			}
 			if (Bun.env.MOCK_RPC_IGNORE_COMMANDS === "1") continue;
 			const id = typeof frame.id === "string" ? frame.id : undefined;
+			if (Bun.env.MOCK_RPC_EXIT_AFTER_PROMPT_ACK === "1" && frame.type === "prompt") {
+				writeFrame({ id, type: "response", command: "prompt", success: true, data: { agentInvoked: true } });
+				process.exit(0);
+			}
+			if (Bun.env.MOCK_RPC_LATE_PROMPT_ERROR === "1" && frame.type === "prompt") {
+				writeFrame({ id, type: "response", command: "prompt", success: true });
+				writeFrame({
+					id,
+					type: "response",
+					command: "prompt",
+					success: false,
+					error: "skill file was deleted",
+				});
+				writeFrame({
+					type: "prompt_result",
+					id,
+					agentInvoked: false,
+					status: "error",
+					error: { message: "skill file was deleted", retryable: false },
+					sessionSettled: true,
+				});
+				continue;
+			}
 			if (frame.type === "negotiate_protocol" && frame.protocolVersion === 2) {
 				writeFrame({
 					id,
@@ -138,12 +187,30 @@ for await (const raw of console) {
 				});
 				continue;
 			}
+			if (
+				frame.type === "get_state" &&
+				(Bun.env.MOCK_RPC_LEGACY_STATE === "1" || Bun.env.MOCK_RPC_INVALID_TPS === "1")
+			) {
+				const data = {
+					...legacyState,
+					...(Bun.env.MOCK_RPC_INVALID_TPS === "1" ? { tokensPerSecond: "invalid" } : {}),
+				};
+				writeFrame({
+					id,
+					type: "response",
+					command: frame.type,
+					success: true,
+					data,
+				});
+				continue;
+			}
+
 			writeFrame({
 				id,
 				type: "response",
 				command: frame.type,
 				success: true,
-				data: supportsProtocolV2 ? { payload: "😀".repeat(400_000) } : {},
+				data: supportsProtocolV2 ? { payload: "😀".repeat(270_000) } : {},
 			});
 		}
 	} catch {

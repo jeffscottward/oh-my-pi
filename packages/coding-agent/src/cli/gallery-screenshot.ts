@@ -15,8 +15,9 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { $which } from "@oh-my-pi/pi-utils";
-import { theme } from "../modes/theme/theme";
+import { quotePosixArgument } from "../utils/shell-quote";
 import type { GallerySection } from "./gallery-cli";
+import { currentTheme } from "@oh-my-pi/pi-tui/theme/runtime";
 
 /** Nerd Font family so the gallery's icon glyphs (PUA) render instead of tofu. */
 export const DEFAULT_SCREENSHOT_FONT = "JetBrainsMono Nerd Font";
@@ -164,7 +165,7 @@ function buildTape(args: TapeArgs): string {
 	// is captured from the final visible frame. Setup is hidden so the typed
 	// `cat` command and shell prompt never appear in the capture, and a trailing
 	// `sleep` keeps the shell from drawing a fresh prompt under the output.
-	const shellCommand = `clear; cat ${shellSingleQuote(args.ansiPath)}; sleep 120`;
+	const shellCommand = `clear; cat ${quotePosixArgument(args.ansiPath)}; sleep 120`;
 	return `${[
 		`Output ${JSON.stringify(args.gifPath)}`,
 		`Set Width ${args.widthPx}`,
@@ -185,14 +186,15 @@ function buildTape(args: TapeArgs): string {
 }
 
 /**
- * Build the VHS terminal theme. Only background/foreground/cursor matter: the
+ * Build the VHS terminal currentTheme(). Only background/foreground/cursor matter: the
  * gallery emits truecolor (`38;2`/`48;2`) escapes, so the 16-color palette is
  * never consulted — it is filler to satisfy VHS's theme schema.
  */
 function buildVhsTheme(): string {
-	const background = parseAnsiRgb(theme.getBgAnsi("statusLineBg")) ?? (theme.isLight ? "#ffffff" : "#1a1a1a");
-	const foreground = theme.isLight ? "#1a1a1a" : "#d4d4d4";
-	const selection = theme.isLight ? "#c8d6ff" : "#404862";
+	const theme = currentTheme();
+	const background = parseAnsiRgb(theme.bgSgr("statusLineBg")) ?? (theme.dark ? "#1a1a1a" : "#ffffff");
+	const foreground = theme.dark ? "#d4d4d4" : "#1a1a1a";
+	const selection = theme.dark ? "#404862" : "#c8d6ff";
 	return JSON.stringify({
 		name: "omp-gallery",
 		background,
@@ -224,11 +226,6 @@ function parseAnsiRgb(ansi: string): string | undefined {
 	if (!match) return undefined;
 	const hex = (value: string) => Number(value).toString(16).padStart(2, "0");
 	return `#${hex(match[1])}${hex(match[2])}${hex(match[3])}`;
-}
-
-/** POSIX single-quote a path for embedding in the VHS shell command. */
-function shellSingleQuote(value: string): string {
-	return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
 /**

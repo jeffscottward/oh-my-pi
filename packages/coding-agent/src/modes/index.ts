@@ -8,3 +8,7 @@
 export * from "./interactive-mode";
 export * from "./rpc/rpc-client";
 export * from "./rpc/rpc-types";
+
+// planSaveFileName moved to plan-mode/plan-autosave; preserved here so its
+// pre-existing barrel reachability survives the move.
+export { planSaveFileName } from "../plan-mode/plan-autosave";

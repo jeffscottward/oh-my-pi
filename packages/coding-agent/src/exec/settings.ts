@@ -1,0 +1,340 @@
+/**
+ * Settings declared by this domain (see `config/registry.ts`). Declaration order is the
+ * settings-panel order; `config/all-settings.ts` registers every domain.
+ */
+import { combine, register, type SettingValueOf } from "../config/registry";
+
+/** One bash-interceptor rule: commands matching `pattern` are redirected to `tool`. */
+export interface BashInterceptorRule {
+	pattern: string;
+	flags?: string;
+	tool: string;
+	message: string;
+	allowSubcommands?: string[];
+}
+
+export type BashPatternApproval = "allow" | "deny" | "prompt";
+
+/** One bash approval pattern rule (`bash.patterns`). */
+export interface BashApprovalPatternRule {
+	match: string;
+	approval: BashPatternApproval;
+	/** Leading env assignment names this `allow` rule strips before matching. */
+	env?: string[];
+}
+
+const EMPTY_BASH_PATTERNS: BashApprovalPatternRule[] = [];
+
+const EMPTY_STRING_ARRAY: string[] = [];
+
+// Perl keeps reading switches after consuming an argument to -e/-E, -I, or -m/-M.
+// Treat quoted and escaped text as part of that argument, not as more switches.
+const PERL_ARGUMENT = String.raw`(?:[^ \t\r\n;|&<>()'"\\]|\\[^\n]|'[^']*'|"(?:[^"\\]|\\[\s\S])*")+`;
+const PERL_SWITCH_CLUSTER = "(?:[0-7acfglnpSstTuUwWX]|d(?!t?[:=])|V(?!:))*";
+const PERL_SWITCH_VALUE = String.raw`(?:[eEImM](?:${PERL_ARGUMENT}|[ \t]+(?!#)${PERL_ARGUMENT})|(?:[CDFx]|dt?[:=]|V:)(?:${PERL_ARGUMENT})?)`;
+const PERL_IN_PLACE_PATTERN = String.raw`^[ \t]*perl[ \t]+(?:-(?=[^ \t\r\n-])${PERL_SWITCH_CLUSTER}${PERL_SWITCH_VALUE}?[ \t]+)*-${PERL_SWITCH_CLUSTER}i`;
+
+export const DEFAULT_BASH_INTERCEPTOR_RULES: BashInterceptorRule[] = [
+	{
+		// `cat` that sends stdout to a file or reads a heredoc writes rather than
+		// reads, also after leading redirects of other fds (`cat 2>err > out`);
+		// the write rule below owns those forms. `cat 2>err file` and
+		// `cat >&2 file` (stdout duplicated, not sent to a file) still read.
+		// A redirect target cannot start with `>` or `|`, so each leading
+		// redirect is consumed one way and matching stays linear.
+		pattern:
+			"^\\s*(?:(?:head|tail|less|more)\\s+|cat\\s+(?!\\s|(?:[02-9]>{1,2}\\|?\\s*[^\\s>|]\\S*\\s+)*(?:<<|1?>(?!&)|&>)))",
+		tool: "read",
+		message: "Use the `read` tool instead of cat/head/tail. It provides better context and handles binary files.",
+	},
+	{
+		pattern: "^\\s*(grep|rg|ripgrep|ag|ack)\\s+",
+		tool: "grep",
+		message: "Use the `grep` tool instead of grep/rg. It respects .gitignore and provides structured output.",
+	},
+	{
+		pattern: "^\\s*(find|fd|locate)\\s+.*(-name|-iname|-type|--type|-glob)",
+		tool: "glob",
+		message: "Use the `glob` tool instead of find/fd. It respects .gitignore and is faster for glob patterns.",
+	},
+	{
+		pattern: "^\\s*sed\\s+(-i|--in-place)",
+		tool: "edit",
+		message: "Use the `edit` tool instead of sed -i. It provides diff preview and fuzzy matching.",
+	},
+	{
+		pattern: PERL_IN_PLACE_PATTERN,
+		tool: "edit",
+		message: "Use the `edit` tool instead of perl -i. It provides diff preview and fuzzy matching.",
+	},
+	{
+		pattern: "^\\s*awk\\s+.*-i\\s+inplace",
+		tool: "edit",
+		message: "Use the `edit` tool instead of awk -i inplace. It provides diff preview and fuzzy matching.",
+	},
+	{
+		// `>` must sit outside quoted regions (so `echo "a -> b"` passes) and be
+		// followed by a plausible filename — including `$VAR` targets; `>|`
+		// (clobber) counts as a redirect; `>&2`/`2>&1` style fd duplication and
+		// redirects of fds other than stdout (`2>err.log`) are not matched, and
+		// the scan continues past them and past input duplication (`<&0`), so
+		// `2>&1 > out.txt` is a write. The scan stops at an unquoted,
+		// unescaped `;`, `&&`, `|` or newline outside a command substitution,
+		// so a redirect in a later command or a heredoc body is not attributed
+		// to the echo/cat, while `echo foo\; > out.txt` and
+		// `echo $(printf a; printf b) > out.txt` keep theirs. Allowed device
+		// sinks are consumed while looking for later real file redirects
+		// because the write tool cannot replace shell output/discard targets.
+		// Each character has exactly one way to be consumed (an fd-numbered
+		// redirect only by the fd branch, an escape only by the escape branch,
+		// a `$(`, `${` or backtick only by the substitution branch, and as a
+		// plain character only when that branch cannot consume it, so a deeper
+		// nesting such as `${a:-${b}}` is scanned as before), which keeps
+		// matching linear on long commands.
+		pattern:
+			"^\\s*(?:(?:echo|printf)\\s+|cat\\s*<<|cat(?=\\s+(?:\\d+|&)?>)\\s+)(?:(?:\\\\[\\s\\S]|\\$\\((?:[^()\"'`]|\"[^\"]*\"|'[^']*'|`[^`]*`|\\([^()]*\\))*\\)|\\$\\{[^{}]*\\}|`[^`]*`|\\$(?!\\((?:[^()\"'`]|\"[^\"]*\"|'[^']*'|`[^`]*`|\\([^()]*\\))*\\)|\\{[^{}]*\\})|`(?![^`]*`)|[^\"'>;&|\\n\\\\$`]|(?<=[<>])&|(?<![<>])&(?=>)|(?<=(?:^|\\s)[02-9])>{1,2}\\|?|\"[^\"]*\"|'[^']*')|(?<!\\||>|(?:^|\\s)[02-9])>{1,2}\\|?\\s*(?:\"/dev/(?:null|tty|stdout|stderr)\"|'/dev/(?:null|tty|stdout|stderr)'|/dev/(?:null|tty|stdout|stderr))(?=[\\s;&|]|$))*(?<!\\||>|(?:^|\\s)[02-9])>{1,2}\\|?\\s*(?!(?:\"/dev/(?:null|tty|stdout|stderr)\"|'/dev/(?:null|tty|stdout|stderr)'|/dev/(?:null|tty|stdout|stderr))(?:[\\s;&|]|$))[$\\w./~\"'-]",
+		tool: "write",
+		message:
+			"Use the `write` tool instead of echo/cat redirection. It handles encoding and provides confirmation. `write` replaces the whole file; to append to an existing file, use `edit` to insert after its last line.",
+	},
+	{
+		pattern: "^\\s*nohup\\s+|(?<!&)\\&\\s*$",
+		tool: "bash",
+		message:
+			"Use `bash` with `name` instead of nohup or background shell syntax so the service stays observable and managed.",
+	},
+	{
+		pattern:
+			"^\\s*(?:(?:bun|npm|pnpm|yarn)\\s+(?:run\\s+)?(?:dev|start)(?:\\s|$)|(?:vite|next\\s+dev|nuxt\\s+dev|nodemon|lldb|gdb|tail\\s+-f)(?:\\s|$)|docker\\s+compose\\s+up(?!.*(?:\\s-d(?:\\s|$)|--detach))(?:\\s|$))",
+		tool: "bash",
+		message: "Use `bash` with `name` for services, watchers, and debuggers; inspect with `read proc://<name>`.",
+	},
+	{
+		pattern:
+			"^\\s*(?:(?:bun|npm|pnpm|yarn)\\s+(?:run\\s+)?\\S+|cargo\\s+watch|watchexec|pytest|vitest|jest|tsc)(?:.|\\n)*(?:--watch|-w)(?:\\s|$)",
+		tool: "bash",
+		message: "Use `bash` with `name` for watch mode so its output, input, and lifecycle stay managed.",
+	},
+];
+
+export const cfgShellPath = register({ id: "shellPath", type: "string", default: undefined });
+
+/** Pi shell command prefix forwarded to legacy extensions; OMP's native shell does not apply it. */
+export const cfgLegacyShellCommandPrefix = register({ id: "shellCommandPrefix", type: "string", default: undefined });
+
+export const cfgBashEnabled = register({
+	id: "bash.enabled",
+	type: "boolean",
+	default: true,
+	ui: {
+		tab: "shell",
+		group: "Bash",
+		label: "Bash",
+		description: "Enable the bash tool for shell command execution",
+	},
+});
+
+export const cfgBashAllowCompoundCommands = register({
+	id: "bash.allowCompoundCommands",
+	type: "boolean",
+	default: false,
+	ui: {
+		tab: "shell",
+		group: "Bash",
+		label: "Allow Compound Commands",
+		description:
+			"Evaluate literal && chains per command; unmatched commands use normal bash approval policy and mode",
+	},
+});
+
+export const cfgBashAutoBackgroundEnabled = register({
+	id: "bash.autoBackground.enabled",
+	protocolDefault: ["rpc"],
+	type: "boolean",
+	default: true,
+	ui: {
+		tab: "shell",
+		group: "Bash",
+		label: "Bash Auto-Background",
+		description: "Automatically background long-running bash commands and deliver the result later",
+	},
+});
+
+export const cfgBashReapBackground = register({
+	id: "bash.reapBackground",
+	type: "boolean",
+	default: true,
+	ui: {
+		tab: "shell",
+		group: "Bash",
+		label: "Reap Background Processes",
+		description:
+			"Remind the agent about processes its bash calls left running (`cmd &`, `nohup`) when it stops, and kill the `&` ones at session end unless registered as services; off in RPC mode",
+	},
+});
+
+export const cfgBashGitGuard = register({
+	id: "bash.gitGuard",
+	type: "boolean",
+	default: false,
+	ui: {
+		tab: "shell",
+		group: "Bash",
+		label: "Git Guard",
+		description:
+			"Refuse git commands that discard or move shared work in a repository's main checkout: stash, reset --hard or to another commit, and checkout/switch/restore outside a merge or rebase conflict. In a linked worktree they run, saving uncommitted changes they discard first",
+	},
+});
+
+export const cfgBashPatterns = register({
+	id: "bash.patterns",
+	type: "array",
+	default: EMPTY_BASH_PATTERNS,
+	pathScoped: { valuesKey: "patterns", itemType: "object" },
+	merge: "prepend",
+	ui: {
+		tab: "shell",
+		group: "Bash",
+		label: "Bash Approval Patterns",
+		description:
+			"Ordered bash command approval rules. Each item has match and approval fields; only '*' wildcards are supported.",
+	},
+});
+
+export const cfgBashAllowedEnvVars = register({
+	id: "bash.allowedEnvVars",
+	type: "array",
+	default: EMPTY_STRING_ARRAY,
+	ui: {
+		tab: "shell",
+		group: "Bash",
+		label: "Bash Allowed Environment Variables",
+		description:
+			"Exact environment variable names allowed as leading KEY=VALUE prefixes when matching bash.patterns allow rules (no wildcards). Any value is accepted, so list only benign build/test variables; execution-altering variables (PATH, LD_PRELOAD, BASH_ENV, *_RUNNER, *_WRAPPER) allow arbitrary command execution.",
+	},
+});
+
+// Bash interceptor
+export const cfgBashInterceptorEnabled = register({
+	id: "bashInterceptor.enabled",
+	type: "boolean",
+	default: false,
+	ui: {
+		tab: "shell",
+		group: "Bash",
+		label: "Bash Interceptor",
+		description: "Block shell commands that have dedicated tools",
+	},
+});
+
+export const cfgBashInterceptorPatterns = register({
+	id: "bashInterceptor.patterns",
+	type: "array",
+	default: DEFAULT_BASH_INTERCEPTOR_RULES,
+	pathScoped: { valuesKey: "patterns", itemType: "object" },
+	merge: "prepend",
+});
+
+export const cfgBashDirenv = register({
+	id: "bash.direnv",
+	type: "enum",
+	values: ["auto", "off"] as const,
+	default: "auto",
+	ui: {
+		tab: "shell",
+		group: "Bash",
+		label: "direnv Auto-Load",
+		description:
+			"Load project environment variables with the embedded direnv builtin, honoring direnv's allow and deny rules",
+	},
+});
+
+export const cfgBashDirenvLoadTimeoutMs = register({
+	id: "bash.direnvLoadTimeoutMs",
+	type: "number",
+	default: 30_000,
+	ui: {
+		tab: "shell",
+		group: "Bash",
+		label: "direnv Load Timeout (ms)",
+		description:
+			"Max wait for embedded .envrc evaluation (a cold devenv shell can be slow); on timeout the session runs without its exports",
+	},
+});
+
+// Shell output minimizer
+export const cfgShellMinimizerEnabled = register({
+	id: "shellMinimizer.enabled",
+	type: "boolean",
+	default: true,
+	ui: {
+		tab: "shell",
+		group: "Bash",
+		label: "Shell Minimizer",
+		description: "Compress verbose shell output (git, npm, cargo, etc.) before returning it to the agent",
+	},
+});
+
+export const cfgShellMinimizerSettingsPath = register({
+	id: "shellMinimizer.settingsPath",
+	type: "string",
+	default: undefined,
+});
+
+export const cfgShellMinimizerOnly = register({
+	id: "shellMinimizer.only",
+	type: "array",
+	default: EMPTY_STRING_ARRAY,
+});
+
+export const cfgShellMinimizerExcept = register({
+	id: "shellMinimizer.except",
+	type: "array",
+	default: EMPTY_STRING_ARRAY,
+});
+
+export const cfgShellMinimizerMaxCaptureBytes = register({
+	id: "shellMinimizer.maxCaptureBytes",
+	type: "number",
+	default: 4 * 1024 * 1024,
+});
+
+export const cfgShellMinimizerSourceOutlineLevel = register({
+	id: "shellMinimizer.sourceOutlineLevel",
+	type: "enum",
+	values: ["default", "aggressive"] as const,
+	default: "default",
+	ui: {
+		tab: "shell",
+		group: "Bash",
+		label: "Shell Minimizer Source Outline",
+		description: "Source outline mode for cat/read of source files: default or aggressive",
+	},
+});
+
+export const cfgShellMinimizerLegacyFilters = register({
+	id: "shellMinimizer.legacyFilters",
+	type: "boolean",
+	default: undefined,
+});
+
+/** Shell output minimizer configuration (`shellMinimizer.*`). */
+export const cfgShellMinimizer = combine({
+	enabled: cfgShellMinimizerEnabled,
+	settingsPath: cfgShellMinimizerSettingsPath,
+	only: cfgShellMinimizerOnly,
+	except: cfgShellMinimizerExcept,
+	maxCaptureBytes: cfgShellMinimizerMaxCaptureBytes,
+	sourceOutlineLevel: cfgShellMinimizerSourceOutlineLevel,
+	legacyFilters: cfgShellMinimizerLegacyFilters,
+});
+
+/** Shell output minimizer configuration ({@link cfgShellMinimizer}). */
+export type ShellMinimizerSettings = SettingValueOf<typeof cfgShellMinimizer>;
+
+export const cfgBashAutoBackgroundThresholdMs = register({
+	id: "bash.autoBackground.thresholdMs",
+	protocolDefault: ["rpc"],
+	type: "number",
+	default: 60_000,
+});

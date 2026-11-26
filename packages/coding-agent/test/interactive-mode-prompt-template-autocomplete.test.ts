@@ -8,19 +8,22 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as os from "node:os";
 import * as path from "node:path";
+import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import { type Api, Effort, type Model } from "@oh-my-pi/pi-ai";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import type { PromptTemplate } from "@oh-my-pi/pi-coding-agent/config/prompt-templates";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
-import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import type { AutocompleteProvider } from "@oh-my-pi/pi-tui";
+import type { AutocompleteProvider } from "@oh-my-pi/pi-coding-agent/autocomplete/autocomplete";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { type } from "arktype";
+
+import { cfgStartupQuiet } from "@oh-my-pi/pi-coding-agent/modes/settings";
+import { initTheme } from "../src/ui/theme/service";
+import { createModeTerminal } from "./helpers/mode-terminal";
 
 function makeTool(name: string): AgentTool {
 	return {
@@ -56,9 +59,9 @@ describe("InteractiveMode prompt-template autocomplete (#2462)", () => {
 		originalHome = process.env.HOME;
 		process.env.HOME = tempDir.path();
 		await Settings.init({ inMemory: true, cwd: tempDir.path() });
-		Settings.instance.set("startup.quiet", true);
+		cfgStartupQuiet.set(Settings.instance, true);
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
-		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		authStorage.keys.setRuntime("anthropic", "test-key");
 		// ModelRegistry (bundled-model load) and the resolved model are immutable across
 		// these tests, so build them once rather than per test.
 		registry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
@@ -117,7 +120,15 @@ describe("InteractiveMode prompt-template autocomplete (#2462)", () => {
 			toolRegistry: new Map(tools.map(tool => [tool.name, tool])),
 			promptTemplates: templates,
 		});
-		const createdMode = new InteractiveMode(created, "test");
+		const createdMode = new InteractiveMode(
+			created,
+			"test",
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			createModeTerminal().frame,
+		);
 		session = created;
 		mode = createdMode;
 		return { mode: createdMode, session: created };
@@ -125,8 +136,9 @@ describe("InteractiveMode prompt-template autocomplete (#2462)", () => {
 
 	function captureAutocompleteProvider(target: InteractiveMode): { current: AutocompleteProvider | undefined } {
 		const slot: { current: AutocompleteProvider | undefined } = { current: undefined };
-		vi.spyOn(target.editor, "setAutocompleteProvider").mockImplementation(provider => {
-			slot.current = provider;
+		// The mode hands the composer its own provider (with inline hints); the composer's type is narrower.
+		vi.spyOn(target.composer, "setAutocomplete").mockImplementation(provider => {
+			slot.current = provider as AutocompleteProvider | undefined;
 		});
 		return slot;
 	}
@@ -178,6 +190,31 @@ describe("InteractiveMode prompt-template autocomplete (#2462)", () => {
 		created.session.setFastMode(true);
 		const onFast = (await fetchSlashItems(providerSlot.current!, "/fast")).find(item => item.value === "fast");
 		expect(onFast?.description).toBe("Fast: on");
+	});
+
+	it("normalizes file-command hints before autocomplete renders them", async () => {
+		const created = createHarness([]);
+		const providerSlot = captureAutocompleteProvider(created.mode);
+
+		await created.mode.refreshSlashCommandState(tempDir.path(), [
+			{
+				name: "git-sync",
+				description: "Sync branches",
+				content: "body",
+				source: "test",
+				argumentHint: "[base\tbranch]\n[next]",
+			},
+		]);
+
+		const provider = providerSlot.current;
+		expect(provider).toBeDefined();
+		const item = (await fetchSlashItems(provider!, "/git-sync")).find(candidate => candidate.value === "git-sync");
+		const inlineHint = provider!.getInlineHint?.(["/git-sync "], 0, "/git-sync ".length);
+
+		expect(item?.description).toContain("[next] - Sync branches");
+		expect(item?.description).not.toMatch(/[\t\r\n]/);
+		expect(inlineHint).toContain("[next]");
+		expect(inlineHint).not.toMatch(/[\t\r\n]/);
 	});
 
 	it("does not duplicate templates whose names collide with builtin slash commands", async () => {

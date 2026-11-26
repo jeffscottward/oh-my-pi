@@ -31,6 +31,8 @@ export interface OpenAIAnthropicShimConfig {
 	defaultFormat: OpenAIAnthropicApiFormat;
 	/** Thinking transport used when this provider's Anthropic endpoint differs from generic budget semantics. */
 	anthropicThinkingMode?: ThinkingControlMode;
+	/** Forward cache-retention and request-metadata options to the selected transport. Default: false. */
+	forwardCacheOptions?: boolean;
 	/** Provider-specific headers (e.g. auth/session) merged ahead of user-supplied headers. */
 	extraHeaders?: () => Record<string, string>;
 }
@@ -54,7 +56,7 @@ export function streamOpenAIAnthropicShim(
 	(async () => {
 		try {
 			const mergedHeaders = {
-				...(config.extraHeaders?.() ?? {}),
+				...config.extraHeaders?.(),
 				...options?.headers,
 			};
 
@@ -90,11 +92,15 @@ export function streamOpenAIAnthropicShim(
 					minP: options?.minP,
 					presencePenalty: options?.presencePenalty,
 					repetitionPenalty: options?.repetitionPenalty,
+					stopSequences: options?.stopSequences,
 					maxTokens: options?.maxTokens ?? model.maxTokens ?? undefined,
 					signal: options?.signal,
 					headers: mergedHeaders,
+					cacheRetention: config.forwardCacheOptions ? options?.cacheRetention : undefined,
+					metadata: config.forwardCacheOptions ? options?.metadata : undefined,
 					sessionId: options?.sessionId,
 					promptCacheKey: options?.promptCacheKey,
+					omitDemotedReasoning: options?.omitDemotedReasoning,
 					onPayload: options?.onPayload,
 					onResponse: options?.onResponse,
 					onSseEvent: options?.onSseEvent,
@@ -104,6 +110,7 @@ export function streamOpenAIAnthropicShim(
 					reasoning: config.anthropicThinkingMode ? reasoningEffort : undefined,
 					toolChoice: mapAnthropicToolChoice(options?.toolChoice),
 					serviceTier: options?.serviceTier,
+					waitForTerminalDrain: options?.waitForTerminalDrain,
 				});
 
 				for await (const event of innerStream) {
@@ -128,9 +135,14 @@ export function streamOpenAIAnthropicShim(
 					minP: options?.minP,
 					presencePenalty: options?.presencePenalty,
 					repetitionPenalty: options?.repetitionPenalty,
+					stopSequences: options?.stopSequences,
+					frequencyPenalty: options?.frequencyPenalty,
 					maxTokens: options?.maxTokens ?? model.maxTokens ?? undefined,
+					maxHttpAttempts: options?.maxHttpAttempts,
 					signal: options?.signal,
 					headers: mergedHeaders,
+					cacheRetention: config.forwardCacheOptions ? options?.cacheRetention : undefined,
+					metadata: config.forwardCacheOptions ? options?.metadata : undefined,
 					sessionId: options?.sessionId,
 					promptCacheKey: options?.promptCacheKey,
 					onPayload: options?.onPayload,
@@ -141,6 +153,7 @@ export function streamOpenAIAnthropicShim(
 					toolChoice: options?.toolChoice,
 					serviceTier: options?.serviceTier,
 					disableReasoning: options?.disableReasoning,
+					waitForTerminalDrain: options?.waitForTerminalDrain,
 				});
 
 				for await (const event of innerStream) {

@@ -1,35 +1,4 @@
-/**
- * Repair double-encoded JSON string arguments for the task tool.
- *
- * Models occasionally JSON-escape a string value twice when emitting a
- * `task` tool call, so a `task` field that should read
- *
- *     # Role
- *     You are a judge … "describe this" … return —
- *
- * arrives — after the one JSON decode the provider already applied — as the
- * literal text
- *
- *     # Role\nYou are a judge … \"describe this\" … return \u2014
- *
- * i.e. every newline, quote, and unicode character is still backslash-escaped.
- * The subagent then receives that garbled prompt, and the call preview renders
- * one long blob with visible `\n` / `\"` / `\uXXXX`.
- *
- * The *whole-arguments* form of this quirk (the entire `arguments` blob is a
- * JSON string) is already auto-corrected by the validator's JSON-string
- * coercion. This module handles the *per-field* form, where the object parses
- * fine but an individual string value is double-encoded — the validator never
- * fires there because a double-encoded string is still a structurally valid
- * string.
- *
- * This is deliberately scoped to the task tool's natural-language fields
- * (`task`, shared `context`); identifier fields (`name`, `agent`)
- * are never repaired. It is NOT applied to code-bearing
- * tools (write/edit/bash/search), where a backslash or quote is load-bearing
- * and a false-positive unescape would silently corrupt a file or command.
- */
-import type { TaskItem, TaskParams } from "./types";
+import type { TaskItem, TaskParams } from "./task-details";
 
 /** A backslash that escapes a structural char — `\"`, `\\`, `\/`, or `\uXXXX`. */
 const STRUCTURAL_ESCAPE = /\\(?:["\\/]|u[0-9a-fA-F]{4})/;
@@ -79,40 +48,71 @@ export function repairDoubleEncodedJsonString(value: string): string {
 	return typeof decoded === "string" && decoded !== value ? decoded : value;
 }
 
-/** Repair a single (possibly partial) task item's prose field (`task`). */
+/** Repair each string of a (possibly partial) `steps` list; the same reference when nothing changed. */
+function repairSteps(steps: string[] | undefined): string[] | undefined {
+	if (!Array.isArray(steps)) return steps;
+	let changed = false;
+	const repaired = steps.map(step => {
+		if (typeof step !== "string") return step;
+		const next = repairDoubleEncodedJsonString(step);
+		if (next !== step) changed = true;
+		return next;
+	});
+	return changed ? repaired : steps;
+}
+
+/** Repair a single (possibly partial) task item's prose fields (`task`, `steps`). */
 function repairTaskItem(item: TaskItem): TaskItem {
 	if (item === null || typeof item !== "object") return item;
 	const task = typeof item.task === "string" ? repairDoubleEncodedJsonString(item.task) : item.task;
-	if (task === item.task) return item;
-	return { ...item, task };
+	const steps = repairSteps(item.steps);
+	if (task === item.task && steps === item.steps) return item;
+	return { ...item, task, steps };
+}
+
+/** Promote a JSON-string `tasks` payload to an array when it is unambiguously one. */
+function parseStringTasks(tasks: string): TaskItem[] | undefined {
+	const trimmed = tasks.trim();
+	if (trimmed.length < 2 || trimmed[0] !== "[" || trimmed[trimmed.length - 1] !== "]") return undefined;
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(trimmed);
+	} catch {
+		return undefined;
+	}
+	return Array.isArray(parsed) ? (parsed as TaskItem[]) : undefined;
 }
 
 /**
- * Repair double-encoded prose in task-tool params (flat `task`, shared
- * `context`, and each batch task item's `task`). Returns the same reference
- * when nothing changed so callers can cheaply skip work. Defensive against
- * partially-streamed args (missing/undefined fields, partial task arrays) so
- * it is safe on the render path as well as on execution.
+ * Repair double-encoded prose in task-tool params (flat `task`/`steps`, shared
+ * `context`, and each batch task item's `task`/`steps`), and promote a JSON-string
+ * `tasks` payload back to a real array. Returns the same reference when nothing
+ * changed so callers can cheaply skip work. Defensive against partially-streamed
+ * args (missing/undefined fields, partial task arrays) so it is safe on the render
+ * path as well as on execution.
  */
 export function repairTaskParams(params: TaskParams): TaskParams {
 	if (params === null || typeof params !== "object") return params;
 
 	const task = typeof params.task === "string" ? repairDoubleEncodedJsonString(params.task) : params.task;
 	const context = typeof params.context === "string" ? repairDoubleEncodedJsonString(params.context) : params.context;
+	const steps = repairSteps(params.steps);
 
-	let tasks = params.tasks;
-	if (Array.isArray(params.tasks)) {
+	let tasks: unknown = params.tasks;
+	if (typeof tasks === "string") tasks = parseStringTasks(tasks) ?? tasks;
+	if (Array.isArray(tasks)) {
 		let changed = false;
-		const repaired = params.tasks.map(item => {
-			const next = repairTaskItem(item);
+		const repaired = tasks.map(item => {
+			const next = repairTaskItem(item as TaskItem);
 			if (next !== item) changed = true;
 			return next;
 		});
 		if (changed) tasks = repaired;
 	}
+	const finalTasks = tasks as TaskParams["tasks"];
 
-	if (task === params.task && context === params.context && tasks === params.tasks) {
+	if (task === params.task && steps === params.steps && context === params.context && finalTasks === params.tasks) {
 		return params;
 	}
-	return { ...params, task, context, tasks };
+	return { ...params, task, steps, context, tasks: finalTasks };
 }

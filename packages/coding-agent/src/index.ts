@@ -1,23 +1,34 @@
-import { HookEditorComponent, HookInputComponent, HookSelectorComponent } from "./modes/components";
-
 // Core session management
 
-// Re-export TUI components for custom tool rendering
-export { Container, Markdown, Spacer, Text } from "@oh-my-pi/pi-tui";
+export * as zod from "@oh-my-pi/omptype/zod";
+export { z } from "@oh-my-pi/omptype/zod";
 // Logging
 export { getAgentDir, logger, VERSION } from "@oh-my-pi/pi-utils";
-export * as zod from "zod/v4";
-export { z } from "zod/v4";
-export * from "./config/keybindings";
+export {
+	type AppKeybinding,
+	getDefaultPasteImageKeys,
+	KEYBINDINGS,
+	type Keybinding,
+} from "./config/keybindings/app-keybindings";
+export {
+	type KeybindingsConfig,
+	type KeybindingsCreateOptions,
+	migrateKeybindingsConfigFile,
+} from "./config/keybindings/config-file";
+export { canonicalKeyId, type KeyId } from "./config/keybindings/key-id";
+export * from "./config/keybindings/keybindings";
+export { keyHintPlatform, setKeyHintPlatform } from "./ui/keys/format";
+export { formatDoubleTap, formatKeyHint, formatKeyHints, formatTooltipKey } from "./ui/keys/hints";
+export type { ResolvedRoleModel } from "./modes/view-model/overlays/model-picker";
+export type { ContextUsage } from "./modes/view-model/status-line/types";
 export * from "./config/model-registry";
 // Prompt templates
 export type * from "./config/prompt-templates";
 export * from "./config/prompt-templates";
-export type { RetrySettings, SkillsSettings } from "./config/settings";
+export type { RetrySettings } from "./session/settings";
 export { Settings, settings } from "./config/settings";
 // Custom commands
 export type * from "./extensibility/custom-commands/types";
-export type * from "./extensibility/custom-tools";
 // Custom tools
 export * from "./extensibility/custom-tools";
 export type * from "./extensibility/extensions";
@@ -33,9 +44,8 @@ export type * from "./lsp";
 export * from "./main";
 // Run modes for programmatic SDK usage
 export * from "./modes";
-export * from "./modes/components";
-// Theme utilities for custom tools
-export * from "./modes/theme/theme";
+// Theme utilities for extensions (renderers receive the theme itself)
+export * from "./ui/theme/service";
 // SDK for programmatic usage
 export * from "./sdk";
 export * from "./session/agent-session";
@@ -55,12 +65,26 @@ export * from "./session/session-storage";
 export * from "./session/sql-session-storage";
 export * from "./task/executor";
 export type * from "./task/types";
+export type {
+	AgentSource,
+	StructuredSubagentSchemaMode,
+	StructuredSubagentSchemaSource,
+	StructuredSubagentValidationStatus,
+	StructuredSubagentOutput,
+	TaskItem,
+	TaskParams,
+	ReviewFinding,
+	ReviewSummary,
+	ReviewData,
+	YieldItem,
+	AgentProgress,
+	SingleResult,
+	TaskToolDetails,
+} from "./task/task-details";
 // Tools (detail types and utilities)
 export * from "./tools";
-export * from "./utils/git";
-// UI components for extensions
-export {
-	HookEditorComponent as ExtensionEditorComponent,
-	HookInputComponent as ExtensionInputComponent,
-	HookSelectorComponent as ExtensionSelectorComponent,
-};
+export * from "./tools/hashline-header-path";
+export * from "./utils/github";
+// Helpers and setting handles for extensions, so they need not import internal paths
+export { ansiSpans } from "./ui/transcript/messages/spans";
+export { cfgExtensionTranscriptPresenters, type SkillsSettings } from "./extensibility/settings";

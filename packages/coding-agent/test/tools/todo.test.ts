@@ -1,23 +1,32 @@
-import { beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, describe, expect, it } from "bun:test";
 import * as path from "node:path";
+import { type } from "@oh-my-pi/omptype";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { initTheme, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import {
 	markdownToPhases,
 	nextActionableTask,
-	phasesToMarkdown,
 	resolveTodoMarkdownPath,
+	TodoTool,
+} from "@oh-my-pi/pi-coding-agent/tools";
+import {
 	selectCollapsedTodos,
 	TODO_STRIKE_HOLD_FRAMES,
+	TODO_STRIKE_TOTAL_FRAMES,
 	type TodoItem,
 	type TodoPhase,
-	TodoTool,
+	type TodoStatus,
 	todoMatchesAnyDescription,
-	todoToolRenderer,
-} from "@oh-my-pi/pi-coding-agent/tools";
-import type { Component } from "@oh-my-pi/pi-tui";
-import { type } from "arktype";
+} from "@oh-my-pi/pi-coding-agent/tools/details/todo";
+import { SPINNER_INTERVAL_MS } from "@oh-my-pi/pi-tui/term/painters/spinner";
+import { createTestTerminal, type TestTerminal } from "@oh-my-pi/pi-tui/testing/terminal";
+import { loadThemeSync } from "@oh-my-pi/pi-tui/theme/loader";
+import { ToolBlock, ToolCall, type ToolCallResult } from "../../src/ui/transcript/tool-block";
+import { toolCall } from "../helpers/tool-text";
+import { currentTheme, setCurrentTheme } from "@oh-my-pi/pi-tui/theme/runtime";
+
+const restoreTheme = currentTheme();
+afterAll(() => setCurrentTheme(restoreTheme));
 
 function createSession(initialPhases: TodoPhase[] = []): ToolSession {
 	let phases = initialPhases;
@@ -34,9 +43,32 @@ function createSession(initialPhases: TodoPhase[] = []): ToolSession {
 	};
 }
 
-beforeAll(async () => {
-	await initTheme();
-});
+const DARK = loadThemeSync("dark");
+
+/** A todo call's transcript card on a 120-column terminal (clock at 0; `tick` advances the strike). */
+function todoCard(call: ToolCall): TestTerminal {
+	return createTestTerminal(() => ({ main: ToolBlock({ call }) }), { columns: 120, rows: 80, theme: DARK, now: 0 });
+}
+
+/** The card's rows (escapes kept) for a result, `args` the call's (undefined: a rebuilt transcript without them). */
+function resultRows(result: ToolCallResult, expanded: boolean, args?: unknown): string {
+	const term = todoCard(toolCall({ name: "todo", args, result, expanded }));
+	try {
+		return term.rows().join("\n");
+	} finally {
+		term.dispose();
+	}
+}
+
+/** The card's rows (escapes kept) while the call's args still stream. */
+function callRows(args: unknown): string {
+	const term = todoCard(new ToolCall({ id: "call-1", name: "todo", args }));
+	try {
+		return term.rows().join("\n");
+	} finally {
+		term.dispose();
+	}
+}
 
 describe("resolveTodoMarkdownPath", () => {
 	it("defaults to TODO.md under cwd", () => {
@@ -54,7 +86,7 @@ describe("resolveTodoMarkdownPath", () => {
 	it("rejects internal URL schemes", () => {
 		const cwd = path.resolve("tmp", "todo-workspace");
 
-		expect(() => resolveTodoMarkdownPath("artifact://todo", cwd)).toThrow("internal scheme");
+		expect(() => resolveTodoMarkdownPath("agent://todo", cwd)).toThrow("internal scheme");
 	});
 });
 
@@ -136,17 +168,19 @@ it("renders completed tasks as checked before revealing strikethrough", async ()
 	const tool = new TodoTool(createSession());
 	await tool.execute("call-1", { op: "init", list: [{ phase: "Execution", items: ["finish"] }] });
 	const result = await tool.execute("call-2", { op: "done", task: "finish" });
-	const options = { expanded: true, isPartial: false, spinnerFrame: 0 };
-	const component = todoToolRenderer.renderResult(result, options, theme);
+	const term = todoCard(toolCall({ name: "todo", args: { op: "done", task: "finish" }, result, expanded: true }));
+	try {
+		const firstFrame = term.rows().join("\n");
+		expect(Bun.stripANSI(firstFrame)).toContain("finish");
+		expect(firstFrame).not.toContain("\x1b[9m");
 
-	const firstFrame = component.render(120).join("\n");
-	expect(Bun.stripANSI(firstFrame)).toContain("finish");
-	expect(firstFrame).not.toContain("\x1b[9m");
-
-	options.spinnerFrame = TODO_STRIKE_HOLD_FRAMES + 1;
-	const revealFrame = component.render(120).join("\n");
-	expect(Bun.stripANSI(revealFrame)).toContain("finish");
-	expect(revealFrame).toContain("\x1b[9m");
+		term.tick(SPINNER_INTERVAL_MS * (TODO_STRIKE_HOLD_FRAMES + 1));
+		const revealFrame = term.rows().join("\n");
+		expect(Bun.stripANSI(revealFrame)).toContain("finish");
+		expect(revealFrame).toContain("\x1b[9m");
+	} finally {
+		term.dispose();
+	}
 });
 
 describe("TodoTool operations", () => {
@@ -180,6 +214,68 @@ describe("TodoTool operations", () => {
 		expect(allTasks.map(task => task.status)).toEqual(["pending", "pending", "in_progress"]);
 	});
 
+	it("applies done and rm to every task in an array across phases", async () => {
+		const tool = new TodoTool(createSession());
+		await tool.execute("call-1", {
+			op: "init",
+			list: [
+				{ phase: "A", items: ["a1", "a2"] },
+				{ phase: "B", items: ["b1", "b2"] },
+			],
+		});
+
+		const done = await tool.execute("call-2", { op: "done", task: ["a1", "b1"] });
+		expect(done.isError).toBeUndefined();
+		expect(done.details?.completedTasks).toEqual([
+			{ phase: "A", content: "a1" },
+			{ phase: "B", content: "b1" },
+		]);
+		expect(done.details?.phases.flatMap(phase => phase.tasks.map(task => task.status))).toEqual([
+			"completed",
+			"in_progress",
+			"completed",
+			"pending",
+		]);
+
+		const removed = await tool.execute("call-3", { op: "rm", task: ["a2", "b2"] });
+		expect(removed.details?.phases.map(phase => phase.tasks.map(task => task.content))).toEqual([["a1"], ["b1"]]);
+	});
+
+	it("splits a flattened task string like a path list, preferring verbatim content", async () => {
+		const tool = new TodoTool(createSession());
+		await tool.execute("call-1", { op: "init", list: [{ phase: "A", items: ["Fix foo, bar", "a1", "a2", "a3"] }] });
+		const statuses = (phases: TodoPhase[] | undefined) => phases?.[0]?.tasks.map(task => task.status);
+
+		const verbatim = await tool.execute("call-2", { op: "done", task: "Fix foo, bar" });
+		expect(statuses(verbatim.details?.phases)).toEqual(["completed", "in_progress", "pending", "pending"]);
+
+		const partial = await tool.execute("call-3", { op: "done", task: "a2; nope" });
+		const partialText = partial.content.find(part => part.type === "text");
+		expect(partialText?.type === "text" && partialText.text).toContain('Errors: Task "nope" not found');
+
+		const spaced = await tool.execute("call-4", { op: "done", task: " a1  a2 " });
+		expect(statuses(spaced.details?.phases)).toEqual(["completed", "completed", "completed", "in_progress"]);
+
+		const quoted = await tool.execute("call-5", { op: "drop", task: '"a3",' });
+		expect(statuses(quoted.details?.phases)).toEqual(["completed", "completed", "completed", "abandoned"]);
+	});
+
+	it("rejects a task array with a missing entry, or more than one task to start, without changing state", async () => {
+		const tool = new TodoTool(createSession());
+		await tool.execute("call-1", { op: "init", list: [{ phase: "A", items: ["a1", "a2", "a3"] }] });
+		const before: TodoStatus[] = ["in_progress", "pending", "pending"];
+
+		const missing = await tool.execute("call-2", { op: "done", task: ["a2", "nope"] });
+		expect(missing.isError).toBe(true);
+		const missingText = missing.content.find(part => part.type === "text");
+		expect(missingText?.type === "text" && missingText.text).toContain('Task "nope" not found');
+		expect(missing.details?.phases[0]?.tasks.map(task => task.status)).toEqual(before);
+
+		const start = await tool.execute("call-3", { op: "start", task: ["a2", "a3"] });
+		expect(start.isError).toBe(true);
+		expect(start.details?.phases[0]?.tasks.map(task => task.status)).toEqual(before);
+	});
+
 	it("appends items to an existing phase", async () => {
 		const tool = new TodoTool(createSession());
 		await tool.execute("call-1", { op: "init", list: [{ phase: "Work", items: ["First"] }] });
@@ -197,143 +293,124 @@ describe("TodoTool operations", () => {
 		]);
 	});
 
-	it("blocks a task (excluded from remaining, counted distinctly) and unblocks it", async () => {
-		const tool = new TodoTool(createSession());
-		await tool.execute("call-1", { op: "init", list: [{ phase: "Work", items: ["a", "b"] }] });
+	it("appends to the active phase unless an explicit phase overrides it", async () => {
+		const session = createSession();
+		const tool = new TodoTool(session);
+		await tool.execute("init", {
+			op: "init",
+			list: [
+				{ phase: "A", items: ["a1", "a2"] },
+				{ phase: "B", items: ["b1"] },
+			],
+		});
 
-		const blocked = await tool.execute("call-2", { op: "block", task: "b", reason: "waiting on sign-off" });
-		const bTask = blocked.details?.phases[0]?.tasks.find(task => task.content === "b");
-		expect(bTask?.status).toBe("blocked");
-		expect(bTask?.blocker).toBe("waiting on sign-off");
-		const summary = blocked.content.find(part => part.type === "text");
-		if (summary?.type !== "text") throw new Error("Expected text summary from todo");
-		// `a` stays the only open item; `b` leaves the remaining/open set but is surfaced as blocked.
-		expect(summary.text).toContain("Remaining items (1):");
-		expect(summary.text).toContain("1 blocked");
+		const first = await tool.execute("append-a", { op: "append", items: ["a3"] });
+		expect(first.isError).toBeUndefined();
+		expect(first.details?.phases.map(phase => phase.tasks.map(task => task.content))).toEqual([
+			["a1", "a2", "a3"],
+			["b1"],
+		]);
 
-		const unblocked = await tool.execute("call-3", { op: "unblock", task: "b" });
-		const bAfter = unblocked.details?.phases[0]?.tasks.find(task => task.content === "b");
-		expect(bAfter?.status).toBe("pending");
-		expect(bAfter?.blocker).toBeUndefined();
+		await tool.execute("start-b", { op: "start", task: "b1" });
+		const second = await tool.execute("append-b", { op: "append", items: ["b2"] });
+		expect(second.isError).toBeUndefined();
+		expect(second.details?.phases[1]?.tasks).toEqual([
+			{ content: "b1", status: "in_progress" },
+			{ content: "b2", status: "pending" },
+		]);
+
+		const explicit = await tool.execute("append-explicit", { op: "append", phase: "A", items: ["a4"] });
+		expect(explicit.isError).toBeUndefined();
+		expect(session.getTodoPhases?.()?.map(phase => phase.tasks.map(task => task.content))).toEqual([
+			["a1", "a2", "a3", "a4"],
+			["b1", "b2"],
+		]);
 	});
 
-	it("does not auto-promote a blocked task to in_progress", async () => {
-		const tool = new TodoTool(createSession());
-		await tool.execute("call-1", { op: "init", list: [{ phase: "Work", items: ["only"] }] });
-
-		const result = await tool.execute("call-2", { op: "block", task: "only" });
-
-		// `only` was in_progress; blocking it leaves no pending/in_progress, so normalization must not revive it.
-		expect(result.details?.phases[0]?.tasks[0]?.status).toBe("blocked");
-	});
-
-	it("blocking a phase leaves completed/abandoned tasks closed", async () => {
-		const tool = new TodoTool(createSession());
-		await tool.execute("call-1", { op: "init", list: [{ phase: "Work", items: ["a", "b", "c"] }] });
-		await tool.execute("call-2", { op: "done", task: "a" });
-		await tool.execute("call-3", { op: "drop", task: "c" });
-
-		const result = await tool.execute("call-4", { op: "block", phase: "Work", reason: "waiting on infra" });
-		const tasks = result.details?.phases[0]?.tasks ?? [];
-		const byContent = (content: string) => tasks.find(task => task.content === content);
-		// Completed/abandoned work is untouched; only the open task becomes blocked.
-		expect(byContent("a")?.status).toBe("completed");
-		expect(byContent("c")?.status).toBe("abandoned");
-		expect(byContent("b")?.status).toBe("blocked");
-		expect(byContent("b")?.blocker).toBe("waiting on infra");
-		// A completed task must never carry a blocker note.
-		expect(byContent("a")?.blocker).toBeUndefined();
-	});
-
-	it("re-blocking an already-blocked task refines its blocker note", async () => {
-		const tool = new TodoTool(createSession());
-		await tool.execute("call-1", { op: "init", list: [{ phase: "Work", items: ["a", "b"] }] });
-		// First block with no reason, then block again to add one — the agent often
-		// learns what it's waiting on only after the initial block.
-		await tool.execute("call-2", { op: "block", task: "b" });
-		const first = await tool.execute("call-3", { op: "block", task: "b" });
-		expect(first.details?.phases[0]?.tasks.find(task => task.content === "b")?.blocker).toBeUndefined();
-
-		const refined = await tool.execute("call-4", { op: "block", task: "b", reason: "waiting on user" });
-		const bTask = refined.details?.phases[0]?.tasks.find(task => task.content === "b");
-		expect(bTask?.status).toBe("blocked");
-		expect(bTask?.blocker).toBe("waiting on user");
-	});
-
-	it("rejects a block with neither task nor phase target", async () => {
-		const tool = new TodoTool(createSession());
-		await tool.execute("call-1", { op: "init", list: [{ phase: "Work", items: ["a", "b"] }] });
-
-		const result = await tool.execute("call-2", { op: "block", reason: "oops" });
-		expect(result.isError).toBe(true);
-		const summary = result.content.find(part => part.type === "text");
-		if (summary?.type !== "text") throw new Error("Expected text summary from todo");
-		expect(summary.text).toContain("block requires a task or phase target");
-		// Nothing was blocked — state is unchanged.
-		const tasks = result.details?.phases[0]?.tasks ?? [];
-		expect(tasks.every(task => task.status !== "blocked")).toBe(true);
-	});
-
-	it("rejects an unblock with neither task nor phase target", async () => {
-		const tool = new TodoTool(createSession());
-		await tool.execute("call-1", { op: "init", list: [{ phase: "Work", items: ["a"] }] });
-		await tool.execute("call-2", { op: "block", task: "a", reason: "x" });
-
-		const result = await tool.execute("call-3", { op: "unblock" });
-		expect(result.isError).toBe(true);
-		const summary = result.content.find(part => part.type === "text");
-		if (summary?.type !== "text") throw new Error("Expected text summary from todo");
-		expect(summary.text).toContain("unblock requires a task or phase target");
-		// The blocked task stays blocked — the targetless unblock was rejected.
-		expect(result.details?.phases[0]?.tasks[0]?.status).toBe("blocked");
-	});
-
-	it("preserves blocked status across the markdown round-trip", () => {
-		const phases: TodoPhase[] = [
+	it("uses the first pending phase when no task is active, skipping closed phases", async () => {
+		const tool = new TodoTool(
+			createSession([
+				{ name: "Done", tasks: [{ content: "wait", status: "completed" }] },
+				{ name: "Next", tasks: [{ content: "next", status: "pending" }] },
+				{ name: "Later", tasks: [{ content: "later", status: "pending" }] },
+			]),
+		);
+		const result = await tool.execute("append", { op: "append", items: ["new"] });
+		expect(result.isError).toBeUndefined();
+		expect(result.details?.phases).toEqual([
+			{ name: "Done", tasks: [{ content: "wait", status: "completed" }] },
 			{
-				name: "Work",
+				name: "Next",
 				tasks: [
-					{ content: "a", status: "blocked", blocker: "x" },
-					{ content: "b", status: "completed" },
+					{ content: "next", status: "in_progress" },
+					{ content: "new", status: "pending" },
 				],
 			},
-		];
-		const md = phasesToMarkdown(phases);
-		expect(md).toContain("- [!] a");
-
-		const { phases: parsed, errors } = markdownToPhases(md);
-		expect(errors).toEqual([]);
-		const parsedA = parsed[0]?.tasks.find(task => task.content === "a");
-		expect(parsedA?.status).toBe("blocked");
-		// The blocker reason must survive the round-trip, not just the status.
-		expect(parsedA?.blocker).toBe("x");
+			{ name: "Later", tasks: [{ content: "later", status: "pending" }] },
+		]);
 	});
 
-	it("normalizes a multi-line blocker reason so the markdown round-trip survives", async () => {
+	it("appends to the last phase after completion without reopening completed work", async () => {
 		const tool = new TodoTool(createSession());
-		await tool.execute("call-1", { op: "init", list: [{ phase: "Work", items: ["a"] }] });
-		// A blocker reason lifted from a multi-line external error or user question.
-		const blocked = await tool.execute("call-2", {
-			op: "block",
-			task: "a",
-			reason: "waiting on user:\nline two\n\tindented three",
+		await tool.execute("init", {
+			op: "init",
+			list: [
+				{ phase: "A", items: ["a1"] },
+				{ phase: "B", items: ["b1"] },
+			],
 		});
-		const phases = blocked.details?.phases ?? [];
-		const stored = phases[0]?.tasks.find(task => task.content === "a");
-		// Normalized at the source: whitespace runs (incl. newlines) collapse to
-		// single spaces, so every one-line consumer stays intact.
-		expect(stored?.blocker).toBe("waiting on user: line two indented three");
+		await tool.execute("done", { op: "done", task: ["a1", "b1"] });
+		const result = await tool.execute("append", { op: "append", items: ["b2"] });
+		expect(result.isError).toBeUndefined();
+		expect(result.details?.phases).toEqual([
+			{ name: "A", tasks: [{ content: "a1", status: "completed" }] },
+			{
+				name: "B",
+				tasks: [
+					{ content: "b1", status: "completed" },
+					{ content: "b2", status: "in_progress" },
+				],
+			},
+		]);
+	});
 
-		// Without normalization the embedded newline splits the HTML comment across
-		// two markdown lines: line one is an unclosed `<!-- blocker: …` and line two
-		// parses as unrecognized syntax, losing the reason and adding an error.
-		const md = phasesToMarkdown(phases);
-		expect(md.split("\n").filter(line => line.includes("- [!]"))).toHaveLength(1);
-		const { phases: parsed, errors } = markdownToPhases(md);
+	it("creates a phase for an empty list that subsequent phaseless appends reuse", async () => {
+		const session = createSession();
+		const tool = new TodoTool(session);
+		const first = await tool.execute("first", { op: "append", items: ["first"] });
+		expect(first.isError).toBeUndefined();
+		const second = await tool.execute("second", { op: "append", items: ["second"] });
+		expect(second.isError).toBeUndefined();
+		expect(session.getTodoPhases?.()).toEqual([
+			{
+				name: "Tasks",
+				tasks: [
+					{ content: "first", status: "in_progress" },
+					{ content: "second", status: "pending" },
+				],
+			},
+		]);
+	});
+
+	it("rejects the retired [!] checklist marker from /todo edit", () => {
+		const { phases, errors } = markdownToPhases("# Work\n- [!] a\n- [ ] b\n");
+		expect(errors).toEqual(['Line 2: unknown status marker "[!]" (use [ ], [x], [/], [-])']);
+		expect(phases[0]?.tasks.map(task => task.content)).toEqual(["b"]);
+	});
+
+	it("parses checklist items with backslash-escaped brackets from /todo edit", () => {
+		// Editors/serializers (e.g. content pasted from a markdown renderer) escape
+		// `[` and `]`; the line still renders as a checkbox, so it must parse rather
+		// than error out and drop the user's edits (issue #9188).
+		const md = ["# Todos", "* \\[x] first", "- \\[ \\] second", "+ \\[/\\] third"].join("\n");
+		const { phases, errors } = markdownToPhases(md);
 		expect(errors).toEqual([]);
-		const parsedA = parsed[0]?.tasks.find(task => task.content === "a");
-		expect(parsedA?.status).toBe("blocked");
-		expect(parsedA?.blocker).toBe("waiting on user: line two indented three");
+		const tasks = phases[0]?.tasks ?? [];
+		expect(tasks).toEqual([
+			{ content: "first", status: "completed" },
+			{ content: "second", status: "pending" },
+			{ content: "third", status: "in_progress" },
+		]);
 	});
 
 	it("creates a phase when append targets a missing phase", async () => {
@@ -365,18 +442,21 @@ describe("TodoTool operations", () => {
 		expect(allTasks.map(task => task.status)).toEqual(["completed", "completed", "in_progress"]);
 	});
 
-	it("removes all tasks when rm omits task and phase", async () => {
+	it("refuses done and rm that name no task, and reads items as the tasks", async () => {
 		const tool = new TodoTool(createSession());
 		await tool.execute("call-1", {
 			op: "init",
-			list: [{ phase: "Work", items: ["First", "Second"] }],
+			list: [{ phase: "Work", items: ["First", "Second", "Third"] }],
 		});
 
-		const result = await tool.execute("call-2", { op: "rm" });
-		expect(result.details?.phases[0]?.tasks).toEqual([]);
-		const summary = result.content.find(part => part.type === "text");
-		if (summary?.type !== "text") throw new Error("Expected text summary");
-		expect(summary.text).toContain("Todo list cleared.");
+		expect((await tool.execute("call-2", { op: "rm" })).isError).toBe(true);
+		expect((await tool.execute("call-3", { op: "done" })).isError).toBe(true);
+		const result = await tool.execute("call-4", { op: "done", items: ["Second"] });
+		expect(result.details?.phases[0]?.tasks.map(task => task.status)).toEqual([
+			"in_progress",
+			"completed",
+			"pending",
+		]);
 	});
 
 	it("drops all tasks in a phase", async () => {
@@ -426,6 +506,39 @@ describe("TodoTool operations", () => {
 });
 
 describe("TodoTool lenient init shapes", () => {
+	it("names an empty init phase Tasks so append can target it", async () => {
+		for (const args of [
+			{ op: "init" as const, phase: "", items: ["First"] },
+			{ op: "init" as const, list: [{ phase: "", items: ["First"] }] },
+		]) {
+			const tool = new TodoTool(createSession());
+			await tool.execute("init", args);
+			const appended = await tool.execute("append", { op: "append", phase: "Tasks", items: ["Second"] });
+			expect(appended.isError).toBeUndefined();
+			expect(appended.details?.phases.map(phase => [phase.name, phase.tasks.map(task => task.content)])).toEqual([
+				["Tasks", ["First", "Second"]],
+			]);
+		}
+	});
+
+	it("rejects normalized duplicate phases without replacing existing state", async () => {
+		const initial: TodoPhase[] = [{ name: "Existing", tasks: [{ content: "Keep", status: "in_progress" }] }];
+		const session = createSession(initial);
+		const tool = new TodoTool(session);
+		const result = await tool.execute("init", {
+			op: "init",
+			list: [
+				{ phase: "", items: ["A"] },
+				{ phase: "Tasks", items: ["B"] },
+			],
+		});
+		expect(result.isError).toBe(true);
+		expect(result.content).toEqual([
+			expect.objectContaining({ text: expect.stringContaining('Duplicate phase "Tasks"') }),
+		]);
+		expect(session.getTodoPhases?.()).toEqual(initial);
+	});
+
 	it("accepts a flattened init with bare items and no phase", async () => {
 		const tool = new TodoTool(createSession());
 		const result = await tool.execute("call-1", { op: "init", items: ["First", "Second"] });
@@ -446,6 +559,27 @@ describe("TodoTool lenient init shapes", () => {
 		expect(result.isError).toBeUndefined();
 		expect(result.details?.phases.map(phase => phase.name)).toEqual(["Cleanup"]);
 		expect(result.details?.phases[0]?.tasks.map(task => task.content)).toEqual(["Remove dead code"]);
+	});
+
+	it("uses flat items when list is an empty placeholder array (#17346)", async () => {
+		const tool = new TodoTool(createSession([{ name: "Old", tasks: [{ content: "Stale", status: "pending" }] }]));
+		const result = await tool.execute("call-1", { op: "init", list: [], items: ["First", "Second"] });
+
+		expect(result.isError).toBeUndefined();
+		expect(result.details?.phases.map(phase => phase.name)).toEqual(["Tasks"]);
+		expect(result.details?.phases[0]?.tasks.map(task => task.content)).toEqual(["First", "Second"]);
+	});
+
+	it("prefers a non-empty list over flat items", async () => {
+		const tool = new TodoTool(createSession());
+		const result = await tool.execute("call-1", {
+			op: "init",
+			list: [{ phase: "Work", items: ["From list"] }],
+			items: ["From items"],
+		});
+
+		expect(result.details?.phases.map(phase => phase.name)).toEqual(["Work"]);
+		expect(result.details?.phases[0]?.tasks.map(task => task.content)).toEqual(["From list"]);
 	});
 
 	it("still errors when init has neither list nor items", async () => {
@@ -501,8 +635,8 @@ describe("TodoTool lenient op recovery", () => {
 		expect(initialized.isError).toBeUndefined();
 		expect(initialized.details?.op).toBe("init");
 
-		// With existing todos the same shape is ambiguous (flat init would wipe
-		// the list; append lacks a phase) and must error instead of guessing.
+		// With existing todos the same shape is ambiguous (replace via flat init
+		// or append to the active phase) and must error instead of guessing.
 		const populated = new TodoTool(
 			createSession([{ name: "Work", tasks: [{ content: "First", status: "pending" }] }]),
 		);
@@ -546,10 +680,6 @@ describe("TodoTool empty items tolerance", () => {
 });
 
 describe("todoMatchesAnyDescription", () => {
-	it("matches identical strings", () => {
-		expect(todoMatchesAnyDescription("Sonnet #1: AGENTS audit", ["Sonnet #1: AGENTS audit"])).toBe(true);
-	});
-
 	it("matches case- and whitespace-insensitively", () => {
 		expect(todoMatchesAnyDescription("  Sonnet  #1: AGENTS Audit  ", ["sonnet #1: agents audit"])).toBe(true);
 	});
@@ -600,7 +730,7 @@ describe("todoMatchesAnyDescription", () => {
 		expect(todoMatchesAnyDescription("Audit AGENTS.md compliance", ["Audit AGENTS md compliance"])).toBe(true);
 	});
 });
-describe("todoToolRenderer.renderResult phase collapsing", () => {
+describe("todo result card phase collapsing", () => {
 	async function buildThreePhaseAfterDone() {
 		const tool = new TodoTool(createSession());
 		await tool.execute("init", {
@@ -615,21 +745,27 @@ describe("todoToolRenderer.renderResult phase collapsing", () => {
 		// Beta and Gamma untouched by this update.
 		return tool.execute("done", { op: "done", task: "a1" });
 	}
-	function innerLines(component: Component): string[] {
-		const lines = Bun.stripANSI(component.render(100).join("\n")).split("\n");
-		return lines.slice(1, -1).map(line => line.replace(/^│/, "").replace(/│\s*$/, "").trim());
+	function innerLines(rendered: string): string[] {
+		const lines = Bun.stripANSI(rendered)
+			.split("\n")
+			.filter(line => line.trim() !== "");
+		return lines.slice(1, -1).map(line =>
+			line
+				.replace(/^│/, "")
+				.replace(/│\s*$/, "")
+				.trim(),
+		);
 	}
 	it("collapses untouched phases to a one-line summary while expanding the active phase", async () => {
 		const result = await buildThreePhaseAfterDone();
-		const component = todoToolRenderer.renderResult(result, { expanded: false, isPartial: false }, theme, {
-			op: "done",
-			task: "a1",
-		});
-		const rendered = Bun.stripANSI(component.render(100).join("\n"));
-		// Active phase's collapsed viewport omits the completed task and shows the
-		// promoted current one (#5873).
-		expect(rendered).not.toContain("a1");
+		const rendered = Bun.stripANSI(resultRows(result, false, { op: "done", task: "a1" }));
+		// Active phase's collapsed viewport keeps the just-closed task as the lead
+		// row and shows the promoted current one (#5873), and its header carries
+		// progress so the phase being worked on is not the one phase with no
+		// completion signal.
+		expect(rendered).toContain("a1");
 		expect(rendered).toContain("a2");
+		expect(rendered).toContain("I. Alpha  1/2");
 		// Untouched phases collapse: headers + progress counts, no task contents.
 		expect(rendered).toContain("II. Beta");
 		expect(rendered).toContain("III. Gamma");
@@ -639,23 +775,33 @@ describe("todoToolRenderer.renderResult phase collapsing", () => {
 		expect(rendered).not.toContain("c1");
 		expect(rendered).not.toContain("c2");
 	});
+	it("sweeps the just-completed row's strike in the collapsed view", async () => {
+		const result = await buildThreePhaseAfterDone();
+		// The card's default view is collapsed, so the completion animation the
+		// `completedTasks` plumbing drives has to land there — while the viewport
+		// dropped every closed row, the animation ran against a row nobody rendered.
+		const term = todoCard(toolCall({ name: "todo", args: { op: "done", task: "a1" }, result }));
+		const strikeSpan = (): string => /\x1b\[9m(.*?)\x1b\[29m/.exec(term.rows().join("\n"))?.[1] ?? "";
+		try {
+			expect(strikeSpan()).toBe("");
+			term.tick(SPINNER_INTERVAL_MS * TODO_STRIKE_TOTAL_FRAMES);
+			expect(strikeSpan()).toBe("a1");
+		} finally {
+			term.dispose();
+		}
+	});
 	it("falls back to in_progress / completed signals when call args are unavailable", async () => {
 		const result = await buildThreePhaseAfterDone();
 		// Transcript rebuilds may not carry call args; the active (Alpha) phase is
 		// still derived from the in_progress task and the completion transition.
-		const component = todoToolRenderer.renderResult(result, { expanded: false, isPartial: false }, theme);
-		const rendered = Bun.stripANSI(component.render(100).join("\n"));
+		const rendered = Bun.stripANSI(resultRows(result, false));
 		expect(rendered).toContain("a2");
 		expect(rendered).not.toContain("b1");
 		expect(rendered).not.toContain("c1");
 	});
 	it("shows every phase fully when manually expanded", async () => {
 		const result = await buildThreePhaseAfterDone();
-		const component = todoToolRenderer.renderResult(result, { expanded: true, isPartial: false }, theme, {
-			op: "done",
-			task: "a1",
-		});
-		const rendered = Bun.stripANSI(component.render(100).join("\n"));
+		const rendered = Bun.stripANSI(resultRows(result, true, { op: "done", task: "a1" }));
 		expect(rendered).toContain("b1");
 		expect(rendered).toContain("b2");
 		expect(rendered).toContain("c1");
@@ -663,12 +809,10 @@ describe("todoToolRenderer.renderResult phase collapsing", () => {
 	});
 	it("drops blank separator lines between phases", async () => {
 		const result = await buildThreePhaseAfterDone();
-		const component = todoToolRenderer.renderResult(result, { expanded: true, isPartial: false }, theme, {
-			op: "done",
-			task: "a1",
-		});
 		// No empty body line survives between phases.
-		expect(innerLines(component).every(line => line.length > 0)).toBe(true);
+		expect(innerLines(resultRows(result, true, { op: "done", task: "a1" })).every(line => line.length > 0)).toBe(
+			true,
+		);
 	});
 });
 
@@ -696,7 +840,7 @@ describe("selectCollapsedTodos walking viewport (#5873)", () => {
 		expect(sel.summary).toContain("6 more todos");
 	});
 
-	it("omits completed and abandoned tasks in collapsed mode", () => {
+	it("leads with the last closed task and omits the rest in collapsed mode", () => {
 		const tasks: TodoItem[] = [
 			{ content: "done", status: "completed" },
 			{ content: "dropped", status: "abandoned" },
@@ -704,7 +848,27 @@ describe("selectCollapsedTodos walking viewport (#5873)", () => {
 			{ content: "next", status: "pending" },
 		];
 		const sel = selectCollapsedTodos(tasks, never, 5);
-		expect(contents(sel)).toEqual(["current", "next"]);
+		// One closed row survives so a completion is visible as it lands; earlier
+		// closed work stays hidden.
+		expect(contents(sel)).toEqual(["dropped", "current", "next"]);
+		expect(sel.summary).toBe("");
+	});
+
+	it("keeps an out-of-order completion as the closed lead row", () => {
+		const tasks: TodoItem[] = [
+			{ content: "current", status: "in_progress" },
+			{ content: "next", status: "pending" },
+			{ content: "finished early", status: "completed" },
+		];
+		const sel = selectCollapsedTodos(tasks, never, 5);
+		expect(contents(sel)).toEqual(["finished early", "current", "next"]);
+	});
+
+	it("keeps the closed lead row additive to the open-task cap", () => {
+		const tasks: TodoItem[] = [{ content: "closed", status: "completed" }, ...mk(5, [1])];
+		const sel = selectCollapsedTodos(tasks, never, 5);
+		// All 5 open tasks fit the cap; the closed context row does not evict one.
+		expect(contents(sel)).toEqual(["closed", "Task 1", "Task 2", "Task 3", "Task 4", "Task 5"]);
 		expect(sel.summary).toBe("");
 	});
 
@@ -729,13 +893,31 @@ describe("selectCollapsedTodos walking viewport (#5873)", () => {
 	});
 
 	it("keeps a summary when actives exactly fill the cap but pending remains", () => {
-		// 5 matched actives + 1 trailing pending, cap 5. The active-overflow branch
+		// 5 matched actives + 2 trailing pending, cap 5. The active-overflow branch
 		// must NOT swallow the hidden pending work with an empty summary (#5878).
-		const tasks = mk(6, []);
+		const tasks = mk(7, []);
 		const matched = (t: TodoItem) => ["Task 1", "Task 2", "Task 3", "Task 4", "Task 5"].includes(t.content);
 		const sel = selectCollapsedTodos(tasks, matched, 5);
 		expect(contents(sel)).toEqual(["Task 1", "Task 2", "Task 3", "Task 4", "Task 5"]);
-		expect(sel.summary).toBe("… 1 more todo");
+		expect(sel.summary).toBe("… 2 more todos");
+	});
+
+	it("renders a lone hidden todo in place of a one-item summary row", () => {
+		const pending = selectCollapsedTodos(mk(6, [1]), never, 5);
+		expect(contents(pending)).toEqual(["Task 1", "Task 2", "Task 3", "Task 4", "Task 5", "Task 6"]);
+		expect(pending.summary).toBe("");
+
+		const active = selectCollapsedTodos(mk(6, []), () => true, 5);
+		expect(contents(active)).toEqual(["Task 1", "Task 2", "Task 3", "Task 4", "Task 5", "Task 6"]);
+		expect(active.summary).toBe("");
+	});
+
+	it("keeps an overflow summary when one active task overflows the cap and pending remains", () => {
+		// 6 matched actives + 2 pending, cap 5: showing all 6 actives would hide the
+		// pending work with no summary row at all.
+		const sel = selectCollapsedTodos(mk(8, []), (t: TodoItem) => Number(t.content.slice(5)) <= 6, 5);
+		expect(contents(sel)).toEqual(["Task 1", "Task 2", "Task 3", "Task 4", "Task 5"]);
+		expect(sel.summary).toBe("… 1 more active todo");
 	});
 
 	it("returns the whole open set with no summary when it fits", () => {
@@ -754,43 +936,31 @@ describe("selectCollapsedTodos walking viewport (#5873)", () => {
 	});
 });
 
-describe("todoToolRenderer.renderCall malformed-args regression (#2005)", () => {
+describe("todo call card malformed-args regression (#2005)", () => {
 	// Reporter saw `TypeError: args?.ops?.map is not a function` against
 	// Xiaomi Token Plan's Anthropic protocol because `parseStreamingJson`
 	// surfaced `{ ops: "[..." }` shapes mid-stream. The renderer is invoked
 	// on every streaming delta, so any non-array `ops` (string, object,
 	// number) must NOT crash the TUI render loop and trigger the spam-warn /
 	// retry cascade.
-	const renderOptions = { expanded: false, isPartial: true } as const;
-
 	it("does not throw when op is a streaming-truncated number", () => {
 		// Mid-stream the new flat shape can surface `{ op: 1 }` before the
 		// discriminator string lands.
-		const args = { op: 1 } as unknown as Parameters<typeof todoToolRenderer.renderCall>[0];
-		expect(() => todoToolRenderer.renderCall(args, renderOptions, theme)).not.toThrow();
+		expect(() => callRows({ op: 1 })).not.toThrow();
 	});
 
 	it("does not throw when a flat op's items field is a non-array", () => {
-		const args = {
-			op: "append",
-			phase: "Work",
-			items: "Second" as unknown as string[],
-		} as unknown as Parameters<typeof todoToolRenderer.renderCall>[0];
-		expect(() => todoToolRenderer.renderCall(args, renderOptions, theme)).not.toThrow();
+		expect(() => callRows({ op: "append", phase: "Work", items: "Second" })).not.toThrow();
 	});
 
 	it("does not throw on the legacy streaming-truncated `ops` string", () => {
 		// Old transcripts/collab-web still carry `{ ops: "[{" }` mid-stream;
 		// `normalizeTodoArg` must keep tolerating the legacy batch shape.
-		const args = { ops: '[{"op":"init"' } as unknown as Parameters<typeof todoToolRenderer.renderCall>[0];
-		expect(() => todoToolRenderer.renderCall(args, renderOptions, theme)).not.toThrow();
+		expect(() => callRows({ ops: '[{"op":"init"' })).not.toThrow();
 	});
 
 	it("renders op summary metadata for a well-formed flat call", () => {
-		const args = { op: "init", items: ["a", "b", "c"] };
-		const component = todoToolRenderer.renderCall(args, renderOptions, theme);
-		// `Text(text, 0, 0)` from `@oh-my-pi/pi-tui` exposes the content via .render().
-		const rendered = Bun.stripANSI(component.render(120).join("\n"));
+		const rendered = Bun.stripANSI(callRows({ op: "init", items: ["a", "b", "c"] }));
 		expect(rendered).toContain("init");
 		expect(rendered).toContain("3 items");
 	});
@@ -803,13 +973,129 @@ describe("todoToolRenderer.renderCall malformed-args regression (#2005)", () => 
 				{ op: "append", phase: "Cleanup", items: ["d"] },
 			],
 		};
-		const component = todoToolRenderer.renderCall(args, renderOptions, theme);
-		const rendered = Bun.stripANSI(component.render(120).join("\n"));
+		const rendered = Bun.stripANSI(callRows(args));
 		expect(rendered).toContain("init");
 		expect(rendered).toContain("3 items");
 		expect(rendered).toContain("done");
 		expect(rendered).toContain("append");
 		expect(rendered).toContain("Cleanup");
 		expect(rendered).toContain("1 item");
+	});
+});
+
+describe("todo result card label sanitization", () => {
+	// A mirrored Cursor snapshot carries provider text verbatim into
+	// `details.phases`, and the renderer interpolates it straight into terminal
+	// output. A label holding ANSI/C0 sequences would rewrite the terminal every
+	// time the list renders or replays.
+	function renderPhases(phases: TodoPhase[]): string {
+		const result = {
+			content: [{ type: "text" as const, text: "1/1 tasks completed" }],
+			details: { phases, storage: "session" as const },
+			isError: false,
+		} as unknown as ToolCallResult;
+		return resultRows(result, true);
+	}
+
+	it("strips control sequences from a mirrored task label", () => {
+		const hostile = "clear\u001b[2Jscreen\u0007bell";
+		const rendered = renderPhases([
+			{ name: "Execution", tasks: [{ content: hostile, status: "pending" }] },
+		] as unknown as TodoPhase[]);
+
+		// The dangerous bytes are gone; the readable text survives.
+		expect(rendered).not.toContain("\u001b[2J");
+		expect(rendered).not.toContain("\u0007");
+		expect(Bun.stripANSI(rendered)).toContain("clear");
+		expect(Bun.stripANSI(rendered)).toContain("screen");
+	});
+
+	it("keeps a completed label intact under the strikethrough path", () => {
+		// The completed branch runs the label through `strikethroughText`, which
+		// splices per character — sanitizing first keeps that from interleaving
+		// styling with control bytes.
+		const rendered = renderPhases([
+			{ name: "Execution", tasks: [{ content: "done\u001b[2Jtask", status: "completed" }] },
+		] as unknown as TodoPhase[]);
+
+		expect(rendered).not.toContain("\u001b[2J");
+		expect(Bun.stripANSI(rendered)).toContain("done");
+	});
+
+	it("strips control sequences from a phase header", () => {
+		// Multi-phase renders the header; single-phase omits it.
+		const rendered = renderPhases([
+			{ name: "Set\u001b[2Jup", tasks: [{ content: "a", status: "pending" }] },
+			{ name: "Ship", tasks: [{ content: "b", status: "pending" }] },
+		] as unknown as TodoPhase[]);
+
+		expect(rendered).not.toContain("\u001b[2J");
+		expect(Bun.stripANSI(rendered)).toContain("Set");
+		expect(Bun.stripANSI(rendered)).toContain("up");
+	});
+
+	it("strips control sequences from the zero-task fallback text", () => {
+		// Cursor's own summary or refusal note lands here when nothing is mirrored.
+		const result = {
+			content: [{ type: "text" as const, text: "Todo\u001b[2Jsnapshot not mirrored" }],
+			details: { phases: [], storage: "session" as const },
+			isError: false,
+		} as unknown as ToolCallResult;
+		const rendered = resultRows(result, true);
+
+		expect(rendered).not.toContain("\u001b[2J");
+		expect(Bun.stripANSI(rendered)).toContain("snapshot not mirrored");
+	});
+
+	it("flattens tabs in every result-side fragment", () => {
+		// `sanitizeText` deliberately preserves tabs, and a raw tab punches holes
+		// in bordered TUI output — so the display path must replace them too.
+		const rendered = renderPhases([
+			{ name: "Set\tup", tasks: [{ content: "ship\tit", status: "in_progress" }] },
+			{ name: "Ship", tasks: [{ content: "b", status: "pending" }] },
+		] as unknown as TodoPhase[]);
+
+		expect(rendered).not.toContain("\t");
+		expect(Bun.stripANSI(rendered)).toContain("ship");
+		expect(Bun.stripANSI(rendered)).toContain("Set");
+	});
+
+	it("flattens tabs in the zero-task fallback text", () => {
+		const result = {
+			content: [{ type: "text" as const, text: "Todo\tsnapshot not mirrored" }],
+			details: { phases: [], storage: "session" as const },
+			isError: false,
+		} as unknown as ToolCallResult;
+		const rendered = resultRows(result, true);
+
+		expect(rendered).not.toContain("\t");
+		expect(Bun.stripANSI(rendered)).toContain("snapshot not mirrored");
+	});
+});
+
+describe("todo call card preview sanitization", () => {
+	// The streaming preview interpolates partially-parsed, model-authored args
+	// straight into the status header. `renderStatusLine` only flattens CR/LF and
+	// leaves tabs to the caller, so control sequences and tabs must be handled
+	// here or a mid-stream delta rewrites the terminal.
+	function renderArgs(args: unknown): string {
+		return callRows(args);
+	}
+
+	it("strips control sequences from the task and phase fragments", () => {
+		const rendered = renderArgs({ op: "done", task: "ship\u001b[2Jit", phase: "Exec\u0007ution" });
+
+		expect(rendered).not.toContain("\u001b[2J");
+		expect(rendered).not.toContain("\u0007");
+		expect(Bun.stripANSI(rendered)).toContain("ship");
+		expect(Bun.stripANSI(rendered)).toContain("Exec");
+	});
+
+	it("flattens tabs so a fragment cannot punch holes in the header", () => {
+		const rendered = renderArgs({ op: "done", task: "ship\tit" });
+
+		expect(rendered).not.toContain("\t");
+		expect(Bun.stripANSI(rendered)).toContain("ship");
+		expect(Bun.stripANSI(rendered)).toContain("it");
 	});
 });

@@ -41,7 +41,7 @@ console.log();
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
 export default function (pi: ExtensionAPI) {
-	const { z } = pi.zod;
+	const z = pi.zod;
 
 	pi.on("agent_start", async () => {
 		console.log("[Extension] Agent starting");
@@ -65,7 +65,7 @@ export default function (pi: ExtensionAPI) {
 		parameters: z.object({
 			input: z.string(),
 		}),
-		execute: async (_toolCallId, params, _onUpdate, _ctx, _signal) => ({
+		execute: async (_toolCallId, params, _signal, _onUpdate, _ctx) => ({
 			content: [{ type: "text", text: \`Processed: \${params.input}\` }],
 			details: {},
 		}),

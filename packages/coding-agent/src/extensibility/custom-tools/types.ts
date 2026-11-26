@@ -4,6 +4,10 @@
  * Custom tools are TypeScript modules that define additional tools for the agent.
  * They can provide custom rendering for tool calls and results in the TUI.
  */
+
+import type { type as ArkType } from "@oh-my-pi/omptype";
+import type * as TypeBox from "@oh-my-pi/omptype/typebox";
+import type * as zod from "@oh-my-pi/omptype/zod";
 import type {
 	AgentToolResult,
 	AgentToolUpdateCallback,
@@ -14,10 +18,8 @@ import type {
 } from "@oh-my-pi/pi-agent-core";
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type { FetchImpl, Model, Static, TSchema } from "@oh-my-pi/pi-ai";
-import type { Component } from "@oh-my-pi/pi-tui";
+import type { RenderResultOptions } from "../../tools/details/renderer";
 import type { logger as PiLogger } from "@oh-my-pi/pi-utils";
-import type { type as ArkType } from "arktype";
-import type * as zod from "zod/v4";
 import type { Rule } from "../../capability/rule";
 import type { ModelRegistry } from "../../config/model-registry";
 import type { Settings } from "../../config/settings";
@@ -25,11 +27,10 @@ import type { ExecOptions, ExecResult } from "../../exec/exec";
 import type { HookUIContext } from "../../extensibility/hooks/types";
 import type * as PiCodingAgent from "../../index";
 import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
-import type { Theme } from "../../modes/theme/theme";
+import type { ExtensionRender, ExtensionTheme } from "../extensions/render-types";
 import type { ReadonlySessionManager } from "../../session/session-manager";
-import type { TodoItem } from "../../tools/todo";
-import type { RecoveredRetryError } from "../shared-events";
-import type * as TypeBox from "../typebox";
+import type { TodoItem } from "../../tools/details/todo";
+import type { RetryErrorUpdate } from "../shared-events";
 
 /** Alias for clarity */
 export type CustomToolUIContext = HookUIContext;
@@ -38,6 +39,8 @@ export type CustomToolUIContext = HookUIContext;
 export type { ExecOptions, ExecResult } from "../../exec/exec";
 /** Re-export for custom tools to use in execute signature */
 export type { AgentToolResult, AgentToolUpdateCallback, ToolApproval, ToolApprovalDecision, ToolTier };
+/** Display state handed to `renderCall`/`renderResult`. */
+export type { RenderResultOptions };
 
 /** Pending action entry consumed by the hidden resolve tool */
 export interface CustomToolPendingAction {
@@ -69,7 +72,7 @@ export interface CustomToolAPI {
 	typebox: typeof TypeBox;
 	/** Injected arktype module for arktype-authored custom tools. */
 	arktype: typeof ArkType;
-	/** Injected zod/v4 module for canonical parameter schemas. */
+	/** Injected Zod-compatible omptype builder for custom tools. */
 	zod: typeof zod;
 	/** Injected pi-coding-agent exports */
 	pi: typeof PiCodingAgent;
@@ -115,11 +118,11 @@ export type CustomToolSessionEvent =
 	| {
 			reason: "auto_compaction_start";
 			trigger: "threshold" | "overflow" | "idle" | "incomplete";
-			action: "context-full" | "handoff" | "shake" | "snapcompact";
+			action: "context-full" | "remote" | "handoff" | "shake" | "snapcompact";
 	  }
 	| {
 			reason: "auto_compaction_end";
-			action: "context-full" | "handoff" | "shake" | "snapcompact";
+			action: "context-full" | "remote" | "handoff" | "shake" | "snapcompact";
 			result: CompactionResult | undefined;
 			aborted: boolean;
 			willRetry: boolean;
@@ -138,7 +141,7 @@ export type CustomToolSessionEvent =
 			success: boolean;
 			attempt: number;
 			finalError?: string;
-			recoveredErrors?: RecoveredRetryError[];
+			retryErrors?: RetryErrorUpdate[];
 	  }
 	| {
 			reason: "ttsr_triggered";
@@ -150,16 +153,6 @@ export type CustomToolSessionEvent =
 			attempt: number;
 			maxAttempts: number;
 	  };
-
-/** Rendering options passed to renderResult */
-export interface RenderResultOptions {
-	/** Whether the result view is expanded */
-	expanded: boolean;
-	/** Whether this is a partial/streaming result */
-	isPartial: boolean;
-	/** Current spinner frame index for animated elements (0-9, only provided during partial results) */
-	spinnerFrame?: number;
-}
 
 export type CustomToolResult<TDetails = any> = AgentToolResult<TDetails>;
 
@@ -213,13 +206,24 @@ export interface CustomTool<TParams extends TSchema = TSchema, TDetails = any> {
 	loadMode?: ToolLoadMode;
 	/** If true, tool may stage deferred changes that require explicit resolve/discard. */
 	deferrable?: boolean;
+	/** Whether this tool can read `skill://` instruction content. Survives the custom-tool → definition bridge. */
+	readsSkillUris?: boolean;
 	/** MCP server name for discovery/search metadata when this tool fronts an MCP server. */
 	mcpServerName?: string;
 	/** Original MCP tool name for discovery/search metadata. */
 	mcpToolName?: string;
+	/** MCP read-only annotation, independent of the approval tier. */
+	mcpReadOnlyHint?: boolean;
+	/** Previous public name when a rename changed minting (e.g. digits kept in
+	 *  MCP names). Approval resolution honors `deny`/`prompt` keyed on it. */
+	legacyName?: string;
 
 	/** Capability tier declaration used by approval gates. Omitted means "exec". */
 	approval?: ToolApproval;
+
+	/** Exact targets an approval mode may remember for this call (`always-ask-cached`), one key per
+	 *  target, derived from the call's args. Omit it and approvals are never remembered per target. */
+	approvalCacheTargets?: (args: unknown) => readonly string[] | undefined;
 
 	/** Lines appended after the standard approval prompt header. */
 	formatApprovalDetails?: (args: unknown) => string | string[] | undefined;
@@ -241,16 +245,23 @@ export interface CustomTool<TParams extends TSchema = TSchema, TDetails = any> {
 
 	/** Called on session lifecycle events - use to reconstruct state or cleanup resources */
 	onSession?: (event: CustomToolSessionEvent, ctx: CustomToolContext) => void | Promise<void>;
-	/** Custom rendering for tool call display - return a Component */
-	renderCall?: (args: Static<TParams>, options: RenderResultOptions, theme: Theme) => Component;
+	/**
+	 * Custom rendering for tool call display: pi-tui nodes (drawn in the terminal and in Tern) or a
+	 * rows object `{ render(width): string[] }` (drawn in the terminal; Tern shows the generic card).
+	 */
+	renderCall?: (
+		args: Static<TParams>,
+		options: RenderResultOptions,
+		theme: ExtensionTheme,
+	) => ExtensionRender | undefined;
 
-	/** Custom rendering for tool result display - return a Component */
+	/** Custom rendering for tool result display; same contract as {@link renderCall}. */
 	renderResult?: (
 		result: CustomToolResult<TDetails>,
 		options: RenderResultOptions,
-		theme: Theme,
+		theme: ExtensionTheme,
 		args?: Static<TParams>,
-	) => Component;
+	) => ExtensionRender | undefined;
 }
 
 /** Factory function that creates a custom tool or array of tools */

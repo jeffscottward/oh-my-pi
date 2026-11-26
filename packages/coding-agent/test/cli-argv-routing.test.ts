@@ -9,6 +9,7 @@
  * flags.
  */
 import { describe, expect, test } from "bun:test";
+import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
 import { resolveCliArgv } from "@oh-my-pi/pi-coding-agent/cli-commands";
 
 describe("resolveCliArgv routes subcommands hidden behind leading global flags", () => {
@@ -60,5 +61,45 @@ describe("resolveCliArgv routes subcommands hidden behind leading global flags",
 		expect(resolveCliArgv(["gc", "--apply"])).toEqual({
 			argv: ["gc", "--apply"],
 		});
+	});
+});
+
+describe("resolveCliArgv strips launch-global flags before non-launch subcommands (#8891)", () => {
+	test("`--cwd <dir> update` drops the inapplicable launch flag instead of forwarding it", () => {
+		// Forwarding `--cwd` into update's strict parser crashed with
+		// `Unknown option '--cwd'`; the launch-only flag is now dropped.
+		expect(resolveCliArgv(["--cwd", "/tmp", "update"])).toEqual({ argv: ["update"] });
+	});
+
+	test("`--cwd=<dir>` inline form is stripped too", () => {
+		expect(resolveCliArgv(["--cwd=/tmp", "update"])).toEqual({ argv: ["update"] });
+	});
+
+	test("a trailing subcommand flag survives while the leading launch flag is stripped", () => {
+		expect(resolveCliArgv(["--cwd", "/tmp", "update", "--force"])).toEqual({
+			argv: ["update", "--force"],
+		});
+	});
+
+	test("multiple leading launch flags are all stripped before a non-launch subcommand", () => {
+		expect(resolveCliArgv(["--model", "gpt", "--cwd", "/x", "update"])).toEqual({ argv: ["update"] });
+	});
+
+	test("a subcommand's own flag placed before it is kept, not treated as launch-global", () => {
+		expect(resolveCliArgv(["-c", "update"])).toEqual({ argv: ["update", "-c"] });
+	});
+
+	test("launch-shaped `acp` still receives forwarded launch-global flags", () => {
+		expect(resolveCliArgv(["--cwd", "/x", "acp"])).toEqual({ argv: ["acp", "--cwd", "/x"] });
+	});
+
+	test("extension-shadowable `--plan` before another flag does not hide a trailing subcommand", () => {
+		expect(resolveCliArgv(["--plan", "--cwd", "/tmp", "update"])).toEqual({ argv: ["update"] });
+		const acpResolved = resolveCliArgv(["--plan", "--model", "opus", "acp"]);
+		expect(acpResolved).toEqual({ argv: ["acp", "--plan", "--model", "opus"] });
+		if ("argv" in acpResolved) {
+			expect(parseArgs(acpResolved.argv.slice(1)).model).toBe("opus");
+		}
+		expect(resolveCliArgv(["--plan", "acp"])).toEqual({ argv: ["launch", "--plan", "acp"] });
 	});
 });

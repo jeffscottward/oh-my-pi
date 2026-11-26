@@ -5,7 +5,8 @@
  * this interceptor provides helpful error messages directing them to use
  * the specialized tools instead.
  */
-import { type BashInterceptorRule, DEFAULT_BASH_INTERCEPTOR_RULES } from "../config/settings-schema";
+import { extractFlatShellCommandSegments, withoutLeadingEnvironmentAssignments } from "./shell-tokenize";
+import { type BashInterceptorRule, DEFAULT_BASH_INTERCEPTOR_RULES } from "../exec/settings";
 
 export interface InterceptionResult {
 	/** If true, the bash command should be blocked */
@@ -32,6 +33,21 @@ function compileRules(rules: BashInterceptorRule[]): Array<{ rule: BashIntercept
 	return compiled;
 }
 
+function interceptionCandidates(command: string): string[] {
+	const candidates = [command.trim()];
+	for (const segment of extractFlatShellCommandSegments(command)) {
+		// A segment that consumes the previous stage's stdout via `|` reads piped
+		// stdin, which no path-based dedicated tool (read/grep/glob) — nor any
+		// other dedicated tool — can replace, so it is not an interception
+		// candidate. Standalone and first-stage commands still match.
+		if (segment.pipedStdin) continue;
+		candidates.push(segment.text);
+		const withoutAssignments = withoutLeadingEnvironmentAssignments(segment.text);
+		if (withoutAssignments) candidates.push(withoutAssignments);
+	}
+	return candidates;
+}
+
 /**
  * Check if a bash command should be intercepted.
  *
@@ -43,10 +59,10 @@ export function checkBashInterception(
 	command: string,
 	availableTools: string[],
 	rules: BashInterceptorRule[] = DEFAULT_BASH_INTERCEPTOR_RULES,
+	originalCommand = command,
 ): InterceptionResult {
-	// Normalize command for pattern matching
-	const normalizedCommand = command.trim();
 	const compiled = compileRules(rules);
+	const candidates = interceptionCandidates(command);
 
 	for (const { rule, regex } of compiled) {
 		// Only block if the suggested tool is actually available
@@ -54,12 +70,16 @@ export function checkBashInterception(
 			continue;
 		}
 
-		if (regex.test(normalizedCommand)) {
-			return {
-				block: true,
-				message: `Blocked: ${rule.message}\n\nOriginal command: ${command}`,
-				suggestedTool: rule.tool,
-			};
+		for (const candidate of candidates) {
+			// A configured global or sticky regex carries state across calls.
+			regex.lastIndex = 0;
+			if (regex.test(candidate)) {
+				return {
+					block: true,
+					message: `Blocked: ${rule.message}\n\nOriginal command: ${originalCommand}`,
+					suggestedTool: rule.tool,
+				};
+			}
 		}
 	}
 

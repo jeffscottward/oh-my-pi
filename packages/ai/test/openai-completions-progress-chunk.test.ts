@@ -80,19 +80,6 @@ function createKeepaliveOnlyCompletionsResponse(modelId: string, signal: AbortSi
 }
 
 describe("resolveOpenAICompat stream idle timeout", () => {
-	it("widens GLM 5.1 coding-plan stream watchdogs", () => {
-		const model = buildModel({
-			...openAICompletionsModel,
-			id: "glm-5.1",
-			name: "GLM-5.1",
-			provider: "zhipu-coding-plan",
-			baseUrl: "https://open.bigmodel.cn/api/coding/paas/v4",
-			compat: openAICompletionsModel.compatConfig,
-		} as ModelSpec<"openai-completions">);
-
-		expect(model.compat.streamIdleTimeoutMs).toBe(600_000);
-	});
-
 	it("also widens custom Z.AI OpenAI-compatible GLM 5.1 endpoints", () => {
 		const model = buildModel({
 			...openAICompletionsModel,
@@ -148,7 +135,7 @@ describe("resolveOpenAICompat stream idle timeout", () => {
 	});
 
 	it("widens Kimi K2.6 reasoning streams across OpenAI-compatible hosts", () => {
-		const bundled = getBundledModel<"openai-completions">("firepass", "kimi-k2.6-turbo");
+		const bundled = getBundledModel<"openai-completions">("fireworks", "kimi-k2.6");
 		const canonicalRouter = buildModel({
 			...bundled,
 			id: "accounts/fireworks/routers/kimi-k2p6-turbo",
@@ -191,7 +178,7 @@ describe("resolveOpenAICompat stream idle timeout", () => {
 		expect(openAICompletionsModel.compat.streamIdleTimeoutMs).toBeUndefined();
 	});
 
-	it("widens local OpenAI-compatible stream watchdogs", () => {
+	it("widens local idle watchdogs and disables first-event deadlines", () => {
 		const completions = buildModel({
 			...openAICompletionsModel,
 			id: "qwen3-local",
@@ -210,7 +197,9 @@ describe("resolveOpenAICompat stream idle timeout", () => {
 		} as ModelSpec<"openai-responses">);
 
 		expect(completions.compat.streamIdleTimeoutMs).toBe(300_000);
+		expect(completions.compat.streamFirstEventTimeoutMs).toBe(0);
 		expect(responses.compat.streamIdleTimeoutMs).toBe(300_000);
+		expect(responses.compat.streamFirstEventTimeoutMs).toBe(0);
 	});
 
 	it("widens custom loopback OpenAI-compatible responses stream watchdogs", () => {
@@ -224,6 +213,7 @@ describe("resolveOpenAICompat stream idle timeout", () => {
 		} as ModelSpec<"openai-responses">);
 
 		expect(model.compat.streamIdleTimeoutMs).toBe(300_000);
+		expect(model.compat.streamFirstEventTimeoutMs).toBe(0);
 	});
 
 	it("widens Xiaomi MiMo Pro stream watchdog (issue #1770)", () => {

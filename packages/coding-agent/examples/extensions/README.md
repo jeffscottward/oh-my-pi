@@ -34,15 +34,15 @@ cp permission-gate.ts ~/.omp/agent/extensions/
 
 ### Commands & UI
 
-| Extension        | Description                                                                    |
-| ---------------- | ------------------------------------------------------------------------------ |
-| `plan-mode.ts`   | Claude Code-style plan mode for read-only exploration with `/plan` command     |
-| `tools.ts`       | Interactive `/tools` command to enable/disable tools with session persistence  |
-| `handoff.ts`     | Transfer context to a new focused session via `/handoff <goal>`                |
-| `qna.ts`         | Extracts questions from last response into editor via `ctx.ui.setEditorText()` |
-| `status-line.ts` | Shows turn progress in footer via `ctx.ui.setStatus()` with themed colors      |
-| `thinking-note.ts` | Adds display-only supplemental UI below assistant thinking blocks              |
-| `snake.ts`       | Snake game with custom UI, keyboard handling, and session persistence          |
+| Extension          | Description                                                                    |
+| ------------------ | ------------------------------------------------------------------------------ |
+| `plan-mode.ts`     | Claude Code-style plan mode for read-only exploration with `/plan` command     |
+| `tools.tsx`        | Interactive `/tools` command to enable/disable tools with session persistence  |
+| `handoff.tsx`      | Transfer context to a new focused session via `/handoff <goal>`                |
+| `qna.tsx`          | Extracts questions from last response into editor via `ctx.ui.setEditorText()` |
+| `status-line.ts`   | Shows turn progress in footer via `ctx.ui.setStatus()` with themed colors      |
+| `thinking-note.tsx` | Adds a display-only pi-tui note below assistant thinking blocks                |
+| `snake.ts`         | Snake game with custom UI, keyboard handling, and session persistence          |
 
 ### Git Integration
 
@@ -53,10 +53,10 @@ cp permission-gate.ts ~/.omp/agent/extensions/
 
 ### System Prompt & Compaction
 
-| Extension              | Description                                                           |
-| ---------------------- | --------------------------------------------------------------------- |
-| `pirate.ts`            | Demonstrates `systemPromptAppend` to dynamically modify system prompt |
-| `custom-compaction.ts` | Custom compaction that summarizes entire conversation                 |
+| Extension              | Description                                                                |
+| ---------------------- | -------------------------------------------------------------------------- |
+| `pirate.ts`            | Appends to the system prompt when pirate mode is enabled                   |
+| `custom-compaction.ts` | Custom compaction that summarizes entire conversation                      |
 
 ### External Dependencies
 
@@ -92,7 +92,7 @@ export default function (pi: ExtensionAPI) {
 		parameters: z.object({
 			name: z.string().describe("Name to greet"),
 		}),
-		async execute(toolCallId, params, onUpdate, ctx, signal) {
+		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			return {
 				content: [{ type: "text", text: `Hello, ${params.name}!` }],
 				details: {},
@@ -109,12 +109,13 @@ export default function (pi: ExtensionAPI) {
 	});
 }
 ```
+
 ## Key Patterns
 
 **Use `z.enum` for discriminated string tool args:**
 
 ```typescript
-const { z } = pi.zod;
+const z = pi.zod;
 
 parameters: z.object({
 	action: z.enum(["list", "add"]),

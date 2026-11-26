@@ -1,4 +1,5 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as compatAuth from "@oh-my-pi/pi-catalog/compat/auth";
 import { Effort, type FetchImpl } from "@oh-my-pi/pi-ai";
 import { streamSimple } from "@oh-my-pi/pi-ai/stream";
 import type { Context, Model } from "@oh-my-pi/pi-ai/types";
@@ -11,6 +12,7 @@ interface GeminiCliThinkingConfig {
 }
 
 interface CapturedRequestBody {
+	model?: string;
 	request?: {
 		generationConfig?: {
 			thinkingConfig?: GeminiCliThinkingConfig;
@@ -44,6 +46,10 @@ function extractThinking(bodyText: string | undefined): GeminiCliThinkingConfig 
 }
 
 describe("google-gemini-cli Gemini 3.x thinking mapping", () => {
+	// Antigravity is paused in its auth rules; its transport stays for when it is turned back on.
+	beforeEach(() => vi.spyOn(compatAuth, "providerDisabledReason").mockReturnValue(undefined));
+	afterEach(() => vi.restoreAllMocks());
+
 	const createFetchMock =
 		(capture: (body: string | undefined) => void): FetchImpl =>
 		(_input, init) => {
@@ -137,5 +143,47 @@ describe("google-gemini-cli Gemini 3.x thinking mapping", () => {
 		const thinking = extractThinking(requestBody);
 		expect(thinking?.thinkingLevel).toBeUndefined();
 		expect(thinking?.thinkingBudget).toBeDefined();
+	});
+
+	it("sends LOW not MINIMAL when gemini-3.7-flash minimal aliases the -low SKU", async () => {
+		let requestBody: string | undefined;
+		const fetchMock = createFetchMock(body => {
+			requestBody = body;
+		});
+
+		const model = buildModel({
+			id: "gemini-3.7-flash",
+			name: "Gemini 3.7 Flash",
+			api: "google-gemini-cli",
+			provider: "google-antigravity",
+			baseUrl: "https://daily-cloudcode-pa.googleapis.com",
+			reasoning: true,
+			thinking: {
+				mode: "google-level",
+				efforts: [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High],
+				requiresEffort: true,
+				effortRouting: {
+					[Effort.Minimal]: "gemini-3.7-flash-low",
+					[Effort.Low]: "gemini-3.7-flash-low",
+					[Effort.Medium]: "gemini-3.7-flash-medium",
+					[Effort.High]: "gemini-3.7-flash-high",
+				},
+			},
+			input: ["text", "image"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 1_048_576,
+			maxTokens: 65_536,
+		});
+
+		const stream = streamSimple(model, context, {
+			apiKey: JSON.stringify({ token: "token", projectId: "proj-123" }),
+			reasoning: Effort.Minimal,
+			fetch: fetchMock,
+		});
+		await stream.result();
+
+		const parsed = JSON.parse(requestBody ?? "{}") as CapturedRequestBody;
+		expect(parsed.model).toBe("gemini-3.7-flash-low");
+		expect(parsed.request?.generationConfig?.thinkingConfig?.thinkingLevel).toBe("LOW");
 	});
 });

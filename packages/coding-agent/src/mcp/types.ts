@@ -1,8 +1,16 @@
+import type {
+	MCPAudioContent,
+	MCPContent,
+	MCPImageContent,
+	MCPResourceContent,
+	MCPTextContent,
+} from "../tools/details/mcp";
+import type { MCPProgress } from "../tools/mcp-progress";
 /**
  * MCP (Model Context Protocol) type definitions.
  *
- * Based on MCP specification 2025-03-26:
- * https://modelcontextprotocol.io/specification/2025-03-26/
+ * Based on MCP specification 2025-11-25:
+ * https://modelcontextprotocol.io/specification/2025-11-25/
  */
 
 // =============================================================================
@@ -59,18 +67,40 @@ export interface MCPAuthConfig {
 	resource?: string;
 }
 
+/** Encoding used for outgoing JSON-RPC request ids. */
+export type MCPRequestIdFormat = "string" | "number";
+
 /** Base server config with shared options */
 interface MCPServerConfigBase {
 	/** Whether this server is enabled (default: true) */
 	enabled?: boolean;
 	/** MCP request timeout in milliseconds (default: 30000, 0 to disable) */
 	timeout?: number;
+	/**
+	 * Encoding for outgoing JSON-RPC request ids (default: `"number"`).
+	 *
+	 * Set `"string"` for servers that need collision-resistant snowflake string
+	 * ids instead of per-transport integers. See `RequestIdAllocator` in
+	 * `./request-id`.
+	 *
+	 * OMP-specific, so only the OMP-owned discovery providers parse it (native,
+	 * standalone `mcp.json`, OMP plugins). Providers that translate another
+	 * tool's config do not, since the key is not part of those formats.
+	 */
+	requestIdFormat?: MCPRequestIdFormat;
+	/**
+	 * Include server-provided instructions in the system prompt (default: true).
+	 * OMP-specific: only native config, standalone `mcp.json`, and OMP plugins
+	 * parse this option; providers for other tools' formats ignore it.
+	 */
+	instructions?: boolean;
 	/** Authentication configuration (optional) */
 	auth?: MCPAuthConfig;
 	/** OAuth configuration for servers requiring explicit client credentials */
 	oauth?: {
 		clientId?: string;
 		clientSecret?: string;
+		scope?: string;
 		redirectUri?: string;
 		callbackPort?: number;
 		callbackPath?: string;
@@ -85,6 +115,15 @@ export interface MCPStdioServerConfig extends MCPServerConfigBase {
 	command: string;
 	args?: string[];
 	env?: Record<string, string>;
+	/**
+	 * `literal`: env values are opaque plugin package data (Agent Plugins
+	 * §§4.1/9.2) — no env-name lookup, no `!command` execution, no dropping of
+	 * empty values. The provider already applied the only permitted expansion
+	 * (`${PLUGIN_ROOT}`/`${PLUGIN_DATA}`).
+	 */
+	envPolicy?: "literal";
+	/** Env keys whose values are final package data; auth resolution keeps them verbatim. */
+	envLiteralKeys?: string[];
 	cwd?: string;
 }
 
@@ -93,6 +132,12 @@ export interface MCPHttpServerConfig extends MCPServerConfigBase {
 	type: "http";
 	url: string;
 	headers?: Record<string, string>;
+	/**
+	 * `origin-locked`: configured headers are literal package data pinned to the
+	 * configured URL's origin (Agent Plugins §7.2.1) — never expanded, never
+	 * forwarded cross-origin, and client-generated headers win case-insensitively.
+	 */
+	headerPolicy?: "origin-locked";
 }
 
 /** SSE server configuration (deprecated, use HTTP) */
@@ -100,6 +145,8 @@ export interface MCPSseServerConfig extends MCPServerConfigBase {
 	type: "sse";
 	url: string;
 	headers?: Record<string, string>;
+	/** See {@link MCPHttpServerConfig.headerPolicy}. */
+	headerPolicy?: "origin-locked";
 }
 
 export type MCPServerConfig = MCPStdioServerConfig | MCPHttpServerConfig | MCPSseServerConfig;
@@ -113,7 +160,7 @@ export interface MCPConfigFile {
 	mcpServers?: Record<string, MCPServerConfig>;
 	/** Names to hide regardless of any source `enabled` flag. Highest precedence. */
 	disabledServers?: string[];
-	/** Names to force-enable when a non-writable source reports `enabled: false`. */
+	/** Names to force-enable when a non-writable source reports `enabled: false` or a built-in transform would drop them. */
 	enabledServers?: string[];
 }
 
@@ -121,10 +168,22 @@ export interface MCPConfigFile {
 // MCP Protocol Types
 // =============================================================================
 
-/** MCP implementation info */
+/** Optionally-sized icon for MCP UI metadata (implementation, tools, resources). */
+export interface MCPIcon {
+	src: string;
+	mimeType?: string;
+	sizes?: string[];
+	theme?: "light" | "dark";
+}
+
+/** MCP implementation info (`InitializeRequest.params.clientInfo` / `InitializeResult.serverInfo`). */
 export interface MCPImplementation {
 	name: string;
+	title?: string;
 	version: string;
+	description?: string;
+	websiteUrl?: string;
+	icons?: MCPIcon[];
 }
 
 /** MCP client capabilities */
@@ -158,16 +217,36 @@ export interface MCPInitializeResult {
 	instructions?: string;
 }
 
+/** Tool annotations from the 2025-11-25 tools spec. */
+export interface MCPToolAnnotations {
+	title?: string;
+	readOnlyHint?: boolean;
+	destructiveHint?: boolean;
+	idempotentHint?: boolean;
+	openWorldHint?: boolean;
+}
+
+/** Execution metadata from the 2025-11-25 tools spec. */
+export interface MCPToolExecution {
+	taskSupport?: "forbidden" | "optional" | "required";
+}
+
 /** MCP tool definition */
 export interface MCPToolDefinition {
 	name: string;
+	title?: string;
 	description?: string;
+	icons?: MCPIcon[];
 	inputSchema: {
 		type: "object";
 		properties?: Record<string, unknown>;
 		required?: string[];
 		[key: string]: unknown;
 	};
+	outputSchema?: Record<string, unknown>;
+	execution?: MCPToolExecution;
+	annotations?: MCPToolAnnotations;
+	_meta?: Record<string, unknown>;
 }
 
 /** tools/list response */
@@ -182,33 +261,9 @@ export interface MCPToolCallParams {
 	arguments?: Record<string, unknown>;
 }
 
-/** Content types in tool results */
-export interface MCPTextContent {
-	type: "text";
-	text: string;
-}
-
-export interface MCPImageContent {
-	type: "image";
-	data: string; // base64
-	mimeType: string;
-}
-
-export interface MCPResourceContent {
-	type: "resource";
-	resource: {
-		uri: string;
-		mimeType?: string;
-		text?: string;
-		blob?: string;
-	};
-}
-
-export type MCPContent = MCPTextContent | MCPImageContent | MCPResourceContent;
-
-/** Structured authentication challenge returned in a tool result. */
+/** Authentication challenge a tool call was refused with. */
 export interface MCPAuthChallenge {
-	/** Values from `_meta["mcp/www_authenticate"]`. */
+	/** Values from the result's `_meta["mcp/www_authenticate"]`, or the HTTP refusal's `WWW-Authenticate` header. */
 	readonly wwwAuthenticate: readonly string[];
 }
 
@@ -216,6 +271,13 @@ export interface MCPAuthChallenge {
 export interface MCPToolCallResult {
 	content: MCPContent[];
 	isError?: boolean;
+	/**
+	 * Machine-readable payload channel (MCP spec 2025-06-18, Tools → Structured
+	 * Content). Servers may return their data here while keeping `content`
+	 * minimal; the bridge surfaces it so it reaches the model. Any JSON value,
+	 * `null` included.
+	 */
+	structuredContent?: unknown;
 	_meta?: Record<string, unknown>;
 }
 
@@ -226,6 +288,17 @@ export interface MCPToolCallResult {
 export interface MCPRequestOptions {
 	/** Abort signal (e.g. Escape-to-interrupt) */
 	signal?: AbortSignal;
+	/**
+	 * Adds `_meta.progressToken` to the request and receives only this request's
+	 * `notifications/progress` while pending; each one restarts a default tool-call deadline (never a configured one).
+	 */
+	onProgress?: (progress: MCPProgress) => void;
+	/**
+	 * Receives the JSON-RPC id the transport allocated, before the request is
+	 * written. A `subscriptions/listen` caller needs it: the stream's
+	 * notifications are tagged with that id.
+	 */
+	onRequestId?: (id: string | number) => void;
 }
 
 /** Transport interface - abstracts stdio/http */
@@ -238,6 +311,14 @@ export interface MCPTransport {
 
 	/** Close the transport */
 	close(): Promise<void>;
+
+	/**
+	 * Record the protocol version negotiated in the `initialize` response.
+	 * Streamable HTTP transports echo it in the `MCP-Protocol-Version` header on
+	 * every subsequent request; transports that need no per-request version
+	 * (stdio) omit this.
+	 */
+	setProtocolVersion?(version: string): void;
 
 	/** Whether the transport is connected */
 	readonly connected: boolean;
@@ -256,6 +337,12 @@ export type TransportFactory = (config: MCPServerConfig) => Promise<MCPTransport
 // =============================================================================
 // MCP Client Types
 // =============================================================================
+
+/** A filesystem root a session exposes to MCP servers. */
+export interface MCPRoot {
+	uri: string;
+	name?: string;
+}
 
 /** Connected MCP server state */
 export interface MCPServerConnection {
@@ -281,6 +368,16 @@ export interface MCPServerConnection {
 	instructions?: string;
 	/** Cached prompts (populated on demand) */
 	prompts?: MCPPrompt[];
+	/**
+	 * Roots answered when the server asks `roots/list` through an
+	 * `input_required` result, read at each ask; the project directory when absent.
+	 */
+	roots?: () => MCPRoot[];
+	/**
+	 * Discovery and lists are asked of the server itself and never stored by
+	 * the host: set for connection tests and authentication probes.
+	 */
+	live?: boolean;
 }
 
 /** MCP tool with server context */
@@ -381,13 +478,6 @@ export interface MCPPromptsListResult {
 	nextCursor?: string;
 }
 
-/** Audio content in prompt messages */
-export interface MCPAudioContent {
-	type: "audio";
-	data: string;
-	mimeType: string;
-}
-
 /** Content type union for prompt messages */
 export type MCPPromptContent = MCPTextContent | MCPImageContent | MCPAudioContent | MCPResourceContent;
 
@@ -415,6 +505,7 @@ export interface MCPGetPromptResult {
 
 /** MCP server notification method names */
 export const MCPNotificationMethods = {
+	PROGRESS: "notifications/progress",
 	TOOLS_LIST_CHANGED: "notifications/tools/list_changed",
 	RESOURCES_LIST_CHANGED: "notifications/resources/list_changed",
 	RESOURCES_UPDATED: "notifications/resources/updated",

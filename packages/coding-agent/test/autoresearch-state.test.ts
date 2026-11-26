@@ -3,19 +3,19 @@ import { createAutoresearchExtension } from "@oh-my-pi/pi-coding-agent/autoresea
 import {
 	buildExperimentState,
 	computeConfidence,
-	findBaselineMetric,
-	findBaselineRunNumber,
 	findBestKeptMetric,
 	reconstructControlState,
 } from "@oh-my-pi/pi-coding-agent/autoresearch/state";
 import { AutoresearchStorage, closeAllAutoresearchStorages } from "@oh-my-pi/pi-coding-agent/autoresearch/storage";
-import type { ExperimentResult } from "@oh-my-pi/pi-coding-agent/autoresearch/types";
+import type { ExperimentResult } from "@oh-my-pi/pi-coding-agent/autoresearch/tool-details";
+import { findBaselineMetric, findBaselineRunNumber } from "@oh-my-pi/pi-coding-agent/autoresearch/results-data";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
 	RegisteredCommand,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
-import * as git from "@oh-my-pi/pi-coding-agent/utils/git";
+import type { VcsGitRepo, VcsGitRepoInfo } from "@oh-my-pi/pi-natives";
+import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 afterEach(() => {
@@ -388,73 +388,68 @@ describe("autoresearch control state", () => {
 	});
 });
 
+interface ShortcutRegistration {
+	handler: (ctx: ExtensionCommandContext) => Promise<void> | void;
+}
+
 interface AutoresearchCommandHarness {
 	command: RegisteredCommand;
 	ctx: ExtensionCommandContext;
-	execCalls: Array<{ args: string[]; command: string }>;
+	readonly branch: string;
 	sentMessages: string[];
 	notifications: Array<{ message: string; type: "info" | "warning" | "error" | undefined }>;
+	shortcuts: Map<string, ShortcutRegistration>;
+	/** Key of every `setWidget` call, in order. */
+	widgetUpdates: string[];
 }
 
 function createCommandHarness(
 	cwd: string,
-	execImpl?: (command: string, args: string[]) => Promise<{ code: number; stderr: string; stdout: string }>,
+	opts: { dirty?: boolean; hasUI?: boolean } = {},
 ): AutoresearchCommandHarness {
-	const execCalls: Array<{ args: string[]; command: string }> = [];
+	let branch = "main";
+	const refs = new Set([`refs/heads/${branch}`]);
 	const sentMessages: string[] = [];
 	const notifications: Array<{ message: string; type: "info" | "warning" | "error" | undefined }> = [];
+	const shortcuts: AutoresearchCommandHarness["shortcuts"] = new Map();
+	const widgetUpdates: string[] = [];
 	let command: RegisteredCommand | undefined;
 
-	const runGitMock = async (args: string[]) => {
-		execCalls.push({ args: [...args], command: "git" });
-		return execImpl ? execImpl("git", args) : { code: 0, stderr: "", stdout: "" };
+	const repoInfo: VcsGitRepoInfo = {
+		commonDir: `${cwd}/.git`,
+		gitDir: `${cwd}/.git`,
+		gitEntryPath: `${cwd}/.git`,
+		headPath: `${cwd}/.git/HEAD`,
+		isReftable: false,
+		repoRoot: cwd,
 	};
-
-	vi.spyOn(git.repo, "root").mockImplementation(async () => {
-		const result = await runGitMock(["rev-parse", "--show-toplevel"]);
-		if (result.code !== 0) return null;
-		const repoRoot = result.stdout.trim();
-		return repoRoot.length > 0 ? repoRoot : null;
-	});
-	vi.spyOn(git.show, "prefix").mockImplementation(async () => {
-		const result = await runGitMock(["rev-parse", "--show-prefix"]);
-		return result.code === 0 ? result.stdout.trim() : "";
-	});
-	vi.spyOn(git.branch, "current").mockImplementation(async () => {
-		const result = await runGitMock(["branch", "--show-current"]);
-		if (result.code !== 0) return null;
-		const branch = result.stdout.trim();
-		return branch.length > 0 ? branch : null;
-	});
-	const mockStatus = Object.assign(
-		async (_cwd: string) => {
-			const result = await runGitMock(["status", "--porcelain=v1", "--untracked-files=all", "-z"]);
-			if (result.code !== 0) throw new Error(result.stderr || "git status failed");
-			return result.stdout;
+	const repository = {
+		checkoutNewBranch: async (name: string) => {
+			const ref = `refs/heads/${name}`;
+			if (refs.has(ref)) throw new Error(`Branch already exists: ${name}`);
+			refs.add(ref);
+			branch = name;
 		},
-		{ parse: git.status.parse, summary: git.status.summary },
-	);
-	vi.spyOn(git, "status").mockImplementation(mockStatus);
-	vi.spyOn(git.ref, "exists").mockImplementation(async (_workDir, refName) => {
-		const result = await runGitMock(["show-ref", "--verify", "--quiet", refName]);
-		return result.code === 0;
-	});
-	vi.spyOn(git.branch, "checkoutNew").mockImplementation(async (_workDir, branchName) => {
-		const result = await runGitMock(["checkout", "-b", branchName]);
-		if (result.code !== 0) throw new Error(result.stderr || "git checkout failed");
-	});
+		currentBranch: async () => branch,
+		info: () => repoInfo,
+		prefixOf: () => "",
+		refExists: async (ref: string) => refs.has(ref),
+		statusPorcelain: async () => (opts.dirty ? " M src/foo.ts\0" : ""),
+	} as unknown as VcsGitRepo;
+	vi.spyOn(vcs, "git").mockReturnValue(repository);
+	vi.spyOn(vcs, "requireGit").mockReturnValue(repository);
+	vi.spyOn(vcs, "gitInfo").mockReturnValue(repoInfo);
+	vi.spyOn(vcs, "isPureJj").mockReturnValue(false);
 
 	const api = {
 		appendEntry(): void {},
-		exec: async (commandName: string, args: string[]) => {
-			execCalls.push({ args: [...args], command: commandName });
-			return execImpl ? execImpl(commandName, args) : { code: 0, stderr: "", stdout: "" };
-		},
 		on(): void {},
 		registerCommand(name: string, options: Omit<RegisteredCommand, "name">): void {
 			command = { name, ...options };
 		},
-		registerShortcut(): void {},
+		registerShortcut(shortcut: string, options: ShortcutRegistration): void {
+			shortcuts.set(shortcut, options);
+		},
 		registerTool(): void {},
 		getActiveTools(): string[] {
 			return [];
@@ -476,7 +471,7 @@ function createCommandHarness(
 		compact: async () => {},
 		cwd,
 		getContextUsage: () => undefined,
-		hasUI: false,
+		hasUI: opts.hasUI ?? false,
 		isIdle: () => true,
 		model: undefined,
 		modelRegistry: {},
@@ -502,13 +497,25 @@ function createCommandHarness(
 			setHeader(): void {},
 			setStatus(): void {},
 			setTitle(): void {},
-			setWidget(): void {},
+			setWidget(key: string): void {
+				widgetUpdates.push(key);
+			},
 			setWorkingMessage(): void {},
 		},
 		waitForIdle: async () => {},
 	} as unknown as ExtensionCommandContext;
 
-	return { command, ctx, execCalls, sentMessages, notifications };
+	return {
+		command,
+		ctx,
+		get branch() {
+			return branch;
+		},
+		sentMessages,
+		notifications,
+		shortcuts,
+		widgetUpdates,
+	};
 }
 
 describe("autoresearch slash command", () => {
@@ -530,51 +537,57 @@ describe("autoresearch slash command", () => {
 	});
 
 	it("enables autoresearch with a notify when invoked bare in a clean repo", async () => {
-		const dir = makeTempDir().path();
-		const harness = createCommandHarness(dir, async (_command, args) => {
-			if (args[0] === "rev-parse") return { code: 0, stderr: "", stdout: `${dir}\n` };
-			if (args[0] === "branch" && args[1] === "--show-current") return { code: 0, stderr: "", stdout: "main\n" };
-			if (args[0] === "status") return { code: 0, stderr: "", stdout: "" };
-			if (args[0] === "show-ref") return { code: 1, stderr: "", stdout: "" };
-			if (args[0] === "checkout") return { code: 0, stderr: "", stdout: "" };
-			return { code: 0, stderr: "", stdout: "" };
-		});
+		using dir = makeTempDir();
+		const harness = createCommandHarness(dir.path());
 		await harness.command.handler("", harness.ctx);
 		expect(harness.sentMessages).toEqual([]);
 		expect(harness.notifications.some(n => n.message.includes("Autoresearch enabled"))).toBe(true);
 	});
 
 	it("forwards a slash argument as the user message and creates a slug branch", async () => {
-		const dir = makeTempDir().path();
-		const harness = createCommandHarness(dir, async (_command, args) => {
-			if (args[0] === "rev-parse") return { code: 0, stderr: "", stdout: `${dir}\n` };
-			if (args[0] === "branch" && args[1] === "--show-current") return { code: 0, stderr: "", stdout: "main\n" };
-			if (args[0] === "status") return { code: 0, stderr: "", stdout: "" };
-			if (args[0] === "show-ref") return { code: 1, stderr: "", stdout: "" };
-			if (args[0] === "checkout") return { code: 0, stderr: "", stdout: "" };
-			return { code: 0, stderr: "", stdout: "" };
-		});
+		using dir = makeTempDir();
+		const harness = createCommandHarness(dir.path());
 		await harness.command.handler("reduce edit benchmark runtime variance", harness.ctx);
 		expect(harness.sentMessages).toEqual(["reduce edit benchmark runtime variance"]);
-		const checkout = harness.execCalls.find(c => c.command === "git" && c.args[0] === "checkout");
-		expect(checkout?.args[2]).toMatch(/^autoresearch\/reduce-edit-benchmark-runtime-variance-\d{8}$/);
+		expect(harness.branch).toMatch(/^autoresearch\/reduce-edit-benchmark-runtime-variance-\d{8}$/);
 	});
 
 	it("aborts with an error when the worktree is dirty", async () => {
-		const dir = makeTempDir().path();
-		const harness = createCommandHarness(dir, async (_command, args) => {
-			if (args[0] === "rev-parse") return { code: 0, stderr: "", stdout: `${dir}\n` };
-			if (args[0] === "branch" && args[1] === "--show-current") return { code: 0, stderr: "", stdout: "main\n" };
-			if (args[0] === "status") return { code: 0, stderr: "", stdout: " M src/foo.ts\n" };
-			if (args[0] === "show-ref") return { code: 1, stderr: "", stdout: "" };
-			return { code: 0, stderr: "", stdout: "" };
-		});
+		using dir = makeTempDir();
+		const harness = createCommandHarness(dir.path(), { dirty: true });
 		await harness.command.handler("", harness.ctx);
 		expect(harness.notifications.some(n => n.type === "error" && n.message.includes("dirty"))).toBe(true);
 		// Should abort: no enabled notification, no checkout, no message sent
 		expect(harness.notifications.some(n => n.message.includes("Autoresearch enabled"))).toBe(false);
-		expect(harness.execCalls.find(c => c.command === "git" && c.args[0] === "checkout")).toBeUndefined();
+		expect(harness.branch).toBe("main");
 		expect(harness.sentMessages).toEqual([]);
+	});
+
+	describe("ctrl+x dashboard toggle", () => {
+		function toggle(harness: AutoresearchCommandHarness): (ctx: ExtensionCommandContext) => Promise<void> | void {
+			const shortcut = harness.shortcuts.get("ctrl+x");
+			if (!shortcut) throw new Error("Expected the ctrl+x shortcut to register");
+			return shortcut.handler;
+		}
+
+		it("does nothing in a session that never enabled autoresearch", async () => {
+			using dir = makeTempDir();
+			const harness = createCommandHarness(dir.path(), { hasUI: true });
+			await toggle(harness)(harness.ctx);
+			expect(harness.notifications).toEqual([]);
+			expect(harness.widgetUpdates).toEqual([]);
+		});
+
+		it("redraws the dashboard before the first result instead of refusing", async () => {
+			using dir = makeTempDir();
+			const harness = createCommandHarness(dir.path(), { hasUI: true });
+			await harness.command.handler("", harness.ctx);
+			harness.notifications.length = 0;
+			harness.widgetUpdates.length = 0;
+			await toggle(harness)(harness.ctx);
+			expect(harness.notifications).toEqual([]);
+			expect(harness.widgetUpdates).toEqual(["autoresearch"]);
+		});
 	});
 });
 

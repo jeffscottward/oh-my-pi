@@ -2,13 +2,17 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, type Mock, vi }
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { SelectorController } from "@oh-my-pi/pi-coding-agent/modes/controllers/selector-controller";
-import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { createRoot, type JSXNode, type KeyEvent, type UiNode } from "@oh-my-pi/pi-tui";
+import { bubbleKey, pathTo } from "@oh-my-pi/pi-tui/dispatch";
+import { initTheme } from "../src/ui/theme/service";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import type { SessionTreeNode } from "@oh-my-pi/pi-coding-agent/session/session-entries";
-import { setKittyProtocolActive } from "@oh-my-pi/pi-tui/keys";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "./helpers/settings-test-state";
 
-const SHIFT_ENTER = "\x1b[13;2u";
+import { cfgBranchSummaryEnabled } from "@oh-my-pi/pi-coding-agent/session/context-settings";
+
+const ENTER: KeyEvent = { id: "enter", kind: "press", raw: "\r" };
+const SHIFT_ENTER: KeyEvent = { id: "shift+enter", kind: "press", raw: "\x1b[13;2u" };
 
 let settingsState: SettingsTestState | undefined;
 
@@ -19,11 +23,9 @@ beforeAll(() => {
 beforeEach(async () => {
 	settingsState = beginSettingsTest();
 	await Settings.init({ inMemory: true });
-	setKittyProtocolActive(true);
 });
 
 afterEach(() => {
-	setKittyProtocolActive(false);
 	restoreSettingsTestState(settingsState);
 	settingsState = undefined;
 });
@@ -52,7 +54,8 @@ interface TreeSummaryHarness {
 	controller: SelectorController;
 	navigateTree: Mock<NavigateTree>;
 	navigation: Promise<void>;
-	selector(): { handleInput(key: string): void };
+	/** Press `key` on the shown tree picker (from its `picker` node up, as the terminal routes it). */
+	press(key: KeyEvent): void;
 	showHookSelector: Mock<ShowHookSelector>;
 }
 
@@ -64,37 +67,28 @@ function createHarness(summaryChoice = "No summary"): TreeSummaryHarness {
 		navigation.resolve();
 		return { cancelled: false };
 	});
-	let selector: { handleInput(key: string): void } | undefined;
+	let view: UiNode | undefined;
 	const ctx = {
 		sessionManager: {
 			getTree: () => [root],
 			getLeafId: () => null,
 			appendLabelChange: vi.fn(),
+			getSessionName: () => undefined,
 		},
-		ui: {
-			terminal: { rows: 40 },
-			setFocus: vi.fn(),
-			requestRender: vi.fn(),
-			requestComponentRender: vi.fn(),
-		},
-		editorContainer: {
-			clear: vi.fn(),
-			addChild: vi.fn(),
-		},
-		editor: {
-			getText: () => "",
-			setText: vi.fn(),
-			onEscape: undefined,
-		},
+		shell: { size: () => ({ columns: 120, rows: 40 }) },
+		showEditorAreaDialog: vi.fn((factory: () => JSXNode) => {
+			view = createRoot(() => factory() as UiNode);
+			return { node: view, closed: false, close: vi.fn() };
+		}),
+		composer: { text: () => "", setText: vi.fn(), addKeyHandler: vi.fn(() => () => {}) },
 		showStatus: vi.fn(),
 		showError: vi.fn(),
 		showHookSelector,
+		keybindings: { keysFor: () => ["escape"], matches: () => false },
 		showHookEditor: vi.fn(),
-		chatContainer: { addChild: vi.fn() },
-		statusContainer: {
-			addChild: vi.fn(),
-			disposeChildren: vi.fn(),
-		},
+		showWorking: vi.fn(),
+		clearWorking: vi.fn(() => true),
+		maintenanceInterruptKey: () => "escape",
 		renderInitialMessages: vi.fn(),
 		reloadTodos: vi.fn(async () => {}),
 		session: {
@@ -103,20 +97,26 @@ function createHarness(summaryChoice = "No summary"): TreeSummaryHarness {
 		},
 	} as unknown as InteractiveModeContext;
 	const controller = new SelectorController(ctx);
-	controller.showSelector = create => {
-		const result = create(() => {});
-		selector = result.component as { handleInput(key: string): void };
-	};
 	return {
 		controller,
 		navigateTree,
 		navigation: navigation.promise,
-		selector: () => {
-			if (!selector) throw new Error("Expected tree selector to be shown");
-			return selector;
+		press: key => {
+			if (!view) throw new Error("Expected tree selector to be shown");
+			const picker = findPicker(view);
+			bubbleKey(pathTo([view], picker), key);
 		},
 		showHookSelector,
 	};
+}
+
+function findPicker(node: UiNode): UiNode {
+	if (node.kind === "picker") return node;
+	for (const child of node.children()) {
+		const found = findPicker(child);
+		if (found.kind === "picker") return found;
+	}
+	return node;
 }
 
 describe("SelectorController tree branch summaries", () => {
@@ -124,7 +124,7 @@ describe("SelectorController tree branch summaries", () => {
 		const harness = createHarness();
 
 		harness.controller.showTreeSelector();
-		harness.selector().handleInput("\r");
+		harness.press(ENTER);
 		await harness.navigation;
 
 		expect(harness.showHookSelector).not.toHaveBeenCalled();
@@ -139,7 +139,7 @@ describe("SelectorController tree branch summaries", () => {
 		const harness = createHarness();
 
 		harness.controller.showTreeSelector();
-		harness.selector().handleInput(SHIFT_ENTER);
+		harness.press(SHIFT_ENTER);
 		await harness.navigation;
 
 		expect(harness.showHookSelector).not.toHaveBeenCalled();
@@ -151,11 +151,11 @@ describe("SelectorController tree branch summaries", () => {
 	});
 
 	it("skips the summary prompt on shift+enter even when branchSummary.enabled is on", async () => {
-		Settings.instance.set("branchSummary.enabled", true);
+		cfgBranchSummaryEnabled.set(Settings.instance, true);
 		const harness = createHarness();
 
 		harness.controller.showTreeSelector();
-		harness.selector().handleInput(SHIFT_ENTER);
+		harness.press(SHIFT_ENTER);
 		await harness.navigation;
 
 		expect(harness.showHookSelector).not.toHaveBeenCalled();
@@ -167,11 +167,11 @@ describe("SelectorController tree branch summaries", () => {
 	});
 
 	it("still offers the summary prompt on plain enter when branchSummary.enabled is on", async () => {
-		Settings.instance.set("branchSummary.enabled", true);
+		cfgBranchSummaryEnabled.set(Settings.instance, true);
 		const harness = createHarness("Summarize");
 
 		harness.controller.showTreeSelector();
-		harness.selector().handleInput("\r");
+		harness.press(ENTER);
 		await harness.navigation;
 
 		expect(harness.showHookSelector).toHaveBeenCalledWith("Summarize branch?", [

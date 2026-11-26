@@ -1,30 +1,81 @@
 /**
  * Tool wrappers for extensions.
  */
-import type {
-	AgentTool,
-	AgentToolContext,
-	AgentToolResult,
-	AgentToolUpdateCallback,
-	ToolLoadMode,
+import {
+	type AgentTool,
+	type AgentToolContext,
+	type AgentToolResult,
+	type AgentToolUpdateCallback,
+	isNonBlankContext,
+	type ToolLoadMode,
 } from "@oh-my-pi/pi-agent-core";
 import type { ComputerSafetyCheck, ImageContent, Static, TextContent, TSchema } from "@oh-my-pi/pi-ai";
-import { sanitizeText } from "@oh-my-pi/pi-utils";
-import type { Settings } from "../../config/settings";
-import type { Theme } from "../../modes/theme/theme";
-import { type ApprovalMode, formatApprovalPrompt, resolveApproval, truncateForPrompt } from "../../tools/approval";
+import { prompt, sanitizeText, untilAborted, toError } from "@oh-my-pi/pi-utils";
+import type { Theme } from "@oh-my-pi/pi-tui/theme/contract";
+import { extensionTheme } from "../../ui/extensions/render-output";
+import nativeDelegationTemplate from "../../prompts/tools/native-delegation.md" with { type: "text" };
+import {
+	approvalRestrictions,
+	denyError,
+	recordApprovalGrant,
+	requestApproval,
+	resolveApproval,
+	resolveApprovalFromContext,
+	sessionApprovalScope,
+	truncateForPrompt,
+} from "../../tools/approval";
+import { getApprovalGrants } from "../../tools/approval-cache";
+import { withToolApprovalScope } from "../../tools/approval-scope";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
+import { withFileMutationSession } from "../../tools/file-write-fallback";
 import { normalizeToolEventInput, resolveToolEventInput } from "../tool-event-input";
+import { recordToolApprovalRequested, recordToolApprovalResolved } from "../../session/tool-approval-records";
 import { applyToolProxy } from "../tool-proxy";
 import type { ExtensionRunner } from "./runner";
-import type { RegisteredTool, ToolCallEventResult } from "./types";
+import type { ExtensionAgentIdentity, RegisteredTool, ToolCallEventResult } from "./types";
+
+/**
+ * Second `renderCall` argument that satisfies both the omp and the upstream-pi
+ * renderer contracts.
+ *
+ * omp invokes renderers as `renderCall(args, options, theme)` (see
+ * `src/ui/tools/legacy.ts`), while pi-era renderers — including
+ * every third-party plugin written against pi's published example — are
+ * declared `renderCall(args, theme, context)`. Both shapes take three
+ * parameters, so arity cannot discriminate them. The returned value carries
+ * both instead: own keys stay the render options, every other property
+ * resolves against the live theme. `Theme` keeps its state in `#private`
+ * fields, so delegated methods are bound to the theme instance rather than to
+ * the proxy.
+ */
+function renderOptionsWithTheme<T extends object>(options: T, theme: Theme): T & Theme {
+	const delegates = new Map<PropertyKey, unknown>();
+	return new Proxy(options, {
+		get(target, prop, receiver) {
+			if (Object.hasOwn(target, prop)) return Reflect.get(target, prop, receiver);
+			const delegate = delegates.get(prop);
+			if (delegate !== undefined) return delegate;
+			const value = Reflect.get(theme, prop, theme);
+			if (typeof value !== "function") return value;
+			const bound = value.bind(theme);
+			delegates.set(prop, bound);
+			return bound;
+		},
+	}) as T & Theme;
+}
 
 /**
  * Adapts a RegisteredTool into an AgentTool.
  */
 export class RegisteredToolAdapter implements AgentTool<any, any, any> {
 	declare name: string;
-	declare description: string;
+	get description(): string {
+		const description = this.registeredTool.definition.description;
+		const guidance = this.runner.getNativeDelegationGuidance(this.name);
+		return guidance
+			? prompt.render(nativeDelegationTemplate, { description, name: this.name, guidance })
+			: description;
+	}
 	declare parameters: any;
 	declare label: string;
 	declare strict: boolean;
@@ -45,15 +96,17 @@ export class RegisteredToolAdapter implements AgentTool<any, any, any> {
 		// enters the custom-renderer path, gets undefined back, and silently
 		// discards tool result text (extensions without renderers show blank).
 		if (registeredTool.definition.renderCall) {
-			this.renderCall = (args: any, options: any, theme: any) =>
-				registeredTool.definition.renderCall!(args, options, theme as Theme);
+			this.renderCall = (args: any, options: any, theme: Theme) => {
+				const facade = extensionTheme(theme);
+				return registeredTool.definition.renderCall!(args, renderOptionsWithTheme(options, facade), facade);
+			};
 		}
 		if (registeredTool.definition.renderResult) {
-			this.renderResult = (result: any, options: any, theme: any, args?: any) =>
+			this.renderResult = (result: any, options: any, theme: Theme, args?: any) =>
 				registeredTool.definition.renderResult!(
 					result,
 					{ expanded: options.expanded, isPartial: options.isPartial, spinnerFrame: options.spinnerFrame },
-					theme as Theme,
+					extensionTheme(theme),
 					args,
 				);
 		}
@@ -64,9 +117,40 @@ export class RegisteredToolAdapter implements AgentTool<any, any, any> {
 		params: any,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<any>,
-		_context?: AgentToolContext,
+		context?: AgentToolContext,
 	) {
-		return this.registeredTool.definition.execute(toolCallId, params, signal, onUpdate, this.runner.createContext());
+		// A `bash` line made only of session tool commands is transport traffic, not shell work:
+		// only the native host dispatches those commands, and it dispatches exactly the tools a
+		// top-level call would have run. Hand it back to the native tool so mounted tools keep
+		// working behind a replacement that never delegates (a remote or sandboxed shell), which
+		// otherwise receives command words it cannot execute (#18339). The replacement's approval
+		// gate and `tool_call` handlers already ran in ExtensionToolWrapper, so it can still block
+		// or revise the call; every other command line is executed by it below.
+		if (this.runner.servesToolCommandLine(this.registeredTool.definition.name, params)) {
+			return await this.runner.invokeNativeTool(this.registeredTool.definition.name, params, {
+				signal,
+				onUpdate,
+				callerContext: context,
+			});
+		}
+		// Bind the extension context to this tool's own name so `ctx.invokeTool` delegates to the
+		// native built-in of the same name (present only when this tool re-registers a built-in). The
+		// wrapper's own context, abort signal, and progress callback are inherited by the delegated
+		// call, so a bare `ctx.invokeTool(params)` keeps the caller's `toolCall`/provider metadata
+		// (write/edit LSP batching, computer safety acknowledgement), stops when the outer call is
+		// aborted, and still streams native progress.
+		return this.registeredTool.definition.execute(
+			toolCallId,
+			params,
+			signal,
+			onUpdate,
+			this.runner.createContext(undefined, {
+				toolName: this.registeredTool.definition.name,
+				context,
+				signal,
+				onUpdate,
+			}),
+		);
 	}
 }
 
@@ -83,6 +167,9 @@ export function wrapRegisteredTool(registeredTool: RegisteredTool, runner: Exten
 export function wrapRegisteredTools(registeredTools: RegisteredTool[], runner: ExtensionRunner): AgentTool[] {
 	return registeredTools.map(rt => wrapRegisteredTool(rt, runner));
 }
+
+const LOOP_DISPATCH_CONTEXT = Symbol("omp.loop-dispatch");
+type LoopAwareToolContext = AgentToolContext & { [LOOP_DISPATCH_CONTEXT]?: true };
 
 function computerSafetyChecks(context: AgentToolContext | undefined): ComputerSafetyCheck[] {
 	const metadata = context?.toolCall?.providerMetadata;
@@ -124,20 +211,29 @@ function safetyCheckLines(checks: readonly ComputerSafetyCheck[]): string[] {
  * Wraps a tool with extension callbacks for interception.
  * - Emits tool_call event before execution (can block)
  * - Emits tool_result event after execution (can modify result)
+ *
+ * `agent` overrides the runner's own `ctx.agent` for those events when the tool
+ * runs on behalf of a different agent than the runner's session — the advisor's
+ * toolset shares the primary session's runner (for approval enforcement) but
+ * must not be reported as the primary agent.
  */
-export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetails = unknown>
-	implements AgentTool<TParameters, TDetails>
-{
+export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetails = unknown> implements AgentTool<
+	TParameters,
+	TDetails
+> {
 	declare name: string;
 	declare description: string;
 	declare parameters: TParameters;
 	declare label: string;
 	declare strict: boolean;
+	readonly #agent: ExtensionAgentIdentity | undefined;
 
 	constructor(
 		private tool: AgentTool<TParameters, TDetails>,
 		private runner: ExtensionRunner,
+		agent?: ExtensionAgentIdentity,
 	) {
+		this.#agent = agent;
 		applyToolProxy(tool, this);
 	}
 
@@ -157,40 +253,186 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		onUpdate?: AgentToolUpdateCallback<TDetails, TParameters>,
 		context?: AgentToolContext,
 	): Promise<AgentToolResult<TDetails, TParameters>> {
-		// 1. Check approval policy (before extension handlers).
-		// CLI `--auto-approve` / `--yolo` sets approval mode to yolo.
-		// User `tools.approval.<tool>` policies are still applied in all modes.
-		const cliAutoApprove = context?.autoApprove === true;
-		const settings: Settings | undefined = context?.settings;
-		const configuredMode = (settings?.get("tools.approvalMode") ?? "yolo") as ApprovalMode;
-		const approvalMode: ApprovalMode = cliAutoApprove ? "yolo" : configuredMode;
-		const userPolicies = (settings?.get("tools.approval") ?? {}) as Record<string, unknown>;
-		const resolvedArgs = approvalArgs(params, context);
-		const resolved = resolveApproval(this.tool, resolvedArgs, approvalMode, userPolicies);
-		if (resolved.policy === "deny") {
-			throw new Error(
-				`Tool "${this.tool.name}" is blocked by user policy.\n` +
-					`To allow: remove "tools.approval.${this.tool.name}: deny" from config.`,
+		return withToolApprovalScope(() => this.#execute(toolCallId, params, signal, onUpdate, context));
+	}
+
+	async #execute(
+		toolCallId: string,
+		params: Static<TParameters>,
+		signal?: AbortSignal,
+		onUpdate?: AgentToolUpdateCallback<TDetails, TParameters>,
+		context?: AgentToolContext,
+	): Promise<AgentToolResult<TDetails, TParameters>> {
+		// The agent loop emits `tool_call` at arg-prep time (session
+		// `beforeToolCall` wiring) so a handler revision lands before concurrency
+		// scheduling and `tool_execution_start`. Consume the marker
+		// unconditionally so it cannot go stale; emit here only for dispatches
+		// the loop never saw — tool commands run inside bash and direct
+		// (non-loop) execution such as Cursor exec handlers.
+		const inheritedLoopDispatch = (context as LoopAwareToolContext | undefined)?.[LOOP_DISPATCH_CONTEXT] === true;
+		const loopDispatchedToolCall =
+			(this.runner.consumeLoopToolCall?.(toolCallId, this.tool.name) ?? false) || inheritedLoopDispatch;
+		if (loopDispatchedToolCall && context && !inheritedLoopDispatch) {
+			(context as LoopAwareToolContext)[LOOP_DISPATCH_CONTEXT] = true;
+		}
+		const loopEmittedToolCall = this.runner.consumeToolCallEmitted(toolCallId, this.tool.name);
+		// Resolve approval settings up front. A `deny` on the original input short-circuits before the
+		// runner is touched — an already-denied tool never emits `tool_call` — while the full gate below
+		// re-resolves against the (possibly revised) input so a handler cannot rewrite into a denied or
+		// newly prompt-gated command and have it run unapproved.
+		const approvalSettings = context?.settings ?? this.runner.sessionSettings;
+		const { approvalMode, userPolicies } = resolveApprovalFromContext(
+			context ?? (approvalSettings ? { settings: approvalSettings } : undefined),
+		);
+		// `always-ask-cached` grants for this conversation, shared by the pre-check, the full gate,
+		// and the record after an approval.
+		const approvalGrants =
+			approvalMode === "always-ask-cached"
+				? getApprovalGrants(approvalSettings?.getAgentDir(), this.runner.sessionId)
+				: undefined;
+		const restrictions = approvalRestrictions(approvalSettings, this.runner.cwd);
+		const preResolved = resolveApproval(
+			this.tool,
+			approvalArgs(params, context),
+			approvalMode,
+			userPolicies,
+			approvalGrants,
+			restrictions,
+			context,
+		);
+		if (preResolved.policy === "deny") {
+			throw denyError(preResolved, this.tool.name);
+		}
+
+		// 1. Emit tool_call event first - extensions can block execution or revise the input the tool
+		// runs with. Doing this BEFORE the approval gate means approval (below) resolves against the
+		// input that actually executes, closing the "approve one thing, run another" gap: the prompt
+		// text, policy resolution, and provider safety checks all see `effectiveParams`.
+		// Passive context collected here is forwarded only once the call has run
+		// and produced a non-error result: a block, deny, user reject, fail-closed
+		// safety refusal, or failed execution never injects instructions. This
+		// matches the loop's rule for context prepared at arg-prep time.
+		let pendingAdditionalContext: string | undefined;
+		let effectiveParams = params;
+		const cancelPreflight = (): void => {
+			if (!loopDispatchedToolCall) this.runner.cancelToolCallPreflight?.(toolCallId);
+		};
+		if (!loopEmittedToolCall && this.runner.hasHandlers("tool_call")) {
+			try {
+				const callResult = (await this.runner.emitToolCall(
+					{
+						type: "tool_call",
+						toolName: this.tool.name,
+						toolCallId,
+						...(context?.parentToolCallId !== undefined && { parentToolCallId: context.parentToolCallId }),
+						input: normalizeToolEventInput(
+							this.tool.name,
+							resolveToolEventInput(this.tool, toolEventArgs(params, context)),
+						),
+					},
+					signal,
+					this.#agent,
+				)) as ToolCallEventResult | undefined;
+
+				if (callResult?.block) {
+					const reason = callResult.reason || "Tool execution was blocked by an extension";
+					throw new Error(reason);
+				}
+				if (isNonBlankContext(callResult?.additionalContext)) {
+					pendingAdditionalContext = callResult.additionalContext;
+				}
+				// A non-blocking handler may replace the execution input. The returned object is the raw
+				// input passed to `execute` (handler-owned; not re-normalized). Skipped for `computer`
+				// tool calls, whose event input is a synthetic {actions,pendingSafetyChecks} view
+				// (see toolEventArgs) rather than the real execution params.
+				if (callResult?.input !== undefined && context?.toolCall?.providerMetadata?.type !== "computer") {
+					effectiveParams = callResult.input as typeof params;
+				}
+			} catch (err) {
+				if (err instanceof Error) {
+					throw err;
+				}
+				throw new Error(`Extension failed, blocking execution: ${String(err)}`);
+			}
+		}
+		if (!loopDispatchedToolCall) {
+			const preflight = await this.runner.runToolCallPreflightBefore?.(
+				toolCallId,
+				this.tool,
+				effectiveParams,
+				context,
 			);
+			if (preflight?.block) {
+				throw new Error(preflight.reason || "Tool execution was blocked by a preflight rule");
+			}
+		}
+
+		// 2. Full approval gate against the (possibly revised) input that will actually run — resolves
+		// policy and prompts on `effectiveParams`, so the user approves exactly what executes. A revised
+		// input that newly resolves to `deny` is caught here even though the original passed the
+		// short-circuit above.
+		const resolvedArgs = approvalArgs(effectiveParams, context);
+		this.tool.bindApprovalTargets?.(resolvedArgs);
+		const resolved = resolveApproval(
+			this.tool,
+			resolvedArgs,
+			approvalMode,
+			userPolicies,
+			approvalGrants,
+			restrictions,
+			context,
+		);
+		context?.toolCommandTierResolved?.(resolved.tier);
+		if (resolved.policy === "deny") {
+			cancelPreflight();
+			throw denyError(resolved, this.tool.name);
 		}
 		const pendingSafetyChecks = computerSafetyChecks(context);
-		// An xd:// device dispatch already cleared the write tool's outer gate at
-		// this tool's tier — re-prompting would double-ask for one action. Explicit
-		// per-tool "prompt" policies and tool-demanded overrides still prompt.
-		// Provider safety checks are stronger: yolo, per-tool allow, and xdev approval
-		// never acknowledge them on the user's behalf.
-		const explicitPrompt = resolved.override || Object.hasOwn(userPolicies, this.tool.name);
+		// ACP approval satisfies prompts only for the input the client approved: it compares
+		// against a deep snapshot because handlers can mutate the original argument object in
+		// place. Denies were enforced above, and provider safety checks remain independently
+		// required.
+		const acpBypass =
+			context !== undefined &&
+			Object.hasOwn(context, "acpApprovedArgs") &&
+			Bun.deepEquals(effectiveParams, context.acpApprovedArgs);
+		// Only a prompt `always-ask-cached` itself raised can be remembered by target; provider safety
+		// checks are per-call, so they never offer a grant of any kind.
+		const grantable =
+			approvalGrants !== undefined &&
+			resolved.policy === "prompt" &&
+			resolved.source === "mode" &&
+			pendingSafetyChecks.length === 0;
+		const cacheTargets = grantable ? (this.tool.approvalCacheTargets?.(resolvedArgs)?.length ?? 0) > 0 : false;
+		// A prompt the approval mode raised can be approved for the rest of the session — unless the call
+		// can be remembered by target instead, which keeps the grant to what it touches.
+		const sessionScope =
+			pendingSafetyChecks.length === 0 && !cacheTargets ? sessionApprovalScope(resolved, this.tool.name) : undefined;
+		const sessionApproved = sessionScope !== undefined && this.runner.hasSessionApproval(sessionScope.key);
 		const approvalCheck = {
-			required:
-				pendingSafetyChecks.length > 0 ||
-				(resolved.policy === "prompt" && (explicitPrompt || context?.xdevApproved !== true)),
+			required: pendingSafetyChecks.length > 0 || (resolved.policy === "prompt" && !acpBypass && !sessionApproved),
 			reason: resolved.reason,
 		};
 
 		if (approvalCheck.required) {
+			const scheduledCall = context?.toolCall?.toolCalls[context.toolCall.index];
+			if (
+				scheduledCall?.id === toolCallId &&
+				(scheduledCall.name === this.tool.name || scheduledCall.name === this.tool.customWireName)
+			) {
+				await untilAborted(signal, () => this.runner.waitForToolApprovalPreview(toolCallId));
+			}
+
 			const hasApprovalHandlers =
 				this.runner.hasHandlers("tool_approval_requested") || this.runner.hasHandlers("tool_approval_resolved");
 			const sessionId = context?.sessionManager?.getSessionId() ?? "";
+			await recordToolApprovalRequested(this.runner.approvalRecords, {
+				toolCallId,
+				...(context?.parentToolCallId !== undefined && { parentToolCallId: context.parentToolCallId }),
+				toolName: this.tool.name,
+				approvalMode,
+				...(approvalCheck.reason ? { reason: approvalCheck.reason } : {}),
+			});
 			if (hasApprovalHandlers) {
 				await this.runner.emit({
 					type: "tool_approval_requested",
@@ -202,7 +444,13 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				});
 			}
 
-			const resolveApproval = async (approved: boolean, reason?: string) => {
+			const emitApprovalResolved = async (approved: boolean, reason?: string) => {
+				await recordToolApprovalResolved(this.runner.approvalRecords, {
+					toolCallId,
+					toolName: this.tool.name,
+					approved,
+					...(reason ? { reason } : {}),
+				});
 				if (!hasApprovalHandlers) return;
 				await this.runner.emit({
 					type: "tool_approval_resolved",
@@ -218,10 +466,18 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			// ordinary tier approval, no setting or yolo mode may bypass this gate.
 			if (!this.runner.hasUI()) {
 				const reason = "no interactive UI available";
-				await resolveApproval(false, reason);
+				await emitApprovalResolved(false, reason);
+				cancelPreflight();
 				if (pendingSafetyChecks.length > 0) {
 					throw new Error(
 						`Tool "${this.tool.name}" has pending provider safety checks but no interactive UI is available.`,
+					);
+				}
+				if (resolved.source === "restriction") {
+					throw new Error(
+						`Tool "${this.tool.name}" requires approval but no interactive UI available.\n` +
+							`Reason: ${resolved.reason}\n` +
+							`A restricted folder (tools.restrictedFolders) asks in every approval mode.`,
 					);
 				}
 				throw new Error(
@@ -234,51 +490,43 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			}
 
 			const uiContext = this.runner.getUIContext();
-			const basePrompt = formatApprovalPrompt(this.tool, resolvedArgs, approvalCheck.reason);
-			const safetyPrompt =
-				pendingSafetyChecks.length > 0
-					? `${basePrompt}\nProvider safety checks:\n${safetyCheckLines(pendingSafetyChecks).join("\n")}`
-					: basePrompt;
-			let choice: string | undefined;
+			const safetyAppendix =
+				pendingSafetyChecks.length > 0 ? ["Provider safety checks:", ...safetyCheckLines(pendingSafetyChecks)] : [];
+			let approved: boolean;
 			try {
-				choice = await uiContext.select(safetyPrompt, ["Approve", "Deny"]);
+				context?.onApprovalPrompt?.();
+				// The call's signal closes the prompt: aborting the turn (Esc, a session switch) must not
+				// wait on an approval the user can no longer see or answer.
+				const answer = await untilAborted(signal, () =>
+					requestApproval(uiContext, this.tool, resolvedArgs, {
+						reason: approvalCheck.reason,
+						appendix: safetyAppendix,
+						sessionSubject: sessionScope?.subject,
+						grants: cacheTargets,
+						signal,
+					}),
+				);
+				approved = answer !== "deny";
+				if (answer === "session" && sessionScope) this.runner.grantSessionApproval(sessionScope.key);
+				if (typeof answer === "object" && approvalGrants) {
+					recordApprovalGrant(this.tool, resolvedArgs, approvalGrants, resolved.tier, answer);
+				}
 			} catch (err) {
-				await resolveApproval(false, err instanceof Error ? err.message : "approval aborted");
+				await emitApprovalResolved(false, err instanceof Error ? err.message : "approval aborted");
+				cancelPreflight();
 				throw err;
 			}
-			const approved = choice === "Approve";
-			await resolveApproval(approved, approved ? undefined : "denied by user");
+			await emitApprovalResolved(approved, approved ? undefined : "denied by user");
 			if (!approved) {
+				cancelPreflight();
 				throw new Error(`Tool call denied by user: ${this.tool.name}`);
 			}
 			if (pendingSafetyChecks.length > 0) {
-				if (!context) throw new Error("Provider safety approval context is unavailable");
+				if (!context) {
+					cancelPreflight();
+					throw new Error("Provider safety approval context is unavailable");
+				}
 				context.providerSafetyApproved = true;
-			}
-		}
-
-		// 2. Emit tool_call event - extensions can block execution
-		if (this.runner.hasHandlers("tool_call")) {
-			try {
-				const callResult = (await this.runner.emitToolCall({
-					type: "tool_call",
-					toolName: this.tool.name,
-					toolCallId,
-					input: normalizeToolEventInput(
-						this.tool.name,
-						resolveToolEventInput(this.tool, toolEventArgs(params, context)),
-					),
-				})) as ToolCallEventResult | undefined;
-
-				if (callResult?.block) {
-					const reason = callResult.reason || "Tool execution was blocked by an extension";
-					throw new Error(reason);
-				}
-			} catch (err) {
-				if (err instanceof Error) {
-					throw err;
-				}
-				throw new Error(`Extension failed, blocking execution: ${String(err)}`);
 			}
 		}
 
@@ -287,32 +535,56 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		let executionError: Error | undefined;
 
 		try {
-			result = await this.tool.execute(toolCallId, params, signal, onUpdate, context);
+			// Name the owning session for process-wide file-mutation fallbacks and
+			// expose its settings to registered tools and any fallback handlers they
+			// trigger. `sdk.ts` wraps the whole tool registry with this class whenever
+			// a runner exists.
+			result = await this.runner.runScoped(() =>
+				withFileMutationSession(this.runner.sessionId, () =>
+					this.tool.execute(toolCallId, effectiveParams, signal, onUpdate, context),
+				),
+			);
 		} catch (err) {
-			executionError = err instanceof Error ? err : new Error(String(err));
+			executionError = toError(err);
 			result = {
 				content: [{ type: "text", text: executionError.message }],
 				details: undefined as TDetails,
 			};
 		}
+		if (!loopDispatchedToolCall) {
+			const postflight = await this.runner.runToolCallPreflightAfter?.(toolCallId, result, context);
+			if (postflight) result = postflight as AgentToolResult<TDetails, TParameters>;
+		}
 
 		// Emit tool_result event - extensions can modify the result and error status
 		if (this.runner.hasHandlers("tool_result")) {
-			const resultResult = await this.runner.emitToolResult({
-				type: "tool_result",
-				toolName: this.tool.name,
-				toolCallId,
-				input: normalizeToolEventInput(
-					this.tool.name,
-					resolveToolEventInput(this.tool, toolEventArgs(params, context)),
-				),
-				content: result.content,
-				details: result.details,
-				isError: !!executionError,
-			});
+			const resultResult = await this.runner.emitToolResult(
+				{
+					type: "tool_result",
+					toolName: this.tool.name,
+					toolCallId,
+					...(context?.parentToolCallId !== undefined && { parentToolCallId: context.parentToolCallId }),
+					input: normalizeToolEventInput(
+						this.tool.name,
+						resolveToolEventInput(this.tool, toolEventArgs(effectiveParams, context)),
+					),
+					content: result.content,
+					details: result.details,
+					isError: !!executionError || result.isError === true,
+				},
+				this.#agent,
+			);
 
-			if (resultResult) {
-				const modifiedContent: (TextContent | ImageContent)[] = resultResult.content ?? result.content;
+			// Handler context reports into this call's sink like tool-authored
+			// context: it is delivered even for a failed call (the handler saw
+			// `isError`), and precedes any pending `tool_call` context.
+			if (resultResult?.additionalContext !== undefined) {
+				context?.addAdditionalContext?.(resultResult.additionalContext);
+			}
+
+			// `content` is present only when a handler modified the result.
+			if (resultResult?.content !== undefined) {
+				const modifiedContent: (TextContent | ImageContent)[] = resultResult.content;
 				const modifiedDetails = (resultResult.details ?? result.details) as TDetails;
 
 				// Effective error state: an explicit handler override wins; otherwise the
@@ -320,6 +592,9 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				// call's model-visible content/details while keeping it an error, flip a
 				// failure to success, or flag a success as an error.
 				const effectiveError = resultResult.isError ?? !!executionError;
+				if (!effectiveError && pendingAdditionalContext !== undefined) {
+					context?.addAdditionalContext?.(pendingAdditionalContext);
+				}
 
 				// Return the (possibly modified) result carrying the error flag rather than
 				// rethrowing the original exception. The agent loop honors
@@ -339,6 +614,9 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		// No extension modification
 		if (executionError) {
 			throw executionError;
+		}
+		if (result.isError !== true && pendingAdditionalContext !== undefined) {
+			context?.addAdditionalContext?.(pendingAdditionalContext);
 		}
 		return result;
 	}

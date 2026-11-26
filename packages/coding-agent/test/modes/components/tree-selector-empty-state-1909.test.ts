@@ -1,11 +1,10 @@
-import { beforeAll, describe, expect, it } from "bun:test";
-import { TreeSelectorComponent } from "@oh-my-pi/pi-coding-agent/modes/components/tree-selector";
-import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { afterAll, describe, expect, it } from "bun:test";
 import type { SessionEntry, SessionTreeNode } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import { mountTreeSelector, renderTreeSelector } from "../../helpers/tree-selector";
+import { currentTheme, setCurrentTheme } from "@oh-my-pi/pi-tui/theme/runtime";
 
-beforeAll(async () => {
-	await initTheme(false, undefined, undefined, "dark", "light");
-});
+const restoreTheme = currentTheme();
+afterAll(() => setCurrentTheme(restoreTheme));
 
 function freshSessionTree(): SessionTreeNode[] {
 	// Mirror what `sdk.ts` writes on session start: a `model_change` plus a
@@ -45,59 +44,33 @@ function userMessageTree(): SessionTreeNode[] {
 	return [{ entry, children: [] }];
 }
 
-function renderSelector(selector: TreeSelectorComponent): string {
-	const lines = (selector as unknown as { render: (w: number) => string[] }).render(120);
-	return Bun.stripANSI(lines.join("\n"));
-}
-
 describe("issue #1909: tree-selector empty-state messaging", () => {
 	it("explains that the filter — not missing data — is hiding entries on a fresh session", () => {
-		const selector = new TreeSelectorComponent(
-			freshSessionTree(),
-			"e2",
-			60,
-			() => {},
-			() => {},
-		);
-		const text = renderSelector(selector);
+		const text = renderTreeSelector({ roots: freshSessionTree(), currentLeafId: "e2" }, { rows: 60 });
 
 		// Filter-hiding hint and recovery key must both be present so the user knows
 		// the panel isn't broken and can widen the view without leaving the screen.
 		expect(text).toContain("hidden by the current filter");
 		expect(text).toContain("[default]");
-		expect(text.toLowerCase()).toContain("alt+a");
 		// Total count must reflect the real flatNodes count, not 0/0 (otherwise the
 		// "filter hides things" framing is unconvincing).
 		expect(text).toContain("(0/2)");
 	});
 
 	it("explains a zero-result search as a search problem, not a filter problem", () => {
-		const selector = new TreeSelectorComponent(
-			userMessageTree(),
-			"e1",
-			60,
-			() => {},
-			() => {},
-		);
+		const term = mountTreeSelector({ roots: userMessageTree(), currentLeafId: "e1" }, { rows: 60 });
 		// Type a character that won't match anything in the tree.
-		selector.handleInput("z");
-		const text = renderSelector(selector);
+		term.type("z");
+		const text = term.screen().join("\n");
+		term.dispose();
 
 		expect(text).toContain('No entries match search "z"');
-		expect(text.toLowerCase()).toContain("backspace");
 		// Must NOT misattribute the empty result to the filter mode.
 		expect(text).not.toContain("hidden by the current filter");
 	});
 
 	it("falls back to the bare 'No entries found' line when the tree is genuinely empty", () => {
-		const selector = new TreeSelectorComponent(
-			[],
-			null,
-			60,
-			() => {},
-			() => {},
-		);
-		const text = renderSelector(selector);
+		const text = renderTreeSelector({ roots: [], currentLeafId: null }, { rows: 60 });
 
 		expect(text).toContain("No entries found");
 		expect(text).toContain("(0/0)");

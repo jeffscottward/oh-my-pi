@@ -1,4 +1,5 @@
 import type { DiffHunk, FileDiff, FileHunks, NumstatEntry } from "../../commit/types";
+import { parseGitDiffSectionPaths, splitPatchSections } from "../../utils/git-diff-paths";
 
 export function parseNumstat(output: string): NumstatEntry[] {
 	const entries: NumstatEntry[] = [];
@@ -21,15 +22,18 @@ export function parseNumstat(output: string): NumstatEntry[] {
 
 export function parseFileDiffs(diff: string): FileDiff[] {
 	const sections: FileDiff[] = [];
-	const parts = diff.split("\ndiff --git ");
+	// Split on a line-start lookahead so each block keeps its terminating
+	// newline(s) verbatim. Consuming the delimiter would drop the blank line
+	// that terminates a `GIT binary patch` block, corrupting binary diffs on
+	// rebuild (issue #8899).
+	const parts = splitPatchSections(diff);
 	for (let index = 0; index < parts.length; index += 1) {
-		const part = index === 0 ? parts[index] : `diff --git ${parts[index]}`;
+		const part = parts[index];
 		if (!part.trim()) continue;
 		const lines = part.split("\n");
-		const header = lines[0] ?? "";
-		const match = header.match(/diff --git a\/(.+?) b\/(.+)$/);
-		if (!match) continue;
-		const filename = match[2];
+		const { oldPath, newPath } = parseGitDiffSectionPaths(part);
+		const filename = newPath ?? oldPath;
+		if (!filename) continue;
 		const content = part;
 		const isBinary = lines.some(line => line.startsWith("Binary files "));
 		let additions = 0;

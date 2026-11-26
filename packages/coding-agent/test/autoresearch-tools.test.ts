@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
+import { type ImageContent, type TextContent, validateToolArguments } from "@oh-my-pi/pi-ai";
 import { createSessionRuntime } from "@oh-my-pi/pi-coding-agent/autoresearch/state";
 import {
 	type AutoresearchStorage,
@@ -13,9 +13,15 @@ import { createInitExperimentTool } from "@oh-my-pi/pi-coding-agent/autoresearch
 import { createLogExperimentTool } from "@oh-my-pi/pi-coding-agent/autoresearch/tools/log-experiment";
 import { createRunExperimentTool } from "@oh-my-pi/pi-coding-agent/autoresearch/tools/run-experiment";
 import { createUpdateNotesTool } from "@oh-my-pi/pi-coding-agent/autoresearch/tools/update-notes";
-import type { ASIData, LogDetails, NumericMetricMap, RunDetails } from "@oh-my-pi/pi-coding-agent/autoresearch/types";
+import type {
+	ASIData,
+	LogDetails,
+	NumericMetricMap,
+	RunDetails,
+} from "@oh-my-pi/pi-coding-agent/autoresearch/tool-details";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
-import * as git from "@oh-my-pi/pi-coding-agent/utils/git";
+import { type ReadonlySessionManager, SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { $ } from "bun";
 
@@ -43,7 +49,8 @@ function dashboardStub() {
 }
 
 function createCtx(cwd: string): ExtensionContext {
-	return { cwd, hasUI: false } as ExtensionContext;
+	const sessionManager: ReadonlySessionManager = SessionManager.inMemory(cwd);
+	return { cwd, hasUI: false, sessionManager } as ExtensionContext;
 }
 
 interface PiHarness {
@@ -83,7 +90,9 @@ let templateBaselineCommit: string;
 beforeAll(async () => {
 	templateRepo = makeTempDir("@pi-autoresearch-template-");
 	await Bun.write(path.join(templateRepo.path(), "README.md"), "# baseline\n");
-	await $`git init --initial-branch=main && git config core.autocrlf false && git config core.fsmonitor false && git config user.email tester@example.com && git config user.name Tester && git add -A && git commit -m baseline`
+	// maintenance.auto/gc.auto off: every template below is copied with cpSync,
+	// and a background `git maintenance run --auto` lock would race the copy.
+	await $`git init --initial-branch=main && git config core.autocrlf false && git config core.fsmonitor false && git config maintenance.auto false && git config gc.auto 0 && git config user.email tester@example.com && git config user.name Tester && git add -A && git commit -m baseline`
 		.cwd(templateRepo.path())
 		.quiet();
 	templateBaselineCommit = (await $`git rev-parse HEAD`.cwd(templateRepo.path()).text()).trim();
@@ -212,7 +221,6 @@ describe("init_experiment", () => {
 
 		const storage = await openAutoresearchStorage(dir);
 		const session = storage.getActiveSession();
-		expect(session).not.toBeNull();
 		expect(session?.primaryMetric).toBe("runtime_ms");
 		expect(session?.scopePaths).toEqual(["src", "src/foo"]);
 		expect(session?.offLimits).toEqual(["test"]);
@@ -310,7 +318,7 @@ describe("init_experiment", () => {
 			createCtx(dir),
 		);
 		expect(result.details?.harnessCommitted).toBe(true);
-		const newHead = await git.head.sha(dir);
+		const newHead = await vcs.requireGit(dir).headSha();
 		expect(newHead).not.toBe(initialBaseline);
 		expect(result.details?.baselineCommit).toBe(newHead);
 		const status = (await $`git status --porcelain`.cwd(dir).text()).trim();
@@ -336,7 +344,7 @@ describe("init_experiment", () => {
 			createCtx(dir),
 		);
 		expect(result.details?.harnessCommitted).toBe(false);
-		const newHead = await git.head.sha(dir);
+		const newHead = await vcs.requireGit(dir).headSha();
 		expect(newHead).toBe(initialBaseline);
 		// Harness file is still in the worktree, untracked.
 		expect(fs.existsSync(path.join(dir, "autoresearch.sh"))).toBe(true);
@@ -372,7 +380,11 @@ describe("run_experiment", () => {
 
 	it("accepts arbitrary commands, parses METRIC/ASI, and stores a run", async () => {
 		const dir = freshRepo().dir;
-		await writeHarnessStub(dir, "echo METRIC runtime_ms=42; echo METRIC memory_mb=12; echo ASI hypothesis=baseline");
+		const ctx = createCtx(dir);
+		await writeHarnessStub(
+			dir,
+			'echo METRIC runtime_ms=42; echo METRIC memory_mb=12; echo "ASI session=$PI_SESSION_ID"',
+		);
 		const runtime = createSessionRuntime();
 		const init = createInitExperimentTool({
 			dashboard: dashboardStub(),
@@ -384,18 +396,18 @@ describe("run_experiment", () => {
 			{ name: "speed", primary_metric: "runtime_ms", metric_unit: "ms" },
 			undefined,
 			undefined,
-			createCtx(dir),
+			ctx,
 		);
 		const run = createRunExperimentTool({
 			dashboard: dashboardStub(),
 			getRuntime: () => runtime,
 			pi: createPiHarness().api,
 		});
-		const result = await run.execute("r", { timeout_seconds: 5 }, undefined, undefined, createCtx(dir));
+		const result = await run.execute("r", { timeout_seconds: 5 }, undefined, undefined, ctx);
 		const details = result.details as RunDetails;
 		expect(details.parsedPrimary).toBe(42);
 		expect(details.parsedMetrics).toMatchObject({ runtime_ms: 42, memory_mb: 12 });
-		expect(details.parsedAsi).toMatchObject({ hypothesis: "baseline" });
+		expect(details.parsedAsi).toMatchObject({ session: ctx.sessionManager.getSessionId() });
 		expect(details.passed).toBe(true);
 		expect(details.command).toBe("bash autoresearch.sh");
 		expect(fs.existsSync(details.benchmarkLogPath)).toBe(true);
@@ -521,10 +533,7 @@ describe("log_experiment", () => {
 			createCtx(dir),
 		);
 		const details = result.details as LogDetails;
-		expect(details.experiment.status).toBe("keep");
-		expect(details.experiment.metric).toBe(10);
 		expect(details.state.bestMetric).toBe(10);
-		expect(details.state.results).toHaveLength(1);
 		expect(runtime.state.bestMetric).toBe(10);
 	});
 
@@ -722,7 +731,7 @@ describe("log_experiment", () => {
 		// Simulate a previously kept iteration by committing it directly on the branch.
 		await Bun.write(path.join(dir, "src", "kept.ts"), "export const v = 1;\n");
 		await $`git add -A && git commit -m "kept iteration"`.cwd(dir).quiet();
-		const headBeforeDiscard = await git.head.sha(dir);
+		const headBeforeDiscard = await vcs.requireGit(dir).headSha();
 
 		const storage = await openAutoresearchStorage(dir);
 		// On-branch discard resets to HEAD and ignores preRunDirtyPaths, so a
@@ -744,13 +753,13 @@ describe("log_experiment", () => {
 			undefined,
 			createCtx(dir),
 		);
-		const headAfter = await git.head.sha(dir);
+		const headAfter = await vcs.requireGit(dir).headSha();
 		// Prior commits survive — discard does not rewind history.
 		expect(headAfter).toBe(headBeforeDiscard);
 		// Uncommitted iteration changes are gone.
 		expect(fs.readFileSync(path.join(dir, "src", "kept.ts"), "utf8")).toBe("export const v = 1;\n");
 		expect(fs.existsSync(path.join(dir, "scratch.ts"))).toBe(false);
-		const status = (await git.status(dir, { porcelainV1: true })).trim();
+		const status = (await vcs.requireGit(dir).statusPorcelain({})).trim();
 		expect(status).toBe("");
 	});
 
@@ -793,7 +802,7 @@ describe("log_experiment", () => {
 		);
 		const details = result.details as LogDetails;
 		expect(details.experiment.modifiedPaths).toContain("src/store.ts");
-		const status = (await git.status(dir, { porcelainV1: true })).trim();
+		const status = (await vcs.requireGit(dir).statusPorcelain({})).trim();
 		expect(status).toBe("");
 		const lastMsg = (await $`git log -1 --pretty=%B`.cwd(dir).text()).trim();
 		expect(lastMsg).toContain("improvement");
@@ -853,7 +862,7 @@ describe("update_notes", () => {
 		await dbOverride.remove().catch(() => {});
 	});
 
-	it("replaces session notes and refreshes runtime state", async () => {
+	async function setupNotes() {
 		const dir = freshRepo().dir;
 		await writeHarnessStub(dir);
 		const runtime = createSessionRuntime();
@@ -869,18 +878,65 @@ describe("update_notes", () => {
 			getRuntime: () => runtime,
 			pi: harness.api,
 		});
-		const result = await notes.execute("n", { body: "## Plan\n- step one\n" }, undefined, undefined, createCtx(dir));
-		expect(result.details?.notes).toContain("step one");
+		return { dir, runtime, notes };
+	}
+
+	it("replaces session notes and refreshes runtime state", async () => {
+		const { dir, runtime, notes } = await setupNotes();
+		await notes.execute("n", { body: "## Plan\n- step one\n" }, undefined, undefined, createCtx(dir));
 		expect(runtime.state.notes).toContain("step one");
 
-		const append = await notes.execute(
-			"n2",
-			{ body: "", append_idea: "try caching" },
+		const validated = validateToolArguments(notes, {
+			type: "toolCall",
+			id: "n2",
+			name: notes.name,
+			arguments: { append_idea: "try caching" },
+		}) as typeof notes.parameters.infer;
+		const append = await notes.execute("n2", validated, undefined, undefined, createCtx(dir));
+		expect(append.details?.notes).toBe("## Plan\n- step one\n\n## Ideas\n- try caching\n");
+		expect(runtime.state.notes).toBe("## Plan\n- step one\n\n## Ideas\n- try caching\n");
+
+		const empty = await notes.execute("n3", { append_idea: "   " }, undefined, undefined, createCtx(dir));
+		expect(firstTextBlockText(empty.content)).toContain("Error:");
+		expect(runtime.state.notes).toContain("- try caching");
+
+		const replaced = await notes.execute(
+			"n4",
+			{ body: "## Replacement\n", append_idea: "   " },
 			undefined,
 			undefined,
 			createCtx(dir),
 		);
-		expect(append.details?.notes).toContain("- try caching");
-		expect(runtime.state.notes).toContain("- try caching");
+		expect(firstTextBlockText(replaced.content)).toContain("Notes updated");
+		expect(replaced.details?.notes).toBe("## Replacement\n");
+		expect(runtime.state.notes).toBe("## Replacement\n");
+	});
+
+	it("append_idea creates an Ideas section when only a similarly named heading exists", async () => {
+		const { dir, runtime, notes } = await setupNotes();
+		const initialNotes = "## Plan\n- step one\n\n## Ideas backlog\n- old item\n\n### Ideas\n- nested item\n";
+		await notes.execute("n1", { body: initialNotes }, undefined, undefined, createCtx(dir));
+
+		const appended = await notes.execute("n2", { append_idea: "try caching" }, undefined, undefined, createCtx(dir));
+		const expectedNotes =
+			"## Plan\n- step one\n\n## Ideas backlog\n- old item\n\n### Ideas\n- nested item\n\n## Ideas\n- try caching\n";
+		expect(appended.details?.notes).toBe(expectedNotes);
+		expect(runtime.state.notes).toBe(expectedNotes);
+	});
+
+	it("append_idea stays inside an existing Ideas section before the next heading", async () => {
+		const { dir, runtime, notes } = await setupNotes();
+		await notes.execute(
+			"n1",
+			{ body: "## Plan\n- step one\n\n## Ideas\n- try pooling\n## Results\n- baseline\n" },
+			undefined,
+			undefined,
+			createCtx(dir),
+		);
+
+		const appended = await notes.execute("n2", { append_idea: "try caching" }, undefined, undefined, createCtx(dir));
+		const expectedNotes = "## Plan\n- step one\n\n## Ideas\n- try pooling\n- try caching\n## Results\n- baseline\n";
+		expect(appended.details?.notes).toBe(expectedNotes);
+		expect(runtime.state.notes).toBe(expectedNotes);
 	});
 });

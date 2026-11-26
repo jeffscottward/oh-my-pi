@@ -1,12 +1,5 @@
-Greps files using regex (Rust regex + PCRE2).
-
-<instruction>
-- `path`: scope to known path (e.g. `src`); pass several as delimited list (`src; tests`).
-  Line selector on one file (`src/foo.ts:50-100`); selectors never choose search root.
-- Cross-line patterns from literal `\n` or `\\n` in `pattern`.
-</instruction>
-
-<critical>
-- MUST use this over bash when searching!
-- Open-ended multi-round search → Task tool + scout subagent, NOT chained `grep` calls.
-</critical>
+Regex: Rust, then PCRE2. `path`: `;`-separated file/dir/glob/URL; default `.`. Default case-sensitive, gitignore respected; `skip` paginates files.
+File-only selector: `src/foo.ts:50-100`. Literal `\n`/`\\n` enables cross-line.
+Bare glob `*.ts` matches any depth; `dir/*.ts` only `dir`'s direct children (`dir/**/*.ts` recurses). A `!glob` entry excludes matching files and folders below the searched paths (`src;!**/*.test.ts`).
+{{#if hasFind}}Behavior/unknown symbol → `find`; literals/regex → `grep`.{{/if}}
+{{#if eagerDelegation}}Multi-round search MUST use {{#if scoutAvailable}}Task + scout{{else}}Task{{/if}}, not chained calls.{{/if}}

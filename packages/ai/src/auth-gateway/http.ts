@@ -5,7 +5,12 @@
  * and peer-resolution logic.
  */
 import { timingSafeEqual as nodeTimingSafeEqual } from "node:crypto";
-import type { Api, AssistantMessage, Model } from "../types";
+import * as os from "node:os";
+import type { Effort } from "@oh-my-pi/pi-catalog/effort";
+import { getInstallId } from "@oh-my-pi/pi-utils";
+import { extractClaudeMetadataSessionId } from "../providers/anthropic-identity";
+import type { Api, Model, ServiceTier } from "../types";
+import type { ClientUsageIdentity } from "../usage";
 
 const JSON_HEADERS = {
 	"Content-Type": "application/json",
@@ -19,20 +24,45 @@ export function json(status: number, body: unknown, headers?: Record<string, str
 	});
 }
 
+const NO_STORE_JSON_HEADERS = {
+	"Content-Type": "application/json; charset=utf-8",
+	"Cache-Control": "no-store",
+} as const;
+
+/** Error body of the media routes (embeddings, images, rerank, speech, transcriptions, video): `{ error: { code, type, message } }`. */
+export function codedErrorResponse(status: number, type: string, message: string): Response {
+	return new Response(JSON.stringify({ error: { code: status, type, message } }), {
+		status,
+		headers: NO_STORE_JSON_HEADERS,
+	});
+}
+
+/** Error body of the pi-native and SystemOne routes: `{ error: { type, message } }`. */
+export function noStoreErrorResponse(status: number, type: string, message: string): Response {
+	return new Response(JSON.stringify({ error: { type, message } }), { status, headers: NO_STORE_JSON_HEADERS });
+}
+
+/** OpenAI wire error body: `{ error: { message, type } }`. */
+export function openAIErrorResponse(status: number, type: string, message: string): Response {
+	return new Response(JSON.stringify({ error: { message, type } }), {
+		status,
+		headers: { "Content-Type": "application/json" },
+	});
+}
+
 /**
  * Diagnostic response headers for translated inference requests, mirroring the
  * names existing gateway-aware clients already parse: `x-request-id` /
  * `request-id` (surfaced as `_request_id` by the OpenAI and Anthropic SDKs,
  * matches the gateway log line), LiteLLM's model-resolution and cost headers,
  * and OpenAI's `openai-processing-ms`. Model/request-id headers are always
- * present; `message` — the final assistant message, available only on
- * non-streaming responses — adds the computed cost, and `startedAt` the wall
- * time. Streaming responses send headers before usage exists, so they carry
- * only the identity headers.
+ * present; `costUsd` — known only once a non-streaming response has settled —
+ * adds the computed cost, and `startedAt` the wall time. Streaming responses
+ * send headers before usage exists, so they carry only the identity headers.
  */
 export function gatewayResponseHeaders(
 	model: Model<Api>,
-	info: { requestId: string; message?: AssistantMessage; startedAt?: number },
+	info: { requestId: string; costUsd?: number; startedAt?: number },
 ): Record<string, string> {
 	const headers: Record<string, string> = {
 		"x-request-id": info.requestId,
@@ -40,7 +70,7 @@ export function gatewayResponseHeaders(
 		"x-litellm-model-id": model.id,
 	};
 	if (model.baseUrl) headers["x-litellm-model-api-base"] = model.baseUrl;
-	if (info.message) headers["x-litellm-response-cost"] = info.message.usage.cost.total.toString();
+	if (info.costUsd !== undefined) headers["x-litellm-response-cost"] = info.costUsd.toString();
 	if (info.startedAt !== undefined) {
 		const elapsed = (performance.now() - info.startedAt).toFixed(0);
 		headers["x-litellm-response-duration-ms"] = elapsed;
@@ -49,10 +79,44 @@ export function gatewayResponseHeaders(
 	return headers;
 }
 
-export function resolvePeer(req: Request): string {
-	const fwd = req.headers.get("x-forwarded-for");
-	if (fwd) return fwd.split(",")[0].trim();
-	return req.headers.get("x-real-ip") ?? "unknown";
+/**
+ * Decode each run of percent-escapes on its own, so one malformed escape
+ * elsewhere in the URL cannot hide an encoded token. A run that is not valid
+ * UTF-8 still has its ASCII escapes decoded.
+ */
+function decodeUrlLeniently(location: string): string {
+	return location.replace(/(?:%[0-9A-Fa-f]{2})+/g, run => {
+		try {
+			return decodeURIComponent(run);
+		} catch {
+			return run.replace(/%([0-7][0-9A-Fa-f])/g, (_, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)));
+		}
+	});
+}
+
+/** Keep configured gateway credentials out of URL and forwarded/logged request fields. */
+export function hasMisplacedBearer(req: Request, url: URL, tokens: ReadonlySet<string>): boolean {
+	if (tokens.size === 0) return false;
+	const location = url.pathname + url.search;
+	const decodedLocation = decodeUrlLeniently(location);
+	const headers = req.headers;
+	for (const token of tokens) {
+		if (location.includes(token) || decodedLocation.includes(token)) return true;
+		for (const [name, value] of headers) {
+			if (
+				(PASSTHROUGH_HEADER_NAMES[name] ||
+					name.startsWith("x-stainless-") ||
+					name.startsWith("x-omp-") ||
+					name === "x-forwarded-for" ||
+					name === "x-real-ip" ||
+					name === "forwarded") &&
+				value.includes(token)
+			) {
+				return true;
+			}
+		}
+	}
+	return false;
 }
 
 /**
@@ -77,13 +141,19 @@ export function timingSafeEqual(a: Uint8Array, b: Uint8Array): boolean {
 
 const TOKEN_ENCODER = new TextEncoder();
 
+/** The token of an `Authorization: Bearer <token>` header, trimmed; `undefined` without one. */
+export function readBearerToken(req: Request): string | undefined {
+	const header = req.headers.get("authorization");
+	if (!header) return undefined;
+	const match = header.match(/^Bearer\s+(.+)$/i);
+	return match ? match[1].trim() : undefined;
+}
+
 export function isAuthorized(req: Request, tokens: ReadonlySet<string>): boolean {
 	if (tokens.size === 0) return true;
-	const header = req.headers.get("authorization");
-	if (!header) return false;
-	const match = header.match(/^Bearer\s+(.+)$/i);
-	if (!match) return false;
-	const presented = TOKEN_ENCODER.encode(match[1].trim());
+	const token = readBearerToken(req);
+	if (token === undefined) return false;
+	const presented = TOKEN_ENCODER.encode(token);
 	// Iterate every allowed token regardless of early hits so the result
 	// timing reflects the full set, not the position of the match.
 	let ok = false;
@@ -95,22 +165,27 @@ export function isAuthorized(req: Request, tokens: ReadonlySet<string>): boolean
 }
 
 /**
- * Allow-list of inbound request headers that the gateway captures and forwards
- * to the underlying parsers (which decide whether to surface them to the
- * provider). Case-insensitive; `x-stainless-` is a prefix match.
+ * Allow-list of inbound request headers that the gateway forwards to the
+ * provider for gateway-token requests (`applyCallerTrust`; scoped clients'
+ * are dropped). Case-insensitive; `x-stainless-` is a prefix match.
  */
 const PASSTHROUGH_HEADER_NAMES: Record<string, true> = {
 	"anthropic-beta": true,
 	"anthropic-version": true,
+	"anthropic-user-profile-id": true,
 	"openai-organization": true,
 	"openai-project": true,
 	"openai-beta": true,
 	// Codex / ChatGPT-OAuth backend headers (see @oh-my-pi/pi-catalog/wire/codex).
-	// `session_id` and `conversation_id` thread the upstream session so prompt
-	// caching and per-conversation rate limiting work; `chatgpt-account-id` and
-	// `originator` identify the calling account and client surface.
+	// `session-id` / `thread-id` (codex-rs since 2026-05) and the underscored
+	// `session_id` / `conversation_id` (older Codex clients) thread the upstream
+	// session so prompt caching and per-conversation rate limiting work;
+	// `chatgpt-account-id` and `originator` identify the calling account and
+	// client surface.
 	"chatgpt-account-id": true,
 	originator: true,
+	"session-id": true,
+	"thread-id": true,
 	session_id: true,
 	conversation_id: true,
 	// Vendor-neutral cache-identity headers. The gateway also reads these to
@@ -123,8 +198,8 @@ const PASSTHROUGH_HEADER_NAMES: Record<string, true> = {
 
 /**
  * Extract allow-listed passthrough headers from an inbound request. Keys are
- * lowercased; empty values are dropped. Called once per request in
- * `handleFormatEndpoint`; parsers then read `options.headers`.
+ * lowercased; empty values are dropped. Used by `applyCallerTrust` and by the
+ * Anthropic parser, whose stream encoder reads the caller's `anthropic-beta`.
  */
 export function captureRequestHeaders(headers: Headers): Record<string, string> {
 	const out: Record<string, string> = {};
@@ -139,13 +214,42 @@ export function captureRequestHeaders(headers: Headers): Record<string, string> 
 }
 
 /**
+ * Resolve the usage-attribution identity for an inbound gateway request.
+ *
+ * pi-native omp clients send `x-omp-install-id` / `x-omp-hostname` /
+ * `x-omp-app` (see `providers/pi-native-client.ts`); any client may set them.
+ * Requests without an install id fall back to the gateway host's identity
+ * under the `gateway` app label, so unlabeled foreign-SDK traffic (llm-git,
+ * openai/anthropic SDKs) still lands in per-client burn tracking instead of
+ * vanishing. These headers are attribution-only — they are deliberately
+ * absent from {@link captureRequestHeaders}'s allow-list and never reach the
+ * upstream provider.
+ */
+export function resolveClientIdentity(headers: Headers): ClientUsageIdentity {
+	const read = (name: string): string | undefined => {
+		const value = headers.get(name)?.trim();
+		return value ? value : undefined;
+	};
+	const installId = read("x-omp-install-id");
+	const app = read("x-omp-app");
+	if (!installId) {
+		return { installId: getInstallId(), hostname: os.hostname(), app: app ?? "gateway" };
+	}
+	return { installId, hostname: read("x-omp-hostname"), app: app ?? "gateway" };
+}
+
+/**
  * Priority order for resolving a client-supplied prompt-cache identity. The
  * first non-empty value wins. When none are present, the gateway derives a
  * stable UUID from the request's stable parts.
  */
 const CACHE_KEY_HEADERS: readonly string[] = [
 	"x-prompt-cache-key",
+	"x-claude-code-session-id",
+	"x-session-affinity",
+	"session-id",
 	"session_id",
+	"thread-id",
 	"conversation_id",
 	"x-session-id",
 	"x-conversation-id",
@@ -166,17 +270,23 @@ function readBodyCacheKey(body: unknown): string | undefined {
 		const v = meta[field];
 		if (typeof v === "string" && v.length > 0) return v;
 	}
-	return undefined;
+	// Claude Code nests its session id inside the `user_id` JSON string.
+	return extractClaudeMetadataSessionId(meta.user_id);
 }
 
 /**
  * Resolve a prompt-cache identity from inbound request body + headers.
  * Order of precedence (first wins):
  *   1. Body `prompt_cache_key`
- *   2. Body `metadata.{prompt_cache_key,session_id,conversation_id}`
+ *   2. Body `metadata.{prompt_cache_key,session_id,conversation_id}`, then the
+ *      `session_id` inside Claude Code's `metadata.user_id`
  *   3. Header `x-prompt-cache-key`
- *   4. Header `session_id` / `conversation_id` (Codex / ChatGPT-OAuth surface)
- *   5. Header `x-session-id` / `x-conversation-id` (common informal)
+ *   4. Header `x-claude-code-session-id` (Claude Code), `x-session-affinity` (OpenCode)
+ *   5. Header `session-id` / `session_id`, then `thread-id` / `conversation_id`
+ *      (Codex CLI; codex-rs sends both, and its session id is the cache key)
+ *   6. Header `x-session-id` / `x-conversation-id` (common informal)
+ * OpenCode's `x-parent-session-id` is deliberately ignored: it would key every
+ * subagent on its parent's conversation.
  * Returns undefined when none present; the gateway then derives a stable
  * UUID from the request's stable parts.
  */
@@ -191,11 +301,28 @@ export function resolvePromptCacheKey(body: unknown, headers?: Headers): string 
 	return undefined;
 }
 
+/** OpenAI-wire `reasoning_effort` / `reasoning.effort` values the gateway forwards. */
+export function isOpenAIReasoningEffort(value: unknown): value is Effort {
+	return (
+		value === "minimal" ||
+		value === "low" ||
+		value === "medium" ||
+		value === "high" ||
+		value === "xhigh" ||
+		value === "max"
+	);
+}
+
+/** OpenAI-wire `service_tier` values the gateway forwards. */
+export function isOpenAIServiceTier(value: unknown): value is ServiceTier {
+	return value === "auto" || value === "default" || value === "flex" || value === "scale" || value === "priority";
+}
+
 const CORS_HEADERS: Record<string, string> = {
 	"Access-Control-Allow-Origin": "*",
 	"Access-Control-Allow-Methods": "GET, POST, OPTIONS",
 	"Access-Control-Allow-Headers":
-		"authorization, content-type, anthropic-version, anthropic-beta, openai-organization, openai-project, x-stainless-*, x-api-key",
+		"authorization, content-type, anthropic-version, anthropic-beta, anthropic-user-profile-id, openai-organization, openai-project, x-stainless-*, x-api-key",
 	"Access-Control-Expose-Headers":
 		"x-request-id, request-id, x-litellm-model-id, x-litellm-model-api-base, x-litellm-response-cost, x-litellm-response-duration-ms, openai-processing-ms",
 	"Access-Control-Max-Age": "86400",

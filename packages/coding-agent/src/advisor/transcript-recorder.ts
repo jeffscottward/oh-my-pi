@@ -2,34 +2,17 @@ import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { Message, UserMessage } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
+import { ADVISOR_TRANSCRIPT_FILENAME, JSONL_SUFFIX } from "./transcript-names";
 import { SessionManager } from "../session/session-manager";
+import { fingerprintMessage } from "./message-fingerprint";
 
-/**
- * Reserved transcript stem for advisor session files. Chosen so it cannot
- * collide with a task subagent's `<id>.jsonl` (task ids are reserved against
- * this exact stem in {@link AgentOutputManager}).
- */
-export const ADVISOR_TRANSCRIPT_STEM = "__advisor";
-export const ADVISOR_TRANSCRIPT_FILENAME = `${ADVISOR_TRANSCRIPT_STEM}.jsonl`;
-
-const JSONL_SUFFIX = ".jsonl";
-
-/**
- * Transcript filename for an advisor: `__advisor.jsonl` for the legacy/default
- * advisor (empty slug), `__advisor.<slug>.jsonl` for a named advisor. The `.`
- * separator keeps named files out of the output manager's `-<n>` bump namespace.
- */
-export function advisorTranscriptFilename(slug: string): string {
-	return slug ? `${ADVISOR_TRANSCRIPT_STEM}.${slug}${JSONL_SUFFIX}` : ADVISOR_TRANSCRIPT_FILENAME;
-}
-
-/** Whether a filename is any advisor transcript (`__advisor.jsonl` or `__advisor.<slug>.jsonl`). */
-export function isAdvisorTranscriptName(name: string): boolean {
-	return (
-		name === ADVISOR_TRANSCRIPT_FILENAME ||
-		(name.startsWith(`${ADVISOR_TRANSCRIPT_STEM}.`) && name.endsWith(JSONL_SUFFIX))
-	);
-}
+export {
+	ADVISOR_TRANSCRIPT_FILENAME,
+	ADVISOR_TRANSCRIPT_STEM,
+	advisorTranscriptFilename,
+	isAdvisorTranscriptName,
+} from "./transcript-names";
+export * from "./transcript-costs";
 
 /**
  * Append-only persister for an advisor agent's transcript.
@@ -58,6 +41,21 @@ export class AdvisorTranscriptRecorder {
 	#filename: string;
 	/** Serializes the async open/close against synchronous appends so records land in order. */
 	#queue: Promise<void>;
+	/**
+	 * Ordered fingerprints of user "session update" deltas persisted since the
+	 * last committed advisor turn. The advisor re-delivers the identical batch on
+	 * every retry/overflow/refusal loop (issue #9553), and {@link #rollbackFailedTurn}
+	 * only cleans the agent's in-memory state — the recorder already wrote the
+	 * attempt. Matching a re-delivery positionally against this window skips the
+	 * duplicate while still persisting genuinely new content, including two
+	 * distinct deltas that happen to render identically (a repeated prompt, or two
+	 * tool runs with the same output).
+	 */
+	#replayWindow: bigint[] = [];
+	/** Cursor into {@link #replayWindow}; reset at each delivery attempt via {@link beginTurn}. */
+	#replayCursor = 0;
+	/** Target file {@link #replayWindow} belongs to; a switch starts a fresh window. */
+	#windowFile: string | undefined;
 
 	/**
 	 * @param filename Transcript filename within the session dir. Defaults to
@@ -107,6 +105,35 @@ export class AdvisorTranscriptRecorder {
 		const sessionFile = this.resolveSessionFile();
 		if (!sessionFile?.endsWith(JSONL_SUFFIX)) return;
 		const file = path.join(sessionFile.slice(0, -JSONL_SUFFIX.length), this.#filename);
+		// A new target file starts a fresh replay window: positions from the prior
+		// session's turns must never suppress the new file's first delta.
+		if (file !== this.#windowFile) {
+			this.#windowFile = file;
+			this.#replayWindow = [];
+			this.#replayCursor = 0;
+		}
+		// Skip a re-delivered user delta: on retry/overflow/refusal the advisor
+		// re-sends the identical batch in the same order, so a positional match
+		// against this turn's window is a replay that adds only bytes. New content
+		// — including a delta that renders like an earlier one — diverges from the
+		// window and is persisted. Assistant/tool turns are billed work: always
+		// written, so cost attribution and the Hub transcript stay intact.
+		if (message.role === "user") {
+			const fingerprint = fingerprintMessage(message);
+			if (fingerprint !== undefined) {
+				if (this.#replayCursor < this.#replayWindow.length) {
+					if (this.#replayWindow[this.#replayCursor] === fingerprint) {
+						this.#replayCursor++;
+						return;
+					}
+					// Divergent retry (e.g. reasoning stripped after a refusal): the
+					// window no longer matches, so drop its stale tail and record anew.
+					this.#replayWindow.length = this.#replayCursor;
+				}
+				this.#replayWindow.push(fingerprint);
+				this.#replayCursor = this.#replayWindow.length;
+			}
+		}
 		const cwd = this.resolveCwd();
 		this.#enqueue(async () => {
 			if (file !== this.#file) {
@@ -119,6 +146,48 @@ export class AdvisorTranscriptRecorder {
 			}
 			this.#manager?.appendMessage(persisted);
 		});
+	}
+
+	/**
+	 * Mark the start of one advisor delivery attempt. Rewinds the replay cursor so
+	 * a retry that re-sends the same batch matches this turn's window positionally
+	 * and is skipped, while the window itself (persisted-since-commit) is retained.
+	 */
+	beginTurn(): void {
+		this.#replayCursor = 0;
+	}
+
+	/**
+	 * Mark an advisor turn as committed (its output landed). Clears the replay
+	 * window so the next turn's deltas are recorded even when they render like a
+	 * committed one — only re-deliveries of an *uncommitted* turn are replays.
+	 */
+	commitTurn(): void {
+		this.#clearReplayWindow();
+	}
+
+	/** Discard replay identity for a failed batch that will not be retried. */
+	abandonTurn(): void {
+		this.#clearReplayWindow();
+	}
+
+	/**
+	 * Queue a write barrier after all records accepted so far. Once `ready`
+	 * resolves, callers may safely snapshot the file length; records accepted
+	 * after this call remain queued until `release` settles.
+	 */
+	blockWritesUntil(release: Promise<unknown>): Promise<void> {
+		const ready = Promise.withResolvers<void>();
+		this.#enqueue(async () => {
+			ready.resolve();
+			await release;
+		});
+		return ready.promise;
+	}
+
+	#clearReplayWindow(): void {
+		this.#replayWindow = [];
+		this.#replayCursor = 0;
 	}
 
 	/** Flush pending writes (best-effort). */

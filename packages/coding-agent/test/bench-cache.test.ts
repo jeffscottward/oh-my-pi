@@ -12,7 +12,8 @@ import type {
 	Model,
 	SimpleStreamOptions,
 } from "@oh-my-pi/pi-ai";
-import { type BenchModelRegistry, runBenchCommand } from "@oh-my-pi/pi-coding-agent/cli/bench-cli";
+import { runBenchCommand } from "@oh-my-pi/pi-coding-agent/cli/bench-cli";
+import type { BenchModelRegistry } from "@oh-my-pi/pi-coding-agent/cli/bench-runtime";
 
 const model = {
 	provider: "openai",
@@ -367,15 +368,16 @@ describe("bench cache mode", () => {
 			},
 		);
 
-		expect(stdout).toContain(
+		const output = Bun.stripANSI(stdout);
+		expect(output).toContain(
 			"cold prompt_cache_write_observed input 20 cache-read 0 cache-write 100 output 2 total 122 cost $4.00",
 		);
-		expect(stdout).toContain(
+		expect(output).toContain(
 			"warm prompt_cache_read_observed input 20 cache-read 100 cache-write 0 output 2 total 122 cost $4.00",
 		);
-		expect(stdout).toContain("TTFT");
-		expect(stdout).toContain("duration");
-		expect(stdout).toContain("throughput");
+		expect(output).toContain("TTFT");
+		expect(output).toContain("duration");
+		expect(output).toContain("throughput");
 	});
 
 	it("keeps normal defaults and requires explicit cache concurrency", async () => {
@@ -412,7 +414,8 @@ describe("bench cache mode", () => {
 			},
 		);
 		expect(summary.runs).toBe(10);
-		expect(summary.maxTokens).toBe(512);
+		expect(summary.maxTokens).toBeUndefined();
+		expect(summary.profile).toBe("chat");
 		expect(maxActive).toBe(4);
 		await expect(
 			runBenchCommand(

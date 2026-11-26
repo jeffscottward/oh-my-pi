@@ -1,19 +1,26 @@
 import { beforeAll, describe, expect, it } from "bun:test";
 import {
 	GALLERY_STATES,
+	GALLERY_SURFACES,
 	parseGalleryStates,
+	parseGallerySurfaces,
 	renderGalleryState,
+	renderGallerySurfaceSections,
 	resolveFixture,
 } from "@oh-my-pi/pi-coding-agent/cli/gallery-cli";
-import type { GalleryFixture } from "@oh-my-pi/pi-coding-agent/cli/gallery-fixtures";
+import {
+	type GalleryFixture,
+	getComposerGalleryInventory,
+	getSegmentGalleryInventory,
+} from "@oh-my-pi/pi-coding-agent/cli/gallery-fixtures";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { initTheme, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
-import { toolRenderers } from "@oh-my-pi/pi-coding-agent/tools/renderers";
+import { initTheme } from "@oh-my-pi/pi-coding-agent/ui/theme/service";
+import { toolPresenterNames } from "@oh-my-pi/pi-coding-agent/ui/tools/registry";
 
 beforeAll(async () => {
 	resetSettingsForTest();
 	await Settings.init({ inMemory: true });
-	await initTheme(false, undefined, undefined, "dark", "light");
+	initTheme({ dark: "dark", light: "light" });
 });
 
 describe("gallery harness", () => {
@@ -33,16 +40,54 @@ describe("gallery harness", () => {
 		);
 	});
 
+	it("parses repeatable surfaces and expands all in product order", () => {
+		expect(parseGallerySurfaces(["segment", "tool", "segment"])).toEqual(["tool", "segment"]);
+		expect(parseGallerySurfaces(["all"])).toEqual([...GALLERY_SURFACES]);
+		expect(() => parseGallerySurfaces(["bogus"])).toThrow(/Invalid --surface 'bogus'.*tool.*composer.*segment.*all/);
+	});
+
+	it("orders surfaces tool then composer then segment and lets entry filters imply their surface", async () => {
+		const composer = getComposerGalleryInventory()[0];
+		const segment = getSegmentGalleryInventory()[0];
+		if (!composer || !segment) throw new Error("Production gallery registries must not be empty");
+
+		const sections = await renderGallerySurfaceSections({
+			surfaces: [...GALLERY_SURFACES],
+			tool: "bash",
+			composer,
+			segment,
+			states: ["success"],
+		});
+		expect(sections.map(section => section.heading)).toEqual([
+			"bash — Bash",
+			expect.stringContaining(`composer · ${composer}`),
+			`segment · ${segment}`,
+		]);
+
+		const toolOnly = await renderGallerySurfaceSections({ tool: "bash", states: ["success"] });
+		expect(toolOnly.map(section => section.heading)).toEqual(["bash — Bash"]);
+		const composerOnly = await renderGallerySurfaceSections({ composer });
+		expect(composerOnly).toHaveLength(1);
+		expect(composerOnly[0]?.heading).toContain(`composer · ${composer}`);
+		const segmentOnly = await renderGallerySurfaceSections({ segment });
+		expect(segmentOnly).toHaveLength(1);
+		expect(segmentOnly[0]?.heading).toBe(`segment · ${segment}`);
+	});
+
 	it("renders every registered tool in every lifecycle state without throwing", async () => {
-		for (const name in toolRenderers) {
+		const empty: string[] = [];
+		for (const name of toolPresenterNames()) {
 			const fixture = resolveFixture(name);
 			for (const state of GALLERY_STATES) {
 				const lines = await renderGalleryState(name, fixture, state, 100);
-				// A renderer that produces no lines for a state is a regression: the
-				// component should always emit at least the call header or result.
-				expect(lines.length, `${name}/${state} rendered nothing`).toBeGreaterThan(0);
+				if (lines.length === 0) empty.push(`${name}/${state}`);
 			}
 		}
+		// A presenter that produces no rows for a state is a regression: the
+		// block should always draw at least the call header or result. The
+		// one exception is a pending ask, whose questions live in the panel over
+		// the composer; its transcript entry appears once answers arrive.
+		expect(empty).toEqual(["ask/streaming", "ask/progress"]);
 	});
 
 	it("routes each state to the matching args/result (streaming args vs result, success vs error)", async () => {
@@ -74,27 +119,8 @@ describe("gallery harness", () => {
 		expect(error).not.toContain("SUCCESS_OUT");
 	});
 
-	it("routes customRendered tools (task) through the custom-tool branch", async () => {
-		// `task` attaches its renderer on the real AgentTool, so the gallery must
-		// reproduce that path. With a result present and mergeCallAndResult, the
-		// custom branch must NOT emit a redundant tool-name line above the result box
-		// (regression guard for tool-execution's custom-branch fallback label).
-		const task = resolveFixture("task");
-		expect(task.customRendered).toBe(true);
-		const lines = await renderGalleryState("task", task, "error", 100);
-		const stripped = lines.map(line => Bun.stripANSI(line).trim());
-		// The framed result header carries the label inside the box border...
-		expect(stripped.some(line => line.startsWith(theme.boxRound.topLeft) && line.includes("Task"))).toBe(true);
-		// ...but no standalone "Task" label line precedes it.
-		expect(stripped).not.toContain("Task");
-	});
-
 	it("renders curated failed states as failures", async () => {
-		const cases = [
-			["hub_inbox", "IRC inbox failed: message store unavailable.", "IRC inbox empty"],
-			["hub_list", "IRC list failed: agent hub is unavailable.", "no other agents"],
-			["hub_jobs", "Subagent exited 1: Redis connection string is missing.", "cancelled"],
-		] as const;
+		const cases = [["wait", "Subagent exited 1: Redis connection string is missing.", "42 pass"]] as const;
 
 		for (const [name, expected, forbidden] of cases) {
 			const output = Bun.stripANSI((await renderGalleryState(name, resolveFixture(name), "error", 100)).join("\n"));
@@ -115,12 +141,27 @@ describe("gallery harness", () => {
 		expect(success).not.toContain("full file");
 	});
 
-	it("falls back to a generic fixture for registry tools without curated sample data", () => {
-		// resolveFixture never returns undefined for a registry tool, even one
-		// missing from the curated fixtures, so the gallery cannot crash on a newly
-		// added renderer.
-		const fixture = resolveFixture("a-tool-that-has-no-fixture");
-		expect(fixture.args).toBeDefined();
-		expect(fixture.result.content.length).toBeGreaterThan(0);
+	it("renders URL coordination receipts, cancellation and process errors without file-write chrome", async () => {
+		const render = async (name: string, state: "streaming" | "success" | "error") =>
+			Bun.stripANSI((await renderGalleryState(name, resolveFixture(name), state, 100)).join("\n"));
+		expect(await render("write_agent", "success")).toContain("IRC");
+		expect(await render("write_agent", "success")).toContain("injected");
+		const broadcast = await render("write_agent_broadcast", "success");
+		expect(broadcast).toContain("2 delivered");
+		expect(broadcast).toContain("1 failed");
+		expect(broadcast).toContain("not running");
+		const failedReceipt = await render("write_agent_failed_receipt", "success");
+		expect(failedReceipt).toContain("failed");
+		expect(failedReceipt).toContain("not running");
+		const cancel = await render("write_proc_cancel", "success");
+		expect(cancel).toContain("Build assets");
+		expect(cancel).toContain("cancelled");
+		const error = await render("write_agent", "error");
+		expect(error).toContain("IRC");
+		expect(error).toContain("Peer messaging is unavailable");
+		expect(error).not.toContain("Write");
+		const procError = await render("read_proc_job", "error");
+		expect(procError).toContain("Proc build-42");
+		expect(procError).not.toContain("Read proc://");
 	});
 });

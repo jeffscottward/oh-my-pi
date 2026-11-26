@@ -1,20 +1,21 @@
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Api, Model } from "@oh-my-pi/pi-ai";
-import { Markdown } from "@oh-my-pi/pi-tui";
 import { prompt } from "@oh-my-pi/pi-utils";
+import chalk from "@oh-my-pi/pi-utils/chalk";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
-import chalk from "chalk";
 import typesDescriptionPrompt from "../../commit/prompts/types-description.md" with { type: "text" };
 import type { ModelRegistry } from "../../config/model-registry";
 import type { Settings } from "../../config/settings";
-import { getMarkdownTheme } from "../../modes/theme/theme";
 import { createAgentSession } from "../../sdk";
 import type { AgentSessionEvent } from "../../session/agent-session";
 import type { AuthStorage } from "../../session/auth-storage";
+import type { SessionManager } from "../../session/session-manager";
 import agentUserPrompt from "./prompts/session-user.md" with { type: "text" };
 import agentSystemPrompt from "./prompts/system.md" with { type: "text" };
 import type { CommitAgentState } from "./state";
 import { createCommitTools } from "./tools";
+import { renderMarkdown } from "@oh-my-pi/pi-tui/text/markdown/render";
+import { currentTheme } from "@oh-my-pi/pi-tui/theme/runtime";
 
 export interface CommitAgentInput {
 	cwd: string;
@@ -23,6 +24,7 @@ export interface CommitAgentInput {
 	settings: Settings;
 	modelRegistry: ModelRegistry;
 	authStorage: AuthStorage;
+	sessionManager?: SessionManager;
 	userContext?: string;
 	contextFiles?: Array<{ path: string; content: string }>;
 	changelogTargets: string[];
@@ -57,8 +59,10 @@ export async function runCommitAgentSession(input: CommitAgentInput): Promise<Co
 
 	const { session } = await createAgentSession({
 		cwd: input.cwd,
+		sessionManager: input.sessionManager,
 		authStorage: input.authStorage,
 		modelRegistry: input.modelRegistry,
+		cacheWarming: "off",
 		settings: input.settings,
 		model: input.model,
 		thinkingLevel: input.thinkingLevel,
@@ -68,7 +72,9 @@ export async function runCommitAgentSession(input: CommitAgentInput): Promise<Co
 		enableMCP: false,
 		hasUI: false,
 		spawns,
-		toolNames: ["__none__"],
+		toolNames: tools.map(tool => tool.name),
+		restrictToolNames: true,
+		allowRestrictedCustomTools: true,
 		contextFiles: input.contextFiles,
 		disableExtensionDiscovery: true,
 		skills: [],
@@ -220,8 +226,7 @@ function writeAssistantMessage(message: string): void {
 
 function renderMarkdownLines(message: string): readonly string[] {
 	const width = Math.max(40, process.stdout.columns ?? 100);
-	const markdown = new Markdown(message, 0, 0, getMarkdownTheme());
-	return markdown.render(width);
+	return renderMarkdown(message, width, { theme: currentTheme() });
 }
 
 function formatToolLabel(toolName: string): string {

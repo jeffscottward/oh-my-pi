@@ -1,6 +1,8 @@
 /** Benchmark adapters normalize native artifacts into manager runs and traces. */
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { conversationDumpRelativePath } from "../adapters/edit/dump-path";
+import type { ScopeResult } from "../adapters/scope/result";
 import { aggregate, readJobResult, readTrials } from "./runner";
 import type { BenchmarkKind } from "./store";
 
@@ -40,6 +42,19 @@ export const BENCHMARK_DEFINITIONS: BenchmarkDefinition[] = [
 		metrics: [
 			{ key: "f1", label: "F1", format: "percent", higherIsBetter: true },
 			{ key: "exact_match", label: "Exact match", format: "percent", higherIsBetter: true },
+		],
+	},
+	{
+		kind: "scope",
+		label: "Scope & speed",
+		metrics: [
+			{ key: "pass_rate", label: "Pass", format: "percent", higherIsBetter: true },
+			{ key: "median_wall_s", label: "Median wall s", format: "number", higherIsBetter: false },
+			{ key: "verified_rate", label: "Changes verified before yield", format: "percent", higherIsBetter: true },
+			{ key: "checks_during", label: "Checks during work/run", format: "number", higherIsBetter: false },
+			{ key: "checks_before", label: "Checks before first edit/run", format: "number", higherIsBetter: false },
+			{ key: "check_seconds", label: "Check seconds/run", format: "number", higherIsBetter: false },
+			{ key: "scope_creep_rate", label: "Scope creep", format: "percent", higherIsBetter: false },
 		],
 	},
 ];
@@ -163,7 +178,7 @@ function readEditSnapshot(jobDir: string): BenchmarkSnapshot {
 				costUsd: 0,
 				durationMs: run.duration,
 				detail: JSON.stringify({ name: task.name, error: run.error ?? null, tools: run.toolCalls ?? null }),
-				tracePath: path.join("result.dump", task.id.replace(/[^a-zA-Z0-9._-]/g, "_"), `run-${runNumber}.md`),
+				tracePath: path.join("result.dump", conversationDumpRelativePath(task.id, runNumber)),
 			});
 		}
 	}
@@ -198,18 +213,16 @@ function readSnapcompactSnapshot(jobDir: string): BenchmarkSnapshot {
 		.split("\n")
 		.filter(Boolean)
 		.map(line => JSON.parse(line) as SnapRecord);
-	const traces = records.map(
-		(record, index): BenchmarkTrace => ({
-			name: `${record.cond}__${record.chunk}__${index + 1}`,
-			task: `${record.cond}:${record.chunk}`,
-			status: record.f1 > 0 ? "pass" : "fail",
-			reward: record.f1,
-			costUsd: 0,
-			durationMs: 0,
-			detail: JSON.stringify({ question: record.q, answer: record.answer, golds: record.golds, em: record.em }),
-			tracePath: `record:${index + 1}`,
-		}),
-	);
+	const traces = records.map((record, index): BenchmarkTrace => ({
+		name: `${record.cond}__${record.chunk}__${index + 1}`,
+		task: `${record.cond}:${record.chunk}`,
+		status: record.f1 > 0 ? "pass" : "fail",
+		reward: record.f1,
+		costUsd: 0,
+		durationMs: 0,
+		detail: JSON.stringify({ question: record.q, answer: record.answer, golds: record.golds, em: record.em }),
+		tracePath: `record:${index + 1}`,
+	}));
 	let rows: SnapSummaryRow[] = [];
 	if (fs.existsSync(summaryFile)) {
 		const summary: SnapSummary = JSON.parse(fs.readFileSync(summaryFile, "utf8"));
@@ -239,10 +252,61 @@ function readSnapcompactSnapshot(jobDir: string): BenchmarkSnapshot {
 	};
 }
 
+function readScopeSnapshot(jobDir: string): BenchmarkSnapshot {
+	const file = path.join(jobDir, "result.json");
+	if (!fs.existsSync(file)) return emptySnapshot();
+	const result: ScopeResult = JSON.parse(fs.readFileSync(file, "utf8"));
+	const traces = result.runs.map((run): BenchmarkTrace => ({
+		name: `${run.task}__${run.attempt}`,
+		task: run.task,
+		status: run.error ? "error" : run.pass ? "pass" : "fail",
+		reward: run.pass ? 1 : 0,
+		costUsd: run.costUsd,
+		durationMs: run.wallMs,
+		detail: JSON.stringify({
+			error: run.error,
+			failures: run.failures,
+			turns: run.turns,
+			toolCalls: run.toolCalls,
+			verified: run.verified,
+			checksDuringWork: run.checks.filter(check => check.phase === "during").map(check => check.command),
+			postEditReads: run.postEditReads,
+			outOfScope: run.outOfScope,
+		}),
+		tracePath: run.trace,
+	}));
+	const { summary } = result;
+	const pass = traces.filter(trace => trace.status === "pass").length;
+	return {
+		traces,
+		total: result.total,
+		done: traces.length,
+		pass,
+		fail: traces.length - pass,
+		error: traces.filter(trace => trace.status === "error").length,
+		running: result.finishedAt ? 0 : Math.max(0, result.total - traces.length),
+		costUsd: summary.costUsd,
+		tokIn: summary.tokIn,
+		tokOut: summary.tokOut,
+		tokCache: result.runs.reduce((total, run) => total + run.tokens.cacheRead, 0),
+		score: summary.passRate,
+		metrics: {
+			pass_rate: summary.passRate,
+			median_wall_s: summary.medianWallS,
+			verified_rate: summary.verifiedRate,
+			checks_during: summary.checksDuringPerRun,
+			checks_before: summary.checksBeforePerRun,
+			check_seconds: summary.checkSecondsPerRun,
+			scope_creep_rate: summary.scopeCreepRate,
+		},
+	};
+}
+
 /** Read and normalize the latest artifacts for a benchmark run. */
 export function readBenchmarkSnapshot(benchmark: BenchmarkKind, jobDir: string): BenchmarkSnapshot {
 	if (benchmark === "edit") return readEditSnapshot(jobDir);
 	if (benchmark === "snapcompact") return readSnapcompactSnapshot(jobDir);
+	if (benchmark === "scope") return readScopeSnapshot(jobDir);
 	const trials = readTrials(jobDir);
 	const job = readJobResult(jobDir);
 	const totals = aggregate(trials, job, job?.nTotal ?? trials.length);

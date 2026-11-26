@@ -6,26 +6,19 @@
  * (the reported "first char off / title shift"). Scrolling must also move the
  * visible window.
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import type { AgentHubRemote } from "@oh-my-pi/pi-coding-agent/modes/components/agent-hub";
-import { AgentTranscriptViewer } from "@oh-my-pi/pi-coding-agent/modes/components/agent-transcript-viewer";
-import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { agentTranscriptSource } from "@oh-my-pi/pi-coding-agent/modes/agent-hub-runtime";
+import type { AgentHubRemote } from "@oh-my-pi/pi-coding-agent/modes/view-model/overlays/agent-hub";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { CURRENT_SESSION_VERSION } from "@oh-my-pi/pi-coding-agent/session/session-entries";
-import {
-	getKittyGraphics,
-	ImageBudget,
-	ImageProtocol,
-	setKittyGraphics,
-	setTerminalImageProtocol,
-	TERMINAL,
-	type TUI,
-} from "@oh-my-pi/pi-tui";
 import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
+import { AgentTranscriptViewer } from "../src/ui/overlays/panels/agent-transcript-viewer";
+import { AgentTranscriptViewerModel } from "../src/ui/overlays/panels/agent-transcript-viewer-model";
+import { type LayerTerminal, mountLayer } from "./helpers/layer-terminal";
 
 const TS = new Date().toISOString();
 
@@ -39,7 +32,13 @@ function buildJsonl(): string {
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 	};
 	const lines = [
-		JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION, id: "adv", timestamp: TS, cwd: "/tmp" }),
+		JSON.stringify({
+			type: "session",
+			version: CURRENT_SESSION_VERSION,
+			id: "adv",
+			timestamp: TS,
+			cwd: "/tmp",
+		}),
 	];
 	lines.push(
 		JSON.stringify({
@@ -47,7 +46,13 @@ function buildJsonl(): string {
 			id: "u0",
 			parentId: null,
 			timestamp: TS,
-			message: { role: "user", synthetic: true, attribution: "agent", content: "### PROMPTMARKER", timestamp: 0 },
+			message: {
+				role: "user",
+				synthetic: true,
+				attribution: "agent",
+				content: "### PROMPTMARKER",
+				timestamp: 0,
+			},
 		}),
 	);
 	for (let i = 0; i < 40; i++) {
@@ -73,71 +78,23 @@ function buildJsonl(): string {
 	return `${lines.join("\n")}\n`;
 }
 
-function buildImageJsonl(): string {
-	const usage = {
-		input: 1,
-		output: 1,
-		cacheRead: 0,
-		cacheWrite: 0,
-		totalTokens: 2,
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-	};
-	const entries = [
-		JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION, id: "adv", timestamp: TS, cwd: "/tmp" }),
-		JSON.stringify({
-			type: "message",
-			id: "a0",
-			parentId: null,
-			timestamp: TS,
-			message: {
-				role: "assistant",
-				content: [
-					{ type: "toolCall", id: "image-call", name: "eval", arguments: { language: "py", code: "display" } },
-				],
-				api: "anthropic-messages",
-				provider: "anthropic",
-				model: "gpt-5.5",
-				usage,
-				stopReason: "toolUse",
-				timestamp: 1,
-			},
-		}),
-		JSON.stringify({
-			type: "message",
-			id: "t0",
-			parentId: "a0",
-			timestamp: TS,
-			message: {
-				role: "toolResult",
-				toolCallId: "image-call",
-				toolName: "eval",
-				content: [
-					{ type: "text", text: "displayed image" },
-					{
-						type: "image",
-						data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
-						mimeType: "image/png",
-					},
-				],
-				isError: false,
-				timestamp: 2,
-			},
-		}),
-	];
-	return `${entries.join("\n")}\n`;
-}
-
 function messageLine(id: string, content: string): string {
 	return JSON.stringify({
 		type: "message",
 		id,
 		parentId: null,
 		timestamp: TS,
-		message: { role: "user", synthetic: true, attribution: "agent", content: `### ${content}`, timestamp: 0 },
+		message: {
+			role: "user",
+			synthetic: true,
+			attribution: "agent",
+			content: `### ${content}`,
+			timestamp: 0,
+		},
 	});
 }
 
-function makeViewer(file: string, remote?: AgentHubRemote, ui?: TUI) {
+function makeViewer(file: string, remote?: AgentHubRemote): LayerTerminal {
 	const agents = new AgentRegistry();
 	agents.register({
 		id: "Main/advisor",
@@ -148,18 +105,29 @@ function makeViewer(file: string, remote?: AgentHubRemote, ui?: TUI) {
 		sessionFile: remote ? undefined : file,
 		status: "parked",
 	});
-	return new AgentTranscriptViewer({
+	const model = new AgentTranscriptViewerModel({
+		transcript: agentTranscriptSource,
 		agentId: "Main/advisor",
 		registry: agents,
-		ui: ui ?? ({ requestRender: () => {}, requestComponentRender: () => {} } as never),
-		cwd: "/tmp",
 		remote,
+		terminalRows: () => 24,
 		expandKeys: ["ctrl+o"],
 		hubKeys: ["ctrl+s"],
-		requestRender: () => {},
 		onClose: () => {},
 		onHubClose: () => {},
 	});
+	const viewer = mountLayer(() => AgentTranscriptViewer({ model }), {
+		columns: 80,
+		rows: 24,
+		focusKind: "editor",
+	});
+	return {
+		...viewer,
+		dispose() {
+			viewer.dispose();
+			model.dispose();
+		},
+	};
 }
 
 /** Leading-space count of a stripped line (its content gutter). */
@@ -168,34 +136,88 @@ function gutter(line: string): number {
 	return stripped.length - stripped.trimStart().length;
 }
 
-function withViewer(fn: (viewer: AgentTranscriptViewer) => void): void {
+function withViewer(fn: (viewer: LayerTerminal) => void): void {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-view-"));
 	const file = path.join(dir, "__advisor.jsonl");
 	fs.writeFileSync(file, buildJsonl());
+	const viewer = makeViewer(file);
 	try {
-		fn(makeViewer(file));
+		fn(viewer);
 	} finally {
+		viewer.dispose();
 		removeSyncWithRetries(dir);
 	}
 }
 
-describe("AgentTranscriptViewer", () => {
-	let rowsDesc: PropertyDescriptor | undefined;
+function renderSyntheticAssistant(usage?: { input: number; output: number }): string {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-view-usage-"));
+	const file = path.join(dir, "__advisor.jsonl");
+	fs.writeFileSync(
+		file,
+		[
+			JSON.stringify({
+				type: "session",
+				version: CURRENT_SESSION_VERSION,
+				id: "adv",
+				timestamp: TS,
+				cwd: dir,
+			}),
+			JSON.stringify({
+				type: "message",
+				id: "a0",
+				parentId: null,
+				timestamp: TS,
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "SYNTHETICREPLY" }],
+					model: "qq",
+					provider: "qq",
+					usage,
+					stopReason: "stop",
+					timestamp: Date.now(),
+				},
+			}),
+		].join("\n") + "\n",
+	);
+	try {
+		const viewer = makeViewer(file);
+		try {
+			viewer.render(80);
+			viewer.handleInput("g");
+			return viewer
+				.render(80)
+				.map(line => Bun.stripANSI(line))
+				.join("\n");
+		} finally {
+			viewer.dispose();
+		}
+	} finally {
+		removeSyncWithRetries(dir);
+	}
+}
+async function settleRemoteRefresh(): Promise<void> {
+	await Promise.resolve();
+	await Promise.resolve();
+}
 
-	beforeEach(async () => {
-		resetSettingsForTest();
-		await Settings.init({ inMemory: true });
-		initTheme();
-		rowsDesc = Object.getOwnPropertyDescriptor(process.stdout, "rows");
-		Object.defineProperty(process.stdout, "rows", { configurable: true, get: () => 24, set: () => {} });
+beforeAll(async () => {
+	resetSettingsForTest();
+	await Settings.init({ inMemory: true });
+});
+
+afterAll(() => {
+	resetSettingsForTest();
+});
+
+describe("AgentTranscriptViewer", () => {
+	beforeEach(() => {
+		vi.useFakeTimers();
 	});
 
 	afterEach(() => {
-		if (rowsDesc) {
-			Object.defineProperty(process.stdout, "rows", rowsDesc);
-		} else {
-			Object.defineProperty(process.stdout, "rows", { configurable: true, value: undefined, writable: true });
-		}
+		// A leaked fs spy would make the next test's sync first load recurse and fail.
+		vi.restoreAllMocks();
+		vi.useRealTimers();
 	});
 
 	it("aligns the title and body content on the same gutter", () => {
@@ -212,6 +234,14 @@ describe("AgentTranscriptViewer", () => {
 		});
 	});
 
+	it("shows a synthetic assistant reply without usage", () => {
+		expect(renderSyntheticAssistant()).toContain("SYNTHETICREPLY");
+	});
+
+	it("shows a synthetic assistant reply with tokens but no cost", () => {
+		expect(renderSyntheticAssistant({ input: 1, output: 2 })).toContain("SYNTHETICREPLY");
+	});
+
 	it("collapses synthetic advisor inputs on cold open and expands their body on ctrl+o", () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-view-collapse-"));
 		const file = path.join(dir, "__advisor.jsonl");
@@ -222,13 +252,25 @@ describe("AgentTranscriptViewer", () => {
 		for (let i = 0; i < 500; i++) bodyLines.push(`- SYNTHBODYMARKER line ${i}`);
 		const body = bodyLines.join("\n");
 		const jsonl = [
-			JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION, id: "adv", timestamp: TS, cwd: "/tmp" }),
+			JSON.stringify({
+				type: "session",
+				version: CURRENT_SESSION_VERSION,
+				id: "adv",
+				timestamp: TS,
+				cwd: "/tmp",
+			}),
 			JSON.stringify({
 				type: "message",
 				id: "u0",
 				parentId: null,
 				timestamp: TS,
-				message: { role: "user", synthetic: true, attribution: "agent", content: body, timestamp: 0 },
+				message: {
+					role: "user",
+					synthetic: true,
+					attribution: "agent",
+					content: body,
+					timestamp: 0,
+				},
 			}),
 			JSON.stringify({
 				type: "message",
@@ -247,7 +289,13 @@ describe("AgentTranscriptViewer", () => {
 						cacheRead: 0,
 						cacheWrite: 0,
 						totalTokens: 2,
-						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						cost: {
+							input: 0,
+							output: 0,
+							cacheRead: 0,
+							cacheWrite: 0,
+							total: 0,
+						},
 					},
 					stopReason: "stop",
 					timestamp: 0,
@@ -297,37 +345,6 @@ describe("AgentTranscriptViewer", () => {
 		});
 	});
 
-	it("renders tool-result images through the shared Kitty placeholder budget", async () => {
-		await Settings.init({ inMemory: true, overrides: { "terminal.showImages": true } });
-		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-view-image-"));
-		const file = path.join(dir, "__advisor.jsonl");
-		fs.writeFileSync(file, buildImageJsonl());
-		const previousProtocol = TERMINAL.imageProtocol;
-		const previousGraphics = getKittyGraphics();
-		setTerminalImageProtocol(ImageProtocol.Kitty);
-		setKittyGraphics({ unicodePlaceholders: true });
-		const imageBudget = new ImageBudget(8, () => {});
-		const ui = {
-			imageBudget,
-			requestRender: () => {},
-			requestComponentRender: () => {},
-		} as unknown as TUI;
-		const viewer = makeViewer(file, undefined, ui);
-		try {
-			imageBudget.beginPass();
-			const rendered = viewer.render(80).join("\n");
-			imageBudget.endPass();
-			expect(rendered).toContain("a=p,U=1");
-			expect(rendered).toContain("\u{10eeee}");
-			expect(imageBudget.takeTransmits().join("")).toContain("a=t");
-		} finally {
-			viewer.dispose();
-			setKittyGraphics(previousGraphics);
-			setTerminalImageProtocol(previousProtocol);
-			removeSyncWithRetries(dir);
-		}
-	});
-
 	it("clears stale content when the transcript file is deleted while open", async () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-view-"));
 		const file = path.join(dir, "__advisor.jsonl");
@@ -344,11 +361,8 @@ describe("AgentTranscriptViewer", () => {
 			expect(body()).toContain("PROMPTMARKER");
 
 			removeSyncWithRetries(file);
-			// Poll until the viewer's own poll timer re-stats and clears (deadline-bounded).
-			const deadline = Date.now() + 5000;
-			while (body().includes("PROMPTMARKER") && Date.now() < deadline) {
-				await Bun.sleep(50);
-			}
+			// Drive the viewer's own 250ms polling interval without paying wall-clock time.
+			vi.advanceTimersByTime(250);
 			expect(body()).not.toContain("PROMPTMARKER");
 		} finally {
 			viewer.dispose();
@@ -370,10 +384,7 @@ describe("AgentTranscriptViewer", () => {
 					.render(80)
 					.map(l => Bun.stripANSI(l))
 					.join("\n");
-			const deadline = Date.now() + 5000;
-			while (!body().includes("TAILMARKER") && Date.now() < deadline) {
-				await Bun.sleep(50);
-			}
+			vi.advanceTimersByTime(250);
 			expect(body()).toContain("TAILMARKER");
 			expect(readFileSpy).not.toHaveBeenCalled();
 		} finally {
@@ -386,7 +397,13 @@ describe("AgentTranscriptViewer", () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-view-"));
 		const file = path.join(dir, "__advisor.jsonl");
 		const baseline = `${[
-			JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION, id: "adv", timestamp: TS, cwd: "/tmp" }),
+			JSON.stringify({
+				type: "session",
+				version: CURRENT_SESSION_VERSION,
+				id: "adv",
+				timestamp: TS,
+				cwd: "/tmp",
+			}),
 			messageLine("base", "BASEMARK"),
 		].join("\n")}\n`;
 		fs.writeFileSync(file, baseline);
@@ -423,15 +440,39 @@ describe("AgentTranscriptViewer", () => {
 					.render(80)
 					.map(l => Bun.stripANSI(l))
 					.join("\n");
-			const deadline = Date.now() + 5000;
-			while (!body().includes("TAILMARK") && Date.now() < deadline) {
-				await Bun.sleep(50);
-			}
+			vi.advanceTimersByTime(250);
 			expect(body()).toContain("BASEMARK");
 			expect(body()).toContain("TAILMARK");
 			// The race-window entry must be rendered exactly once, not duplicated
 			// by the poll fast-path re-reading bytes already in the rebuild.
 			expect(body().match(/RACEMARK/g)?.length ?? 0).toBe(1);
+		} finally {
+			viewer.dispose();
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("reloads a rewrite that keeps the file size and mtime within a few idle polls", async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-view-"));
+		const file = path.join(dir, "__advisor.jsonl");
+		fs.writeFileSync(file, `${buildJsonl()}${messageLine("same", "OLDMARKER")}\n`);
+		const original = fs.statSync(file);
+		const viewer = makeViewer(file);
+		try {
+			const body = () =>
+				viewer
+					.render(80)
+					.map(l => Bun.stripANSI(l))
+					.join("\n");
+			expect(body()).toContain("OLDMARKER");
+			fs.writeFileSync(file, `${buildJsonl()}${messageLine("same", "NEWMARKER")}\n`);
+			fs.utimesSync(file, original.atime, original.mtime);
+			const readFile = vi.spyOn(fs.promises, "readFile");
+			vi.advanceTimersByTime(250 * 5);
+			expect(readFile).toHaveBeenCalledTimes(1);
+			await readFile.mock.results[0]!.value;
+			await settleRemoteRefresh();
+			expect(body()).toContain("NEWMARKER");
 		} finally {
 			viewer.dispose();
 			fs.rmSync(dir, { recursive: true, force: true });
@@ -450,7 +491,10 @@ describe("AgentTranscriptViewer", () => {
 			chat: () => {},
 			kill: () => {},
 			revive: () => {},
-			readTranscript: async () => ({ text: header, newSize: Buffer.byteLength(header, "utf-8") }),
+			readTranscript: async () => ({
+				text: header,
+				newSize: Buffer.byteLength(header, "utf-8"),
+			}),
 		};
 		const viewer = makeViewer("", remote);
 		try {
@@ -459,10 +503,7 @@ describe("AgentTranscriptViewer", () => {
 					.render(80)
 					.map(l => Bun.stripANSI(l))
 					.join("\n");
-			const deadline = Date.now() + 5000;
-			while (body().includes("Loading transcript from host") && Date.now() < deadline) {
-				await Bun.sleep(10);
-			}
+			await settleRemoteRefresh();
 			expect(body()).toContain("No messages yet.");
 		} finally {
 			viewer.dispose();
@@ -497,10 +538,7 @@ describe("AgentTranscriptViewer", () => {
 			// Completing the dangling line via a single newline must surface the
 			// buffered entry; it must NOT be dropped as a malformed fragment.
 			fs.appendFileSync(file, "\n");
-			const deadline = Date.now() + 5000;
-			while (!body().includes("PARTIALMARK") && Date.now() < deadline) {
-				await Bun.sleep(50);
-			}
+			vi.advanceTimersByTime(250);
 			expect(body()).toContain("PARTIALMARK");
 		} finally {
 			viewer.dispose();
@@ -508,22 +546,7 @@ describe("AgentTranscriptViewer", () => {
 		}
 	});
 
-	it("stops polling after an oversized remote JSONL entry cannot fit in one host read", async () => {
-		const transcriptReadCap = 4 * 1024 * 1024;
-		const oversizedLine = `${JSON.stringify({
-			type: "message",
-			id: "oversized",
-			parentId: null,
-			timestamp: TS,
-			message: {
-				role: "user",
-				synthetic: true,
-				attribution: "agent",
-				content: "x".repeat(transcriptReadCap + 1),
-				timestamp: 0,
-			},
-		})}\n`;
-		const transcript = Buffer.from(oversizedLine, "utf-8");
+	it("stops polling after the host reports an oversized remote JSONL entry", async () => {
 		const calls: number[] = [];
 		const remote: AgentHubRemote = {
 			chat: () => {},
@@ -531,22 +554,18 @@ describe("AgentTranscriptViewer", () => {
 			revive: () => {},
 			readTranscript: async (_id: string, fromByte: number) => {
 				calls.push(fromByte);
-				const slice = transcript.subarray(fromByte, fromByte + transcriptReadCap);
-				const lastNewline = slice.lastIndexOf(0x0a);
-				if (lastNewline < 0) {
-					return {
-						text: "",
-						newSize: fromByte,
-						error: `transcript entry exceeds transcript fetch cap (${transcriptReadCap} bytes)`,
-					};
-				}
-				const complete = slice.subarray(0, lastNewline + 1);
-				return { text: complete.toString("utf-8"), newSize: fromByte + complete.byteLength };
+				return {
+					text: "",
+					newSize: fromByte,
+					error: "transcript entry exceeds transcript fetch cap (4194304 bytes)",
+				};
 			},
 		};
 		const viewer = makeViewer("", remote);
 		try {
-			await Bun.sleep(650);
+			await settleRemoteRefresh();
+			vi.advanceTimersByTime(650);
+			await settleRemoteRefresh();
 			const body = viewer
 				.render(80)
 				.map(l => Bun.stripANSI(l))
@@ -582,7 +601,10 @@ describe("AgentTranscriptViewer", () => {
 		};
 		const viewer = makeViewer("", remote);
 		try {
-			await Bun.sleep(650);
+			await settleRemoteRefresh();
+			vi.advanceTimersByTime(250);
+			await settleRemoteRefresh();
+			vi.advanceTimersByTime(400);
 			const body = viewer
 				.render(80)
 				.map(l => Bun.stripANSI(l))
@@ -635,10 +657,9 @@ describe("AgentTranscriptViewer", () => {
 					.render(80)
 					.map(l => Bun.stripANSI(l))
 					.join("\n");
-			const deadline = Date.now() + 5000;
-			while (!body().includes("AFTER_ROTATE") && Date.now() < deadline) {
-				await Bun.sleep(20);
-			}
+			await settleRemoteRefresh();
+			vi.advanceTimersByTime(250);
+			await settleRemoteRefresh();
 			expect(body()).toContain("AFTER_ROTATE");
 			// Pre-rotation rows must not stack underneath the refetched transcript.
 			expect(body()).not.toContain("BEFORE_ROTATE");
@@ -661,7 +682,11 @@ describe("AgentTranscriptViewer", () => {
 			// statSync and the sentinel read. The 250ms poll must not throw.
 			vi.spyOn(fs, "statSync").mockImplementation(((p: fs.PathLike) => {
 				if (String(p) === file)
-					return { ...realStat, size: realStat.size + 200, mtimeMs: realStat.mtimeMs + 10 } as fs.Stats;
+					return {
+						...realStat,
+						size: realStat.size + 200,
+						mtimeMs: realStat.mtimeMs + 10,
+					} as fs.Stats;
 				throw new Error("unexpected stat");
 			}) as typeof fs.statSync);
 			vi.spyOn(fs, "openSync").mockImplementation(((p: fs.PathLike) => {

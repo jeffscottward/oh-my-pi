@@ -1,16 +1,28 @@
+import type { ExtensionRender, ExtensionTheme, ExtensionUiHost, HookMessageRenderer } from "../extensions/render-types";
+export type {
+	ExtensionRender,
+	ExtensionRows,
+	ExtensionTheme,
+	ExtensionUiHost,
+	HookMessageRenderer,
+	HookMessageRenderOptions,
+} from "../extensions/render-types";
+import type { type as ArkType } from "@oh-my-pi/omptype";
+import type * as TypeBox from "@oh-my-pi/omptype/typebox";
+import type * as zod from "@oh-my-pi/omptype/zod";
 import type { ImageContent, Message, Model, TextContent } from "@oh-my-pi/pi-ai";
-import type { Component, TUI } from "@oh-my-pi/pi-tui";
 import type { logger as PiLogger } from "@oh-my-pi/pi-utils";
-import type { Type } from "arktype";
-import type * as zod from "zod/v4";
+import type { KeybindingsManager } from "../../config/keybindings/keybindings";
 import type { ModelRegistry } from "../../config/model-registry";
-import type { EditToolDetails } from "../../edit";
+import type { EditToolDetails } from "../../tools/details/edit";
 import type { ExecOptions, ExecResult } from "../../exec/exec";
 import type * as PiCodingAgent from "../../index";
-import type { Theme } from "../../modes/theme/theme";
-import type { CustomMessagePayload, HookMessage } from "../../session/messages";
+import type { CustomMessagePayload } from "../../session/messages";
 import type { ReadonlySessionManager, SessionManager } from "../../session/session-manager";
-import type { BashToolDetails, GlobToolDetails, GrepToolDetails, ReadToolDetails } from "../../tools";
+import type { BashToolDetails } from "../../tools/details/bash";
+import type { GlobToolDetails } from "../../tools/details/glob";
+import type { GrepToolDetails } from "../../tools/details/grep";
+import type { ReadToolDetails } from "../../tools/details/read";
 import type {
 	AgentEndEvent,
 	AgentStartEvent,
@@ -28,6 +40,7 @@ import type {
 	SessionBeforeTreeEvent,
 	SessionBeforeTreeResult,
 	SessionBranchEvent,
+	SessionClearEvent,
 	SessionCompactEvent,
 	SessionCompactingEvent,
 	SessionCompactingResult,
@@ -43,7 +56,6 @@ import type {
 	TurnEndEvent,
 	TurnStartEvent,
 } from "../shared-events";
-import type * as TypeBox from "../typebox";
 
 // Re-export for backward compatibility
 export type { ExecOptions, ExecResult } from "../../exec/exec";
@@ -86,8 +98,8 @@ export interface HookUIContext {
 	/**
 	 * Set status text in the footer/status bar.
 	 * Pass undefined as text to clear the status for this key.
-	 * Text can include ANSI escape codes for styling.
-	 * Note: Newlines, tabs, and carriage returns are replaced with spaces.
+	 * ANSI/VT escape sequences and most control characters are stripped; tabs and newlines become spaces.
+	 * Repeated spaces are collapsed and surrounding whitespace is trimmed.
 	 * The combined status line is truncated to terminal width.
 	 * @param key - Unique key to identify this status (e.g., hook name)
 	 * @param text - Status text to display, or undefined to clear
@@ -95,8 +107,10 @@ export interface HookUIContext {
 	setStatus(key: string, text: string | undefined): void;
 
 	/**
-	 * Show a custom component with keyboard focus.
-	 * The factory receives TUI, theme, and a done() callback to close the component.
+	 * Show a custom view with keyboard focus: pi-tui nodes (one root node, which takes focus) or a
+	 * rows object (`{ render(width), handleInput?(data) }`).
+	 * The factory receives the UI host, theme, keybindings, and a done() callback to close the view.
+	 * Matches the interactive controller call shape (same arity as ExtensionUIContext.custom).
 	 * Can be async for fire-and-forget work (don't await the work, just start it).
 	 *
 	 * @param factory - Function that creates the component. Call done() when finished.
@@ -104,26 +118,25 @@ export interface HookUIContext {
 	 *
 	 * @example
 	 * // Sync factory
-	 * const result = await ctx.ui.custom((tui, theme, done) => {
-	 *   const component = new MyComponent(tui, theme);
-	 *   component.onFinish = (value) => done(value);
-	 *   return component;
-	 * });
+	 * const result = await ctx.ui.custom((ui, theme, keybindings, done) => (
+	 *   <col onKey={key => (key.id === "escape" ? (done(undefined), true) : false)}>
+	 *     <text spans={[{ t: "Press Esc to close", s: "muted" }]} />
+	 *   </col>
+	 * ));
 	 *
 	 * // Async factory with fire-and-forget work
-	 * const result = await ctx.ui.custom(async (tui, theme, done) => {
-	 *   const loader = new CancellableLoader(tui, theme.fg("accent"), theme.fg("muted"), "Working...");
-	 *   loader.onAbort = () => done(null);
-	 *   doWork(loader.signal).then(done);  // Don't await - fire and forget
-	 *   return loader;
+	 * const result = await ctx.ui.custom(async (ui, theme, keybindings, done) => {
+	 *   doWork().then(done); // Don't await - fire and forget
+	 *   return { render: width => [theme.fg("muted", "Working...")] };
 	 * });
 	 */
 	custom<T>(
 		factory: (
-			tui: TUI,
-			theme: Theme,
+			ui: ExtensionUiHost,
+			theme: ExtensionTheme,
+			keybindings: KeybindingsManager,
 			done: (result: T) => void,
-		) => (Component & { dispose?(): void }) | Promise<Component & { dispose?(): void }>,
+		) => ExtensionRender | Promise<ExtensionRender>,
 	): Promise<T>;
 
 	/**
@@ -156,14 +169,9 @@ export interface HookUIContext {
 	): Promise<string | undefined>;
 
 	/**
-	 * Get the current theme for styling text with ANSI codes.
-	 * Use theme.fg() and theme.bg() to style status text.
-	 *
-	 * @example
-	 * const theme = ctx.ui.theme;
-	 * ctx.ui.setStatus("my-hook", theme.fg("success", theme.status.success) + " Ready");
+	 * Get the current theme for styling custom components.
 	 */
-	readonly theme: Theme;
+	readonly theme: ExtensionTheme;
 }
 
 /**
@@ -263,6 +271,8 @@ export type {
 	SessionBeforeSwitchEvent,
 	SessionBeforeTreeEvent,
 	SessionBranchEvent,
+	SessionBranchReason,
+	SessionClearEvent,
 	SessionCompactEvent,
 	SessionCompactingEvent,
 	SessionEvent,
@@ -444,23 +454,7 @@ export type {
  * Handler function type for each event.
  * Handlers can return R, undefined, or void (bare return statements).
  */
-// biome-ignore lint/suspicious/noConfusingVoidType: void allows bare return statements in handlers
 export type HookHandler<E, R = undefined> = (event: E, ctx: HookContext) => Promise<R | void> | R | void;
-
-export interface HookMessageRenderOptions {
-	/** Whether the view is expanded */
-	expanded: boolean;
-}
-
-/**
- * Renderer for hook messages.
- * Hooks register these to provide custom TUI rendering for their message types.
- */
-export type HookMessageRenderer<T = unknown> = (
-	message: HookMessage<T>,
-	options: HookMessageRenderOptions,
-	theme: Theme,
-) => Component | undefined;
 
 /**
  * Command registration options.
@@ -484,6 +478,7 @@ export interface HookAPI {
 	on(event: "session_start", handler: HookHandler<SessionStartEvent>): void;
 	on(event: "session_before_switch", handler: HookHandler<SessionBeforeSwitchEvent, SessionBeforeSwitchResult>): void;
 	on(event: "session_switch", handler: HookHandler<SessionSwitchEvent>): void;
+	on(event: "session_clear", handler: HookHandler<SessionClearEvent>): void;
 	on(event: "session_before_branch", handler: HookHandler<SessionBeforeBranchEvent, SessionBeforeBranchResult>): void;
 	on(event: "session_branch", handler: HookHandler<SessionBranchEvent>): void;
 	on(
@@ -583,11 +578,11 @@ export interface HookAPI {
 
 	/** File logger for error/warning/debug messages */
 	logger: typeof PiLogger;
-	/** Injected zod-backed typebox shim (legacy/compat — prefer `arktype`). */
+	/** Injected TypeBox shim (legacy/compat — prefer `arktype`). */
 	typebox: typeof TypeBox;
-	/** Injected arktype module for arktype-authored hooks. */
-	arktype: typeof Type;
-	/** Injected zod/v4 module for canonical hook validation. */
+	/** Injected omptype schema builder for hooks. */
+	arktype: typeof ArkType;
+	/** Injected Zod-compatible omptype builder for hooks. */
 	zod: typeof zod;
 	/** Injected pi-coding-agent exports */
 	pi: typeof PiCodingAgent;

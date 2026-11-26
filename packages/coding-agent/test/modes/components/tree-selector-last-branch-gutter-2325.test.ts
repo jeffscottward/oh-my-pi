@@ -1,8 +1,11 @@
-import { beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, describe, expect, it } from "bun:test";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import { TreeSelectorComponent } from "@oh-my-pi/pi-coding-agent/modes/components/tree-selector";
-import * as themeModule from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { SessionEntry, SessionTreeNode } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import { treeListRows } from "../../helpers/tree-selector";
+import { currentTheme, setCurrentTheme } from "@oh-my-pi/pi-tui/theme/runtime";
+
+const restoreTheme = currentTheme();
+afterAll(() => setCurrentTheme(restoreTheme));
 
 let counter = 0;
 function makeNode(role: "user" | "assistant", text: string, parentId: string | null = null): SessionTreeNode {
@@ -37,25 +40,13 @@ function chain(parent: SessionTreeNode, ...specs: Array<["user" | "assistant", s
 }
 
 function renderStripped(tree: SessionTreeNode[], leafId: string, width = 120): string[] {
-	const selector = new TreeSelectorComponent(
-		tree,
-		leafId,
-		60,
-		() => {},
-		() => {},
-	);
-	return selector.render(width).map(line => Bun.stripANSI(line));
+	return treeListRows({ roots: tree, currentLeafId: leafId }, { columns: width, rows: 60 });
 }
 
-// Issue #2325 tree shape: a parent that branches into several sub-sessions
-// where the LAST sibling (`└─`) carries a chain of flattened message rows
-// that itself branches again deeper down.
-describe("issue #2325: connectors terminate at `└─` and chain columns stay stable", () => {
-	beforeAll(async () => {
-		await themeModule.initTheme(false, undefined, undefined, "dark", "light");
-	});
-
-	it("renders no vertical in the `└─` corner column and keeps chain rows on one anchor column", () => {
+// A terminal branch whose linear chain branches again must keep every row at
+// its logical depth without reviving the terminal gutter or drifting right.
+describe("issue #7332: terminal branch chains keep compact alignment", () => {
+	it("aligns chain rows with their branch heads and terminates last-sibling gutters", () => {
 		counter = 0;
 		const root = makeNode("user", "proceed with implementation");
 		const asst = chain(root, ["assistant", "resp"]);
@@ -80,30 +71,64 @@ describe("issue #2325: connectors terminate at `└─` and chain columns stay s
 			return row;
 		};
 
-		// b3 is the last sibling: its connector is `└─` at column 2.
-		expect(findRow("user: second review head")).toMatch(/^\s{2}└─ \S/);
+		// b3 is the last sibling: its connector is `└─`.
+		const headRow = findRow("user: second review head");
+		expect(headRow).toMatch(/└─ \S/);
+		const head = headRow.indexOf("user: second review head");
 
-		// Chain rows under the `└─` head: the corner column (col 2) must stay
-		// blank — no `│` running down from the `└─` — and every chain row is
-		// anchored by `│` on the same column, one level right (below the head's
-		// content). Exact prefix: 5 spaces, `│`, 2 spaces, then content.
+		// Chain rows under the `└─` head align with its content. They neither
+		// revive the terminated gutter nor create a disconnected anchor farther
+		// right.
 		for (const needle of ["assistant: fix-asst", "user: fix it all", "assistant: rev-asst"]) {
 			const row = findRow(needle);
-			expect(row).not.toMatch(/^\s{2}│/);
-			expect(row).toMatch(/^\s{5}│\s{2}\S/);
+			expect(row).not.toContain("│");
+			expect(row.indexOf(needle)).toBe(head);
 		}
 
-		// The deeper branch point keeps stable columns: connectors sit directly
-		// below the chain content column (col 8), with nothing dangling in the
-		// outer corner columns.
-		expect(findRow("user: review the fixes")).toMatch(/^\s{8}├─ \S/);
-		expect(findRow("user: other thread")).toMatch(/^\s{8}└─ \S/);
+		// The deeper branch point advances one level from the compact chain.
+		const reviewRow = findRow("user: review the fixes");
+		expect(reviewRow).toMatch(/├─ \S/);
+		expect(reviewRow.search(/├─/)).toBe(head);
+		const otherRow = findRow("user: other thread");
+		expect(otherRow).toMatch(/└─ \S/);
+		expect(otherRow.search(/└─/)).toBe(head);
 
-		// Continuations of the non-last grandchild ride its sibling line at the
-		// same column (col 8) — no drift back into outer columns.
+		// Continuations of the non-last grandchild stay aligned with that
+		// grandchild while its sibling gutter remains visible.
 		for (const needle of ["user: all findings done", "user: still have findings"]) {
 			const row = findRow(needle);
-			expect(row).toMatch(/^\s{8}│\s{5}\S/);
+			expect(row[head]).toBe("│");
+			expect(row.indexOf(needle)).toBe(reviewRow.indexOf("user: review the fixes"));
+		}
+	});
+});
+
+// Multiple roots (e.g. orphaned parent chains after `resetLeaf`) render as
+// children of a virtual branching root: the roots share column 0 and their
+// own descendants must nest one level in rather than collapsing back.
+describe("issue #7332: single-child roots stay nested under the virtual root", () => {
+	it("indents linear descendants of a root past the shared column-0 roots", () => {
+		counter = 0;
+		const root1 = makeNode("user", "root one head");
+		chain(root1, ["assistant", "root one reply"], ["user", "root one follow"]);
+		const root2 = makeNode("user", "root two head");
+		const leaf = chain(root2, ["assistant", "root two reply"]);
+
+		const rendered = renderStripped([root1, root2], leaf.entry.id);
+		const findRow = (needle: string): string => {
+			const row = rendered.find(line => line.includes(needle));
+			if (!row) throw new Error(`row containing ${JSON.stringify(needle)} not rendered`);
+			return row;
+		};
+
+		// The roots share one column (the active one carries its path marker there).
+		const rootColumn = findRow("user: root one head").indexOf("user: root one head");
+		expect(findRow("user: root two head").search(/\S/)).toBe(rootColumn);
+
+		// Their linear descendants nest one level in rather than collapsing back
+		// to the roots' column.
+		for (const needle of ["assistant: root one reply", "user: root one follow"]) {
+			expect(findRow(needle).indexOf(needle)).toBeGreaterThan(rootColumn);
 		}
 	});
 });

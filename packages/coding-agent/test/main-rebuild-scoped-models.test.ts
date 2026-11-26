@@ -1,0 +1,446 @@
+import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import { type Api, type AuthStorage, Effort, type Model } from "@oh-my-pi/pi-ai";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { formatModelStringWithRouting, resolveModelScope } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
+import { cfgEnabledModels, cfgModelProviderOrder } from "@oh-my-pi/pi-coding-agent/config/model-settings";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import {
+	buildSessionOptions,
+	rebuildScopedModels,
+	rebuildScopedModelsAfterDiscovery,
+	resolveScopedModels,
+	type ScopedModelSink,
+	toSessionScopedModels,
+	watchScopedModelSettings,
+} from "@oh-my-pi/pi-coding-agent/main";
+import { createSetupHost } from "@oh-my-pi/pi-coding-agent/modes/setup";
+import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { TempDir } from "@oh-my-pi/pi-utils";
+import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
+
+function model(id: string): Model<Api> {
+	return buildModel({
+		id,
+		name: id,
+		api: "anthropic-messages",
+		provider: "prov",
+		baseUrl: "https://example.com",
+		reasoning: false,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 128_000,
+		maxTokens: 8_192,
+	});
+}
+
+/** Mutable stand-in for {@link ModelRegistry}: `available` grows to mimic provider discovery. */
+class FakeRegistry {
+	available: Model<Api>[];
+	discoverableProviders = ["prov"];
+	refreshCalls = 0;
+	onRefresh: (() => void) | undefined;
+	constructor(initial: Model<Api>[], onRefresh?: () => void) {
+		this.available = initial;
+		this.onRefresh = onRefresh;
+	}
+	getAvailable(): Model<Api>[] {
+		return this.available;
+	}
+	getDiscoverableProviders(): string[] {
+		return this.discoverableProviders;
+	}
+	async refresh(): Promise<void> {
+		this.refreshCalls += 1;
+		this.onRefresh?.();
+	}
+	async awaitBackgroundRefresh(): Promise<void> {
+		this.onRefresh?.();
+	}
+	reapplyModelPolicies(): Promise<void> {
+		return this.refresh();
+	}
+}
+
+class FakeSession implements ScopedModelSink {
+	isDisposed = false;
+	scopedModels: ReadonlyArray<{ model: Model; thinkingLevel?: ThinkingLevel }>;
+	setCalls = 0;
+	disposers: Array<() => void> = [];
+	constructor(initial: ReadonlyArray<{ model: Model; thinkingLevel?: ThinkingLevel }>) {
+		this.scopedModels = initial;
+	}
+	setScopedModels(scopedModels: Array<{ model: Model; thinkingLevel?: ThinkingLevel }>): void {
+		this.setCalls += 1;
+		this.scopedModels = scopedModels;
+	}
+	addDisposer(dispose: () => void): void {
+		this.disposers.push(dispose);
+	}
+}
+
+async function startupScope(
+	patterns: string[],
+	registry: FakeRegistry,
+	settings: Settings,
+): Promise<Array<{ model: Model; thinkingLevel?: ThinkingLevel }>> {
+	return toSessionScopedModels(await resolveModelScope(patterns, registry, undefined, settings), settings);
+}
+
+describe("watchScopedModelSettings", () => {
+	it("replaces the scope when an enabled model changes only its upstream pin", async () => {
+		const source = "openrouter/z-ai/glm-4.7@sambanova";
+		const target = "openrouter/z-ai/glm-4.7@cerebras";
+		const settings = Settings.isolated();
+		cfgEnabledModels.set(settings, [source]);
+		const bundled = getBundledModel("openrouter", "z-ai/glm-4.7");
+		if (!bundled) throw new Error("Expected bundled OpenRouter model");
+		const registry = new FakeRegistry([bundled]);
+		const session = new FakeSession(await startupScope([source], registry, settings));
+		expect(session.scopedModels.map(entry => formatModelStringWithRouting(entry.model))).toEqual([source]);
+
+		watchScopedModelSettings(session, parseArgs([]), registry, settings);
+		try {
+			cfgEnabledModels.set(settings, [target]);
+			const { promise, resolve } = Promise.withResolvers<void>();
+			setImmediate(resolve);
+			await promise;
+
+			expect(session.setCalls).toBe(1);
+			expect(session.scopedModels.map(entry => formatModelStringWithRouting(entry.model))).toEqual([target]);
+		} finally {
+			for (const dispose of session.disposers) dispose();
+		}
+	});
+
+	it("re-resolves an enabledModels role alias when the role is reassigned", async () => {
+		const settings = Settings.isolated({ enabledModels: ["@slow"] });
+		settings.setModelRole("slow", "prov/a");
+		const registry = new FakeRegistry([model("a"), model("b")]);
+		const session = new FakeSession(await startupScope(["@slow"], registry, settings));
+		expect(session.scopedModels.map(entry => entry.model.id)).toEqual(["a"]);
+
+		watchScopedModelSettings(session, parseArgs([]), registry, settings);
+		try {
+			settings.setModelRole("slow", "prov/b");
+			const { promise, resolve } = Promise.withResolvers<void>();
+			setImmediate(resolve);
+			await promise;
+			expect(session.scopedModels.map(entry => entry.model.id)).toEqual(["b"]);
+		} finally {
+			for (const dispose of session.disposers) dispose();
+		}
+	});
+
+	it("updates the cycling scope when provider preference changes an enabled model", async () => {
+		const id = "anthropic/claude-preset-fixture";
+		const patterns = [id];
+		const settings = Settings.isolated({ enabledModels: patterns, modelProviderOrder: ["openrouter"] });
+		const registry = new FakeRegistry(
+			["openrouter", "vercel-ai-gateway"].map(provider => ({ ...model(id), provider })),
+		);
+		const session = new FakeSession(await startupScope(patterns, registry, settings));
+		expect(session.scopedModels.map(entry => entry.model.provider)).toEqual(["openrouter"]);
+
+		watchScopedModelSettings(session, parseArgs([]), registry, settings);
+		try {
+			cfgModelProviderOrder.override(settings, ["vercel-ai-gateway"]);
+			const { promise, resolve } = Promise.withResolvers<void>();
+			setImmediate(resolve);
+			await promise;
+			expect(session.scopedModels.map(entry => entry.model.provider)).toEqual(["vercel-ai-gateway"]);
+		} finally {
+			for (const dispose of session.disposers) dispose();
+		}
+	});
+});
+
+describe("rebuildScopedModelsAfterDiscovery", () => {
+	it("adds an enabledModels model that only materializes after background discovery", async () => {
+		const settings = Settings.isolated({ enabledModels: ["prov/a", "prov/b"] });
+		const registry = new FakeRegistry([model("a")]);
+		// Startup resolves the scope before discovery: `prov/b` is not yet available.
+		const session = new FakeSession(await startupScope(["prov/a", "prov/b"], registry, settings));
+		expect(session.scopedModels.map(s => s.model.id)).toEqual(["a"]);
+
+		// Background discovery completes and populates the registry.
+		registry.available = [model("a"), model("b")];
+		await rebuildScopedModelsAfterDiscovery(session, parseArgs([]), registry, settings);
+
+		expect(session.setCalls).toBe(1);
+		expect(session.scopedModels.map(s => s.model.id)).toEqual(["a", "b"]);
+	});
+
+	it("leaves the scope untouched when discovery adds nothing matching", async () => {
+		const settings = Settings.isolated({ enabledModels: ["prov/a", "prov/b"] });
+		const registry = new FakeRegistry([model("a"), model("b")]);
+		const session = new FakeSession(await startupScope(["prov/a", "prov/b"], registry, settings));
+		const before = session.scopedModels;
+
+		// A later discovery pass adds an unrelated, out-of-scope model.
+		registry.available = [model("a"), model("b"), model("c")];
+		await rebuildScopedModelsAfterDiscovery(session, parseArgs([]), registry, settings);
+
+		expect(session.setCalls).toBe(0);
+		expect(session.scopedModels).toBe(before);
+	});
+
+	it("activates a scope that resolved empty once background discovery finds its model", async () => {
+		const settings = Settings.isolated({ enabledModels: ["prov/b"] });
+		const registry = new FakeRegistry([model("a")]);
+		// `prov/b` matches nothing at startup, so the session initially looks unscoped.
+		const session = new FakeSession(await startupScope(["prov/b"], registry, settings));
+		expect(session.scopedModels).toHaveLength(0);
+
+		registry.available = [model("a"), model("b")];
+		await rebuildScopedModelsAfterDiscovery(session, parseArgs([]), registry, settings);
+
+		expect(session.setCalls).toBe(1);
+		expect(session.scopedModels.map(s => s.model.id)).toEqual(["b"]);
+	});
+
+	it("re-resolves an explicit --models scope against the discovery-backed catalog", async () => {
+		const settings = Settings.isolated();
+		const registry = new FakeRegistry([model("a")]);
+		const session = new FakeSession(await startupScope(["prov/a", "prov/b"], registry, settings));
+		expect(session.scopedModels.map(s => s.model.id)).toEqual(["a"]);
+
+		registry.available = [model("a"), model("b")];
+		await rebuildScopedModelsAfterDiscovery(session, parseArgs(["--models", "prov/a,prov/b"]), registry, settings);
+
+		expect(session.scopedModels.map(s => s.model.id)).toEqual(["a", "b"]);
+	});
+
+	it("skips the rebuild once the session is disposed", async () => {
+		const settings = Settings.isolated({ enabledModels: ["prov/a", "prov/b"] });
+		const registry = new FakeRegistry([model("a")]);
+		const session = new FakeSession(await startupScope(["prov/a", "prov/b"], registry, settings));
+		session.isDisposed = true;
+
+		registry.available = [model("a"), model("b")];
+		await rebuildScopedModelsAfterDiscovery(session, parseArgs([]), registry, settings);
+
+		expect(session.setCalls).toBe(0);
+		expect(session.scopedModels.map(s => s.model.id)).toEqual(["a"]);
+	});
+});
+
+describe("rebuildScopedModels after login", () => {
+	it("adds a newly available allowed model to the existing scope", async () => {
+		const settings = Settings.isolated();
+		const registry = new FakeRegistry([model("a")]);
+		const session = new FakeSession(await startupScope(["prov/a", "prov/b"], registry, settings));
+
+		registry.available = [model("a"), model("b")];
+		await rebuildScopedModels(session, parseArgs(["--models", "prov/a,prov/b"]), registry, settings);
+
+		expect(session.scopedModels.map(entry => entry.model.id)).toEqual(["a", "b"]);
+	});
+
+	it("keeps a newly available model outside the explicit CLI scope", async () => {
+		const settings = Settings.isolated({ enabledModels: ["prov/*"] });
+		const registry = new FakeRegistry([model("a")]);
+		const session = new FakeSession(await startupScope(["prov/a"], registry, settings));
+
+		registry.available = [model("a"), model("b")];
+		await rebuildScopedModels(session, parseArgs(["--models", "prov/a"]), registry, settings);
+
+		expect(session.scopedModels.map(entry => entry.model.id)).toEqual(["a"]);
+	});
+
+	it("uses the current enabledModels scope when no CLI scope is provided", async () => {
+		const settings = Settings.isolated({ enabledModels: ["prov/a", "prov/b"] });
+		const registry = new FakeRegistry([model("a")]);
+		const session = new FakeSession(await startupScope(["prov/a"], registry, settings));
+
+		registry.available = [model("a"), model("b")];
+		await rebuildScopedModels(session, parseArgs([]), registry, settings);
+
+		expect(session.scopedModels.map(entry => entry.model.id)).toEqual(["a", "b"]);
+	});
+
+	it("makes setup-discovered models selectable without changing the active model", async () => {
+		const settings = Settings.isolated({ enabledModels: ["prov/*"] });
+		const active = model("a");
+		const refreshed: string[] = [];
+		const registry = Object.assign(new FakeRegistry([active]), {
+			async refreshProvider(this: FakeRegistry, provider: string) {
+				refreshed.push(provider);
+				this.available = [active, model("b")];
+			},
+		});
+		const session = new FakeSession([{ model: active }]);
+		const ctx = {
+			settings,
+			session: {
+				model: active,
+				modelRegistry: registry,
+				refreshScopedModels: async () => {
+					await rebuildScopedModels(session, parseArgs([]), registry, settings);
+				},
+			},
+		};
+
+		await createSetupHost(ctx as unknown as InteractiveModeContext).refreshProvider?.("prov");
+
+		expect(session.scopedModels.map(entry => entry.model.id)).toEqual(["a", "b"]);
+		expect(ctx.session.model).toBe(active);
+
+		// An OAuth alias refreshes the provider its credential is stored under.
+		await createSetupHost(ctx as unknown as InteractiveModeContext).refreshProvider?.("openai-codex-device");
+		expect(refreshed).toEqual(["prov", "openai-codex"]);
+	});
+});
+
+describe("resolveScopedModels", () => {
+	it("refreshes a collapsed all-discovery --models scope before session model selection", async () => {
+		const settings = Settings.isolated();
+		const registry = new FakeRegistry([], () => {
+			registry.available = [model("b")];
+		});
+
+		const scoped = await resolveScopedModels(parseArgs(["--models", "prov/b"]), registry, settings);
+
+		expect(registry.refreshCalls).toBe(1);
+		expect(scoped.map(entry => entry.model.id)).toEqual(["b"]);
+	});
+});
+
+describe("buildSessionOptions --models scope selection", () => {
+	let tempDir: TempDir;
+	let authStorage: AuthStorage;
+
+	beforeAll(async () => {
+		tempDir = await TempDir.create("@main-rebuild-scoped-models-");
+		authStorage = createInMemoryAuthStorage();
+	});
+
+	afterAll(async () => {
+		authStorage.close();
+		await tempDir.remove();
+	});
+
+	function registry(): ModelRegistry {
+		return new ModelRegistry(authStorage, tempDir.join("models.yml"));
+	}
+
+	it("defers a --models scope that resolved empty to the SDK modelPattern path", async () => {
+		const parsed = parseArgs(["--models", "extprov/model-x,extprov/model-y"]);
+
+		// Empty `scopedModels` mimics an all-extension scope: the provider is not
+		// registered until createAgentSession, so nothing matched at startup.
+		const options = await buildSessionOptions(parsed, [], SessionManager.inMemory(), registry(), Settings.isolated());
+
+		expect(options.model).toBeUndefined();
+		expect(options.modelPattern).toEqual(["extprov/model-x", "extprov/model-y"]);
+		expect(options.scopedModels).toBeUndefined();
+	});
+
+	it("seeds the startup thinking level from the scope entry the session starts on", async () => {
+		const parsed = parseArgs(["--models", "prov/a:low,prov/b:high"]);
+		const settings = Settings.isolated({ modelRoles: { default: "prov/b" } });
+		const scoped = await resolveModelScope(
+			["prov/a:low", "prov/b:high"],
+			{ getAvailable: () => [model("a"), model("b")] },
+			undefined,
+		);
+
+		const options = await buildSessionOptions(parsed, scoped, SessionManager.inMemory(), registry(), settings);
+
+		expect(options.model?.id).toBe("b");
+		expect(options.thinkingLevel).toBe(Effort.High);
+	});
+
+	it("keeps the --model thinking level when that model starts outside the scope", async () => {
+		const parsed = parseArgs([
+			"--model",
+			"anthropic/claude-opus-4-5:medium",
+			"--models",
+			"anthropic/claude-sonnet-4-5:low",
+		]);
+		const scoped = await resolveModelScope(
+			["anthropic/claude-sonnet-4-5:low"],
+			{ getAvailable: () => [getBundledModel("anthropic", "claude-sonnet-4-5")] },
+			undefined,
+		);
+
+		const options = await buildSessionOptions(
+			parsed,
+			scoped,
+			SessionManager.inMemory(),
+			registry(),
+			Settings.isolated(),
+		);
+
+		expect(options.model?.id).toBe("claude-opus-4-5");
+		expect(options.thinkingLevel).toBe(Effort.Medium);
+	});
+
+	it("keeps the --model thinking level over the scope entry for the same model", async () => {
+		const parsed = parseArgs([
+			"--model",
+			"anthropic/claude-opus-4-5:medium",
+			"--models",
+			"anthropic/claude-sonnet-4-5:low,anthropic/claude-opus-4-5:high",
+		]);
+		const scoped = await resolveModelScope(
+			["anthropic/claude-sonnet-4-5:low", "anthropic/claude-opus-4-5:high"],
+			{
+				getAvailable: () => [
+					getBundledModel("anthropic", "claude-sonnet-4-5"),
+					getBundledModel("anthropic", "claude-opus-4-5"),
+				],
+			},
+			undefined,
+		);
+
+		const options = await buildSessionOptions(
+			parsed,
+			scoped,
+			SessionManager.inMemory(),
+			registry(),
+			Settings.isolated(),
+		);
+
+		expect(options.model?.id).toBe("claude-opus-4-5");
+		expect(options.thinkingLevel).toBe(Effort.Medium);
+	});
+
+	it("starts on the remembered free variant and its pin when --models also allows the paid model", async () => {
+		const paid = "openrouter/qwen/qwen3-coder";
+		const saved = `${paid}:free@cerebras`;
+		const parsed = parseArgs(["--models", `${paid},${paid}:free`]);
+		const settings = Settings.isolated({ modelRoles: { default: saved } });
+		const modelRegistry = registry();
+		authStorage.keys.setRuntime("openrouter", "test-key");
+		try {
+			const scoped = await resolveScopedModels(parsed, modelRegistry, settings);
+			const options = await buildSessionOptions(parsed, scoped, SessionManager.inMemory(), modelRegistry, settings);
+			expect(options.model && formatModelStringWithRouting(options.model)).toBe(saved);
+		} finally {
+			authStorage.keys.removeRuntime("openrouter");
+		}
+	});
+
+	it("pins the first scoped model and sets no deferred pattern when the scope resolved", async () => {
+		const parsed = parseArgs(["--models", "prov/a"]);
+		const scoped = await resolveModelScope(["prov/a"], { getAvailable: () => [model("a")] }, undefined);
+
+		const options = await buildSessionOptions(
+			parsed,
+			scoped,
+			SessionManager.inMemory(),
+			registry(),
+			Settings.isolated(),
+		);
+
+		expect(options.modelPattern).toBeUndefined();
+		expect(options.model?.id).toBe("a");
+		expect(options.rebindModelAfterDiscovery).toBe(true);
+		expect(options.scopedModels?.map(entry => entry.model.id)).toEqual(["a"]);
+	});
+});

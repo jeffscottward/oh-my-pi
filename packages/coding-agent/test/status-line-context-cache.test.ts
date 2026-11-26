@@ -1,274 +1,248 @@
 /**
- * Contract for `StatusLineComponent.getCachedContextBreakdown`.
+ * The status line's context usage: it surfaces `session.getContextUsage()`,
+ * which anchors on the last assistant's real provider prompt-token count — so
+ * the bar matches the provider and the `/context` panel instead of an
+ * independent estimate that drifted past 100%.
  *
- * The status-line context% segment no longer keeps its own cl100k estimate of
- * the whole conversation. It surfaces `session.getContextUsage()`, which
- * anchors on the last assistant's real provider prompt-token count — so the bar
- * matches the provider and the `/context` panel instead of an independent
- * estimate that drifted past 100%.
- *
- * `getTopBorder()` runs on every agent event (event-controller.ts), so the
- * breakdown is memoized: it re-queries `getContextUsage()` only when an input
- * it depends on changes (a new/grown message, a replaced message array, or the
- * model's context window). A stable conversation must not re-query on every
- * redraw — that per-event recompute is what previously froze large sessions.
+ * Painting is not an input: the facts re-read usage when the session reports a
+ * change (an event, or `refresh()` for changes that emit none), and repeated
+ * paints in between reuse the snapshot — the per-paint recompute is what
+ * previously froze large sessions.
  */
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ContextUsage } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
-import { StatusLineComponent } from "@oh-my-pi/pi-coding-agent/modes/components/status-line";
-import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
-import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { statusLineHost } from "@oh-my-pi/pi-coding-agent/modes/status-line-host";
+import type { StatusLineSettings } from "@oh-my-pi/pi-coding-agent/ui/status/facts";
+import {
+	disposeStatusLines,
+	flushStatus,
+	lineText,
+	segmentText,
+	statusFacts,
+	statusLine,
+	statusRows,
+	statusSession,
+} from "./helpers/session-status-line";
 
 beforeAll(async () => {
 	resetSettingsForTest();
 	await Settings.init({ inMemory: true });
-	await initTheme();
 });
 
 afterAll(() => {
 	resetSettingsForTest();
 });
 
-interface Fake {
-	session: AgentSession;
-	/** Number of times `getContextUsage()` was queried. */
-	usageCalls: () => number;
-	/** Swap the value the next `getContextUsage()` query returns. */
-	setUsage: (usage: ContextUsage | undefined) => void;
-	/** Bump the in-flight pending revision the next `getCachedContextBreakdown()` reads. */
-	setRevision: (n: number) => void;
-}
+afterEach(() => {
+	disposeStatusLines();
+});
 
-function makeSession(opts: { messages: unknown[]; contextWindow?: number; usage?: ContextUsage | undefined }): Fake {
+function makeSession(opts: { contextWindow?: number; usage?: ContextUsage | undefined }) {
 	const contextWindow = opts.contextWindow ?? 200_000;
+	const model = {
+		id: "test-model",
+		provider: "test",
+		contextWindow,
+		input: ["text"],
+	};
 	let usage: ContextUsage | undefined = "usage" in opts ? opts.usage : { tokens: 1234, contextWindow, percent: 0.6 };
 	let calls = 0;
-	let revision = 0;
-	const session = {
-		messages: opts.messages,
-		systemPrompt: ["You are a helpful assistant."],
-		agent: { state: { tools: [] } },
-		skills: [],
-		model: { id: "test-model", contextWindow },
-		state: { messages: opts.messages, model: { contextWindow } },
-		sessionManager: {
-			getUsageStatistics: () => ({
-				input: 0,
-				output: 0,
-				cacheRead: 0,
-				cacheWrite: 0,
-				totalTokens: 0,
-				orchestrationInput: 0,
-				orchestrationOutput: 0,
-				orchestrationCacheRead: 0,
-				premiumRequests: 0,
-				cost: 0,
-			}),
-			getSessionName: () => "test",
-		},
-		getAsyncJobSnapshot: () => ({ running: [] }),
+	const session = statusSession({
+		model,
+		state: { messages: [], model },
 		getContextUsage: () => {
 			calls++;
 			return usage;
 		},
-		get contextUsageRevision() {
-			return revision;
-		},
-	} as unknown as AgentSession;
+	});
 	return {
 		session,
 		usageCalls: () => calls,
-		setUsage: next => {
+		setUsage: (next: ContextUsage | undefined) => {
 			usage = next;
-		},
-		setRevision: (n: number) => {
-			revision = n;
 		},
 	};
 }
 
-function userMessage(text: string): unknown {
-	return { role: "user", content: text };
-}
-function assistantMessage(text: string): unknown {
-	return { role: "assistant", content: [{ type: "text", text }] };
-}
-
-describe("StatusLineComponent context breakdown", () => {
+describe("status line context usage", () => {
 	it("surfaces the provider-anchored tokens and context window from getContextUsage", () => {
 		const { session } = makeSession({
-			messages: [userMessage("hi")],
 			usage: { tokens: 5000, contextWindow: 272_000, percent: 1.8 },
 		});
-		const breakdown = new StatusLineComponent(session).getCachedContextBreakdown();
-		expect(breakdown.usedTokens).toBe(5000);
-		expect(breakdown.contextWindow).toBe(272_000);
+		const line = statusLine(session);
+		expect(line.contextBreakdown()).toEqual({
+			usedTokens: 5000,
+			contextWindow: 272_000,
+		});
+		expect(line.facts().context).toMatchObject({
+			tokens: 5000,
+			window: 272_000,
+		});
 	});
 
-	it("memoizes: repeated redraws with no change do not re-query usage", () => {
-		const { session, usageCalls } = makeSession({ messages: [userMessage("hi")] });
-		const comp = new StatusLineComponent(session);
-
-		comp.getCachedContextBreakdown();
-		comp.getCachedContextBreakdown();
-		comp.getCachedContextBreakdown();
-
-		expect(usageCalls()).toBe(1);
-	});
-
-	it("re-queries and surfaces the new total when a message is appended", () => {
+	it("re-reads usage when the session reports a change, not on every paint", () => {
 		const fake = makeSession({
-			messages: [userMessage("hi")],
 			usage: { tokens: 100, contextWindow: 200_000, percent: 0.05 },
 		});
-		const comp = new StatusLineComponent(fake.session);
-		expect(comp.getCachedContextBreakdown().usedTokens).toBe(100);
+		const line = statusLine(fake.session, {
+			preset: "custom",
+			leftSegments: ["context_pct"],
+			rightSegments: [],
+		});
+		lineText(line);
+		lineText(line);
+		expect(fake.usageCalls()).toBe(1);
 
-		(fake.session.messages as unknown[]).push(assistantMessage("a reply that bumped the real prompt size"));
 		fake.setUsage({ tokens: 250, contextWindow: 200_000, percent: 0.125 });
+		line.refresh();
 
-		expect(comp.getCachedContextBreakdown().usedTokens).toBe(250);
+		expect(line.facts().context.tokens).toBe(250);
 		expect(fake.usageCalls()).toBe(2);
 	});
 
-	it("re-queries when the streaming tail grows in place", () => {
-		const tail = assistantMessage("partial") as { content: { type: string; text: string }[] };
-		const { session, usageCalls } = makeSession({ messages: [userMessage("hi"), tail] });
-		const comp = new StatusLineComponent(session);
+	it("refreshes token-dependent facts on deltas, and the full snapshot on the next session event", async () => {
+		vi.useFakeTimers();
+		try {
+			let emit!: (event: { type: string }) => void;
+			const readName = vi.fn(() => "live session");
+			let tokens = 100;
+			let window = 20_000;
+			const boundaries = vi.spyOn(statusLineHost, "computeCompactionBoundaries");
+			const line = statusLine(
+				statusSession({
+					subscribe: (listener: typeof emit) => {
+						emit = listener;
+						return () => {};
+					},
+					sessionManager: { getSessionName: readName },
+					getContextUsage: () => ({ tokens, contextWindow: window, percent: 0 }),
+					getPromptCacheStatus: (_now: number, nextTokens: number) => ({ nextTokens }),
+				}),
+				{ leftSegments: ["cache"], rightSegments: [] },
+			);
+			line.facts();
+			readName.mockClear();
+			tokens = 200;
+			emit({ type: "message_update" });
+			emit({ type: "message_update" });
+			vi.advanceTimersByTime(100);
+			await flushStatus();
+			expect(line.facts()).toMatchObject({ context: { tokens }, promptCache: { nextTokens: tokens } });
+			expect(readName).not.toHaveBeenCalled();
+			expect(boundaries).toHaveBeenCalledTimes(1);
 
-		comp.getCachedContextBreakdown();
-		tail.content[0]!.text = "partial response that kept streaming".repeat(8);
-		comp.getCachedContextBreakdown();
+			window = 40_000;
+			emit({ type: "message_update" });
+			vi.advanceTimersByTime(100);
+			await flushStatus();
+			expect(line.facts().context.window).toBe(window);
+			expect(boundaries).toHaveBeenCalledTimes(2);
 
-		expect(usageCalls()).toBe(2);
+			emit({ type: "message_end" });
+			await flushStatus();
+			expect(line.facts().sessionName).toBe("live session");
+			expect(readName).toHaveBeenCalled();
+		} finally {
+			vi.restoreAllMocks();
+			vi.useRealTimers();
+		}
 	});
 
-	it("re-queries when the message array is replaced (branch switch / rebuild)", () => {
-		const { session, usageCalls } = makeSession({
-			messages: [userMessage("a"), userMessage("b")],
-		});
-		const comp = new StatusLineComponent(session);
-		comp.getCachedContextBreakdown();
+	it("matches a full repaint throughout a stream without publishing unchanged facts", async () => {
+		vi.useFakeTimers();
+		try {
+			let emit!: (event: { type: string }) => void;
+			let tokens = 100;
+			let rate: number | null = null;
+			let running = false;
+			let accountLabel: string | undefined;
+			const getUsage = vi.fn(() => ({ tokens, contextWindow: 1_000, percent: tokens / 10 }));
+			const session = statusSession({
+				subscribe: (listener: typeof emit) => {
+					emit = listener;
+					return () => {};
+				},
+				getContextUsage: getUsage,
+				tokenRate: { rate: () => rate },
+				getAsyncJobSnapshot: () => ({ running: running ? [{ type: "bash" }] : [] }),
+				getAnthropicSlowModeLabel: () => accountLabel,
+			});
+			const settings: StatusLineSettings = { preset: "custom", leftSegments: ["context_pct"], rightSegments: [] };
+			const reference = statusLine(session, settings);
+			const live = statusLine(session, settings);
+			const step = async (type: string) => {
+				emit({ type });
+				vi.advanceTimersByTime(100);
+				await flushStatus();
+				reference.refresh();
+				expect(statusRows(settings, live.facts())).toEqual(statusRows(settings, reference.facts()));
+			};
 
-		(session as { messages: unknown[] }).messages = [userMessage("c"), userMessage("d")];
-		comp.getCachedContextBreakdown();
+			const initial = live.facts();
+			expect(live.composerRate()).toBeUndefined();
+			rate = 17.34;
+			await step("message_update");
+			expect(live.composerRate()).toBe(17.3);
+			expect(live.facts()).toBe(initial);
 
-		expect(usageCalls()).toBe(2);
-	});
+			tokens = 250;
+			await step("message_update");
+			expect(live.facts().context.tokens).toBe(250);
+			const changed = live.facts();
+			getUsage.mockClear();
+			await step("tool_stream_update");
+			expect(live.facts()).toBe(changed);
+			expect(getUsage).toHaveBeenCalledTimes(1); // reference only
 
-	it("re-queries when the model context window changes", () => {
-		const { session, usageCalls } = makeSession({ messages: [userMessage("hi")], contextWindow: 200_000 });
-		const comp = new StatusLineComponent(session);
-		comp.getCachedContextBreakdown();
-
-		(session.model as { contextWindow: number }).contextWindow = 400_000;
-		comp.getCachedContextBreakdown();
-
-		expect(usageCalls()).toBe(2);
-	});
-
-	it("re-queries when only the in-flight pending revision changes (no message change)", () => {
-		const fake = makeSession({
-			messages: [userMessage("hi")],
-			usage: { tokens: 190_000, contextWindow: 272_000, percent: 69.9 },
-		});
-		const comp = new StatusLineComponent(fake.session);
-		expect(comp.getCachedContextBreakdown().usedTokens).toBe(190_000);
-
-		// Turn ends/aborts: the message list and last-message fingerprint are
-		// unchanged, but clearing the pending snapshot recalibrates usage to the
-		// real provider anchor. The memo must not keep serving the stale estimate.
-		fake.setUsage({ tokens: 117_000, contextWindow: 272_000, percent: 43.0 });
-		fake.setRevision(1);
-
-		expect(comp.getCachedContextBreakdown().usedTokens).toBe(117_000);
-		expect(fake.usageCalls()).toBe(2);
-	});
-
-	it("propagates a speculative/numeric token count, e.g. right after compaction", () => {
-		const { session } = makeSession({
-			messages: [userMessage("compaction summary")],
-			usage: { tokens: 1234, contextWindow: 272_000, percent: 0.45 },
-		});
-		const breakdown = new StatusLineComponent(session).getCachedContextBreakdown();
-		expect(breakdown.usedTokens).toBe(1234);
-		expect(breakdown.contextWindow).toBe(272_000);
+			running = true;
+			accountLabel = "low priority";
+			await step("tool_execution_update");
+			expect(live.facts()).toMatchObject({ jobs: 1, slowModeLabel: accountLabel });
+			running = false;
+			accountLabel = undefined;
+			await step("tool_execution_update");
+			expect(live.facts().slowModeLabel).toBeUndefined();
+			tokens = 420;
+			await step("message_end");
+			expect(live.facts()).toMatchObject({ jobs: 0, context: { tokens } });
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	it("falls back to the model window with 0 tokens when usage is unavailable", () => {
-		const { session } = makeSession({ messages: [userMessage("hi")], usage: undefined, contextWindow: 128_000 });
-		const breakdown = new StatusLineComponent(session).getCachedContextBreakdown();
-		expect(breakdown.usedTokens).toBe(0);
-		expect(breakdown.contextWindow).toBe(128_000);
-	});
-
-	it("does not query usage when no context segment is rendered", () => {
-		const { session, usageCalls } = makeSession({ messages: [userMessage("hi")] });
-		const comp = new StatusLineComponent(session);
-		comp.updateSettings({
-			preset: "custom",
-			leftSegments: ["pi"],
-			rightSegments: ["session_name"],
-			separator: "powerline-thin",
+		const { session } = makeSession({
+			usage: undefined,
+			contextWindow: 128_000,
 		});
-
-		const border = comp.getTopBorder(80);
-		expect(border.content.length).toBeGreaterThan(0);
-		expect(usageCalls()).toBe(0);
+		expect(statusLine(session).contextBreakdown()).toEqual({
+			usedTokens: 0,
+			contextWindow: 128_000,
+		});
 	});
 
 	it("renders the anchored percent against the (sub-)budget window in the context segment", () => {
-		const { session } = makeSession({
-			messages: [userMessage("hi"), assistantMessage("done")],
-			usage: { tokens: 5000, contextWindow: 272_000, percent: 1.8 },
-		});
-		const comp = new StatusLineComponent(session);
-		comp.updateSettings({
-			preset: "custom",
-			leftSegments: ["context_pct"],
-			rightSegments: [],
-			separator: "powerline-thin",
-		});
-
 		// 5000 / 272000 → 1.8%, window formatted as 272K (matches the footer gauge).
-		const plain = comp.getTopBorder(80).content.replaceAll(/\x1b\[[0-9;]*m/g, "");
-		expect(plain).toContain("1.8%/272K");
+		const facts = statusFacts({
+			context: { tokens: 5000, window: 272_000, percent: 1.8 },
+		});
+		expect(segmentText("context_pct", facts)).toContain("1.8%/272K");
 	});
 
-	it("renders speculative percent instead of ? after compaction", () => {
-		const { session } = makeSession({
-			messages: [userMessage("compaction summary")],
-			usage: { tokens: 1234, contextWindow: 272_000, percent: 0.45 },
+	it("renders the percent of a speculative post-compaction estimate", () => {
+		const facts = statusFacts({
+			context: { tokens: 1234, window: 272_000, percent: 0.45 },
 		});
-		const comp = new StatusLineComponent(session);
-		comp.updateSettings({
-			preset: "custom",
-			leftSegments: ["context_pct"],
-			rightSegments: [],
-			separator: "powerline-thin",
-		});
-
-		const plain = comp.getTopBorder(80).content.replaceAll(/\x1b\[[0-9;]*m/g, "");
-		expect(plain).toContain("0.5%/272K");
+		expect(segmentText("context_pct", facts)).toContain("0.5%/272K");
 	});
 
 	it("renders token usage with an unknown marker when the model window is unavailable", () => {
-		const { session } = makeSession({
-			messages: [userMessage("hi")],
-			contextWindow: 0,
-			usage: { tokens: 5000, contextWindow: 0, percent: 0 },
+		const facts = statusFacts({
+			context: { tokens: 5000, window: 0, percent: null },
 		});
-		const comp = new StatusLineComponent(session);
-		comp.updateSettings({
-			preset: "custom",
-			leftSegments: ["context_pct"],
-			rightSegments: [],
-			separator: "powerline-thin",
-		});
-
-		const plain = comp.getTopBorder(80).content.replaceAll(/\x1b\[[0-9;]*m/g, "");
-		expect(plain).toContain("5K/?");
-		expect(plain).not.toContain("0.0%/0");
+		const text = segmentText("context_pct", facts);
+		expect(text).toContain("5K/?");
+		expect(text).not.toContain("0.0%/0");
 	});
 });

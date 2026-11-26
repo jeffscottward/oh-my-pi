@@ -20,7 +20,6 @@ import rsBoxLeak from "./rs-box-leak.md" with { type: "text" };
 import rsFuturePrelude from "./rs-future-prelude.md" with { type: "text" };
 import rsLazylock from "./rs-lazylock.md" with { type: "text" };
 import rsMatchErgonomics from "./rs-match-ergonomics.md" with { type: "text" };
-import rsParkingLot from "./rs-parking-lot.md" with { type: "text" };
 import rsResultType from "./rs-result-type.md" with { type: "text" };
 import tsBareCatch from "./ts-bare-catch.md" with { type: "text" };
 import tsImportType from "./ts-import-type.md" with { type: "text" };
@@ -28,6 +27,7 @@ import tsNoAny from "./ts-no-any.md" with { type: "text" };
 import tsNoDeprecatedLeftovers from "./ts-no-deprecated-leftovers.md" with { type: "text" };
 import tsNoDynamicImport from "./ts-no-dynamic-import.md" with { type: "text" };
 import tsNoInlineCastAccess from "./ts-no-inline-cast-access.md" with { type: "text" };
+import tsNoLocalIsRecord from "./ts-no-local-is-record.md" with { type: "text" };
 import tsNoReturnType from "./ts-no-return-type.md" with { type: "text" };
 import tsNoTestTimers from "./ts-no-test-timers.md" with { type: "text" };
 import tsNoTinyFunctions from "./ts-no-tiny-functions.md" with { type: "text" };
@@ -55,7 +55,6 @@ export const BUILTIN_RULE_SOURCES: readonly BuiltinRuleSource[] = [
 	{ name: "rs-future-prelude", content: rsFuturePrelude },
 	{ name: "rs-lazylock", content: rsLazylock },
 	{ name: "rs-match-ergonomics", content: rsMatchErgonomics },
-	{ name: "rs-parking-lot", content: rsParkingLot },
 	{ name: "rs-result-type", content: rsResultType },
 	{ name: "ts-bare-catch", content: tsBareCatch },
 	{ name: "ts-import-type", content: tsImportType },
@@ -63,6 +62,7 @@ export const BUILTIN_RULE_SOURCES: readonly BuiltinRuleSource[] = [
 	{ name: "ts-no-deprecated-leftovers", content: tsNoDeprecatedLeftovers },
 	{ name: "ts-no-dynamic-import", content: tsNoDynamicImport },
 	{ name: "ts-no-inline-cast-access", content: tsNoInlineCastAccess },
+	{ name: "ts-no-local-is-record", content: tsNoLocalIsRecord },
 	{ name: "ts-no-return-type", content: tsNoReturnType },
 	{ name: "ts-no-test-timers", content: tsNoTestTimers },
 	{ name: "ts-no-tiny-functions", content: tsNoTinyFunctions },

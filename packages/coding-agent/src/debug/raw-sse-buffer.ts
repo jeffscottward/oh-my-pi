@@ -1,4 +1,5 @@
 import type { Model, ProviderResponseMetadata, RawSseEvent } from "@oh-my-pi/pi-ai";
+import { materializeString } from "@oh-my-pi/pi-utils";
 
 const MAX_RAW_SSE_EVENTS = 1_000;
 const MAX_RAW_SSE_CHARS = 512_000;
@@ -11,6 +12,7 @@ const TRIM_MARKER_RESERVE = 200;
 const MAX_TOOL_SCHEMA_CHARS = 200;
 const MAX_TOOL_DESCRIPTION_CHARS = 200;
 
+/** A captured provider response or raw server-sent event. */
 export type RawSseDebugRecord =
 	| {
 			kind: "response";
@@ -36,6 +38,7 @@ export type RawSseDebugRecord =
 			originalChars: number;
 	  };
 
+/** Retained events and eviction counters at a point in time. */
 export interface RawSseDebugSnapshot {
 	records: readonly RawSseDebugRecord[];
 	droppedRecords: number;
@@ -56,7 +59,7 @@ type TrimResult = { raw: string[]; truncated: boolean; originalChars: number; ch
 // the accounting matches the previous `countRecordChars` byte-for-byte (the
 // trailing +1 covers the record-level newline that `rawRecordText` appends in
 // `toRawText`).
-function countLines(lines: readonly string[]): number {
+function countChars(lines: readonly string[]): number {
 	let chars = 0;
 	for (let i = 0; i < lines.length; i++) chars += lines[i].length + 1;
 	return chars;
@@ -163,7 +166,7 @@ function headTailTrim(lines: string[], budget: number, elidedTotal: number): str
 	}
 	tail.reverse();
 
-	let elided = elidedTotal - countLines(out) - countLines(tail);
+	let elided = elidedTotal - countChars(out) - countChars(tail);
 	if (i <= j) {
 		// lines[i..j] straddle the cut: keep a head slice of the first and a
 		// tail slice of the last (the same line when i === j).
@@ -193,27 +196,31 @@ function headTailTrim(lines: string[], budget: number, elidedTotal: number): str
 // Any trimmed result ends with the `: omp-debug-truncated` marker carrying
 // the original size.
 function trimRawLines(raw: string[]): TrimResult {
-	const originalChars = countLines(raw);
+	const originalChars = countChars(raw);
 	if (originalChars <= MAX_RAW_SSE_EVENT_CHARS) {
 		return { raw, truncated: false, originalChars, chars: originalChars + 1 };
 	}
 
 	const budget = MAX_RAW_SSE_EVENT_CHARS - TRIM_MARKER_RESERVE;
 	let lines = compactToolLines(raw) ?? raw;
-	const compactedChars = lines === raw ? originalChars : countLines(lines);
+	const compactedChars = lines === raw ? originalChars : countChars(lines);
 	if (compactedChars > budget) {
 		lines = headTailTrim(lines, budget, compactedChars);
 	} else if (lines === raw) {
 		lines = raw.slice();
 	}
+	// Kept windows outlive the incoming frame; detach them from its backing storage.
+	lines = lines.map(materializeString);
 	lines.push(`: omp-debug-truncated originalChars=${originalChars}`);
-	return { raw: lines, truncated: true, originalChars, chars: countLines(lines) + 1 };
+	return { raw: lines, truncated: true, originalChars, chars: countChars(lines) + 1 };
 }
 
+/** Format a captured event timestamp as an ISO instant. */
 export function formatRawSseIsoTime(timestamp: number): string {
 	return new Date(timestamp).toISOString();
 }
 
+/** Encode response metadata as an SSE comment. */
 export function formatRawSseResponseComment(record: Extract<RawSseDebugRecord, { kind: "response" }>): string {
 	const fields = [
 		"omp-response",
@@ -228,6 +235,7 @@ export function formatRawSseResponseComment(record: Extract<RawSseDebugRecord, {
 	return `: ${fields.join(" ")}`;
 }
 
+/** Return wire-format lines for a captured record. */
 export function rawSseRecordLines(record: RawSseDebugRecord): string[] {
 	if (record.kind === "response") return [formatRawSseResponseComment(record)];
 	return record.raw;
@@ -242,6 +250,7 @@ function metadataTransport(response: ProviderResponseMetadata): string | undefin
 	return typeof value === "string" ? value : undefined;
 }
 
+/** Bounded, observable capture of raw provider responses and SSE frames. */
 export class RawSseDebugBuffer {
 	#records: RawSseDebugRecord[] = [];
 	// Parallel to `#records`: `#recordChars[i]` is the precomputed char count
@@ -262,8 +271,14 @@ export class RawSseDebugBuffer {
 	#totalEvents = 0;
 	#lastUpdatedAt: number | undefined;
 	#nextSequence = 1;
+	#revision = 0;
 	#listeners = new Set<() => void>();
 	#emitScheduled = false;
+
+	/** Bumped on every change to the captured window (append, eviction, clear); equal revisions mean equal snapshots. */
+	get revision(): number {
+		return this.#revision;
+	}
 
 	subscribe(listener: () => void): () => void {
 		this.#listeners.add(listener);
@@ -335,12 +350,32 @@ export class RawSseDebugBuffer {
 		return body.length > 0 ? `${dropped}${body}` : dropped;
 	}
 
+	/**
+	 * Drop every retained record and reset accounting. Called from
+	 * {@link AgentSession} teardown so a disposed (e.g. parked subagent) session
+	 * releases its bounded captured wire records. Notifies subscribers so a live
+	 * debug viewer redraws empty.
+	 */
+	clear(): void {
+		this.#records = [];
+		this.#recordChars = [];
+		this.#head = 0;
+		this.#totalChars = 0;
+		this.#droppedRecords = 0;
+		this.#droppedChars = 0;
+		this.#totalEvents = 0;
+		this.#lastUpdatedAt = undefined;
+		this.#revision += 1;
+		this.#emit();
+	}
+
 	#append(record: RawSseDebugRecord, chars: number): void {
 		this.#records.push(record);
 		this.#recordChars.push(chars);
 		this.#totalChars += chars;
 		this.#lastUpdatedAt = record.timestamp;
 		this.#enforceLimits();
+		this.#revision += 1;
 		this.#emit();
 	}
 
@@ -401,6 +436,7 @@ const globalFallbackBuffer = new RawSseDebugBuffer();
 const kRawSseDebugBuffer = Symbol("debug.rawSseBuffer");
 type OwnerWithBuffer = object & { rawSseDebugBuffer?: unknown; [kRawSseDebugBuffer]?: RawSseDebugBuffer };
 
+/** Resolve an owner's capture buffer or the process-wide fallback. */
 export function resolveRawSseDebugBuffer(owner?: object): RawSseDebugBuffer {
 	if (!owner) return globalFallbackBuffer;
 

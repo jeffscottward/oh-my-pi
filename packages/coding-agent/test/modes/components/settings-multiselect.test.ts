@@ -1,131 +1,108 @@
-import { afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import { afterAll, describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { SettingsSelectorComponent } from "@oh-my-pi/pi-coding-agent/modes/components/settings-selector";
-import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
-import { SEARCH_PROVIDER_CHOICES } from "@oh-my-pi/pi-coding-agent/web/search/types";
+import { cfgContextFilesExtra } from "@oh-my-pi/pi-coding-agent/session/context-settings";
+import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
+import { cfgDevAutoqa } from "@oh-my-pi/pi-coding-agent/tools/settings";
+import type { TestTerminal } from "@oh-my-pi/pi-tui/testing/terminal";
+import { getProjectAgentDir, removeWithRetries } from "@oh-my-pi/pi-utils";
+import { settingsScreen, setupSettingsWindow } from "../../helpers/settings-window";
+import { currentTheme, setCurrentTheme } from "@oh-my-pi/pi-tui/theme/runtime";
 
-beforeAll(async () => {
-	await initTheme();
-});
+const restoreTheme = currentTheme();
+afterAll(() => setCurrentTheme(restoreTheme));
 
-let geometryStub: { restore(): void } | undefined;
+const mountSettingsWindow = setupSettingsWindow();
 
-beforeEach(async () => {
-	resetSettingsForTest();
-	await Settings.init({ inMemory: true });
-	geometryStub = stubStdoutGeometry(120);
-});
-
-afterEach(() => {
-	resetSettingsForTest();
-	geometryStub?.restore();
-	geometryStub = undefined;
-});
-
-function stubStdoutGeometry(cols: number): { restore(): void } {
-	const rowsDesc = Object.getOwnPropertyDescriptor(process.stdout, "rows");
-	const colsDesc = Object.getOwnPropertyDescriptor(process.stdout, "columns");
-	const rows = 40;
-	Object.defineProperty(process.stdout, "rows", { configurable: true, get: () => rows, set: () => {} });
-	Object.defineProperty(process.stdout, "columns", { configurable: true, get: () => cols, set: () => {} });
-	const restoreOne = (key: "rows" | "columns", desc: PropertyDescriptor | undefined) => {
-		if (desc) Object.defineProperty(process.stdout, key, desc);
-	};
-	return {
-		restore() {
-			restoreOne("rows", rowsDesc);
-			restoreOne("columns", colsDesc);
-		},
-	};
+/** Left press and release on the first cell row showing `label`. */
+function clickLabel(term: TestTerminal, label: string): void {
+	const rows = settingsScreen(term).split("\n");
+	const row = rows.findIndex(line => line.includes(label));
+	if (row === -1) throw new Error(`Missing settings label: ${label}`);
+	const col = rows[row]!.indexOf(label) + 1;
+	term.mouse({ row, col, button: "left", action: "press", mods: [] });
+	term.mouse({ row, col, button: "left", action: "release", mods: [] });
 }
 
-function createSelector(): SettingsSelectorComponent {
-	return new SettingsSelectorComponent(
-		{
-			availableThinkingLevels: [],
-			thinkingLevel: undefined,
-			availableThemes: ["dark"],
-			providers: [],
-			cwd: process.cwd(),
-		},
-		{
-			onChange: () => {},
-			onCancel: () => {},
-		},
-	);
+describe("settings section sidebar", () => {
+	it("does not toggle the selected section's first setting", () => {
+		const term = mountSettingsWindow();
+		for (let i = 0; i < 7; i++) term.press("right");
+		expect(cfgDevAutoqa.get(settings)).toBe(true);
+		clickLabel(term, "Developer");
+		expect(cfgDevAutoqa.get(settings)).toBe(true);
+		clickLabel(term, "Developer");
+		expect(cfgDevAutoqa.get(settings)).toBe(true);
+	});
+});
+
+/** Open the extra-context-files text editor. */
+function openExtraContextFiles(term: TestTerminal): void {
+	term.type("extra context files");
+	term.press("enter");
 }
 
-const [firstChoice, secondChoice] = SEARCH_PROVIDER_CHOICES;
+/** Replace the open editor's text with `value` and submit it. */
+async function submitText(term: TestTerminal, value: string): Promise<void> {
+	term.press("ctrl+a");
+	term.press("ctrl+k");
+	term.type(value);
+	term.press("enter");
+	await Promise.resolve();
+}
 
-describe("multiselect settings (array-of-enum)", () => {
-	it("edits providers.webSearchOrder via the ordered toggle list", () => {
-		const comp = createSelector();
-		for (const ch of "web search provider order") comp.handleInput(ch);
-		const row = comp.render(120).join("\n");
-		expect(row).toContain("Web Search Provider Order");
-		expect(row).toContain("default");
+describe("extra context filenames editor", () => {
+	it("saves multiple filenames as an array and lets users disable extras", async () => {
+		const term = mountSettingsWindow();
+		openExtraContextFiles(term);
+		await submitText(term, '["AGENTS.local.md","TEAM.md"]');
+		expect(cfgContextFilesExtra.get(settings)).toEqual(["AGENTS.local.md", "TEAM.md"]);
 
-		// Open the editor; Space toggles the first provider, Enter the second.
-		comp.handleInput("\n");
-		comp.handleInput(" ");
-		comp.handleInput("\x1b[B");
-		comp.handleInput("\n");
-		expect(settings.get("providers.webSearchOrder")).toEqual([firstChoice!.value, secondChoice!.value]);
-
-		// ← promotes the highlighted member one slot earlier in priority.
-		comp.handleInput("\x1b[D");
-		expect(settings.get("providers.webSearchOrder")).toEqual([secondChoice!.value, firstChoice!.value]);
-
-		// Toggling a member off removes it and renumbers the rest.
-		comp.handleInput(" ");
-		expect(settings.get("providers.webSearchOrder")).toEqual([firstChoice!.value]);
-
-		// Esc returns to the list; the row summary reflects the saved order.
-		comp.handleInput("\x1b");
-		expect(comp.render(120).join("\n")).toContain(firstChoice!.label);
+		term.press("enter");
+		await submitText(term, "[]");
+		expect(cfgContextFilesExtra.get(settings)).toEqual([]);
 	});
 
-	it("splices the hovered option into the pressed digit's position", () => {
-		const [a, b, c] = SEARCH_PROVIDER_CHOICES;
-		const comp = createSelector();
-		for (const ch of "web search provider order") comp.handleInput(ch);
-		comp.handleInput("\n");
-
-		// Select rows 1 and 3 → [a, c].
-		comp.handleInput(" ");
-		comp.handleInput("\x1b[B");
-		comp.handleInput("\x1b[B");
-		comp.handleInput(" ");
-		expect(settings.get("providers.webSearchOrder")).toEqual([a!.value, c!.value]);
-
-		// Hover row 2 (unselected) and press "2" → spliced between them.
-		comp.handleInput("\x1b[A");
-		comp.handleInput("2");
-		expect(settings.get("providers.webSearchOrder")).toEqual([a!.value, b!.value, c!.value]);
-
-		// Press "9" (past the end) → clamps to the tail.
-		comp.handleInput("9");
-		expect(settings.get("providers.webSearchOrder")).toEqual([a!.value, c!.value, b!.value]);
-
-		// Press "1" → promotes to the head.
-		comp.handleInput("1");
-		expect(settings.get("providers.webSearchOrder")).toEqual([b!.value, a!.value, c!.value]);
+	it.each([
+		["[", /Invalid array JSON/],
+		['{"file":"TEAM.md"}', /Invalid array JSON/],
+		['["../TEAM.md"]', /file names, not paths/],
+	])("keeps the saved filenames when input %s is rejected", async (input, error) => {
+		cfgContextFilesExtra.set(settings, ["TEAM.md"]);
+		const term = mountSettingsWindow();
+		openExtraContextFiles(term);
+		await submitText(term, input);
+		expect(cfgContextFilesExtra.get(settings)).toEqual(["TEAM.md"]);
+		expect(settingsScreen(term)).toMatch(error);
 	});
 
-	it("edits providers.webSearchExclude as an unordered toggle set", () => {
-		const comp = createSelector();
-		for (const ch of "excluded web search providers") comp.handleInput(ch);
-		expect(comp.render(120).join("\n")).toContain("none");
+	it("is not offered when the project config sets the list, so it cannot be copied to global", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-extra-ctx-"));
+		try {
+			const cwd = path.join(root, "repo");
+			const agentDir = path.join(root, "agent");
+			await fs.mkdir(agentDir, { recursive: true });
+			await Bun.write(path.join(getProjectAgentDir(cwd), "config.yml"), "contextFiles:\n  extra:\n    - TEAM.md\n");
+			resetSettingsForTest();
+			await Settings.init({ cwd, agentDir });
 
-		comp.handleInput("\n");
-		comp.handleInput(" ");
-		expect(settings.get("providers.webSearchExclude")).toEqual([firstChoice!.value]);
-
-		// Unordered lists ignore reorder keys.
-		comp.handleInput("\x1b[C");
-		expect(settings.get("providers.webSearchExclude")).toEqual([firstChoice!.value]);
-
-		comp.handleInput(" ");
-		expect(settings.get("providers.webSearchExclude")).toEqual([]);
+			const term = mountSettingsWindow();
+			try {
+				openExtraContextFiles(term);
+				term.press("enter");
+				await settings.flush();
+				expect(settingsScreen(term)).not.toContain("Extra Context Files");
+			} finally {
+				term.dispose();
+			}
+			const globalConfig = Bun.file(path.join(agentDir, "config.yml"));
+			expect((await globalConfig.exists()) ? await globalConfig.text() : "").not.toContain("TEAM.md");
+		} finally {
+			resetSettingsForTest();
+			AgentStorage.close();
+			await removeWithRetries(root);
+		}
 	});
 });

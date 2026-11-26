@@ -54,6 +54,34 @@ describe("ToolChoiceQueue", () => {
 			expect(q.nextToolChoice()).toBeUndefined();
 		});
 
+		it("onRejected returning 'drop_sequence' discards its later yields", () => {
+			const q = new ToolChoiceQueue();
+			q.pushSequence([forced, "none"], {
+				label: "user-force",
+				onRejected: () => "drop_sequence",
+			});
+			q.pushOnce(forcedRead, { label: "later" });
+
+			expect(q.nextToolChoice()).toEqual(forced);
+			q.reject("unavailable");
+			expect(q.nextToolChoice()).toEqual(forcedRead);
+		});
+
+		it("drop_sequence removes the origin after an unavailable replay", () => {
+			const q = new ToolChoiceQueue();
+			q.pushSequence([forced, "none"], {
+				label: "user-force",
+				onRejected: info => (info.reason === "unavailable" ? "drop_sequence" : "requeue"),
+			});
+			q.pushOnce(forcedRead, { label: "later" });
+
+			expect(q.nextToolChoice()).toEqual(forced);
+			q.reject("aborted");
+			expect(q.nextToolChoice()).toEqual(forced);
+			q.reject("unavailable");
+			expect(q.nextToolChoice()).toEqual(forcedRead);
+		});
+
 		it("requeued directive preserves onRejected so it can re-requeue across aborts", () => {
 			const q = new ToolChoiceQueue();
 			let rejectCount = 0;
@@ -157,18 +185,6 @@ describe("ToolChoiceQueue", () => {
 });
 
 describe("onInvoked / peekInFlightInvoker", () => {
-	it("exposes the in-flight directive's onInvoked handler via peekInFlightInvoker", async () => {
-		const q = new ToolChoiceQueue();
-		q.pushOnce(forced, {
-			label: "pending",
-			onInvoked: async input => ({ echoed: input }),
-		});
-		q.nextToolChoice();
-		const invoker = q.peekInFlightInvoker();
-		expect(invoker).toBeDefined();
-		const result = await invoker!({ action: "apply", reason: "ok" });
-		expect(result).toEqual({ echoed: { action: "apply", reason: "ok" } });
-	});
 	it("does not resolve an onInvoked directive until the requested tool runs", () => {
 		const q = new ToolChoiceQueue();
 		const rejected: RejectInfo[] = [];
@@ -200,7 +216,7 @@ describe("onInvoked / peekInFlightInvoker", () => {
 		q.nextToolChoice();
 		const invoker = q.peekInFlightInvoker();
 		expect(invoker).toBeDefined();
-		await invoker!({ action: "apply", reason: "ok" });
+		expect(await invoker!({ action: "apply", reason: "ok" })).toEqual({ echoed: { action: "apply", reason: "ok" } });
 		q.resolve();
 		expect(resolved).toEqual([{ choice: forced }]);
 		expect(q.hasInFlight).toBe(false);

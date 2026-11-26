@@ -1,157 +1,115 @@
 /**
- * Regression: fire-and-forget async IIFEs in StatusLineComponent
- * (`#isDefaultBranch`, `#lookupPr`) outlive `dispose()`. After tests call
- * `resetSettingsForTest()`, a late callback fires `#onBranchChange` →
- * `InteractiveMode.updateEditorTopBorder` → `settings.get(...)`, hitting the
- * global settings proxy and throwing "Settings not initialized".
+ * Regression: the status line's background reads (git status, `gh pr view`)
+ * outlive `dispose()`. A late result then reached the host after tests reset
+ * the global settings (or after the session's status line was replaced),
+ * hitting the settings proxy and throwing "Settings not initialized".
  *
- * Contract: after `dispose()`, no async callback touches `settings` or
- * `#onBranchChange`, even when the awaited git/gh promise resolves later.
- *
- * The original cross-file failure was flaky and depended on git/gh shell
- * latency; these tests force the race deterministically by spying on
- * `git.branch.default` (the same entry point `#isDefaultBranch` awaits) and
- * asserting `#onBranchChange` never fires post-dispose.
+ * Contract: after `dispose()`, a background read that resolves later neither
+ * reports to the host (`onPullRequest`) nor publishes new facts.
  */
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import type { StatusLineSettings } from "@oh-my-pi/pi-coding-agent/modes/components/status-line";
-import { StatusLineComponent } from "@oh-my-pi/pi-coding-agent/modes/components/status-line";
-import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
-import type { GitRefHead } from "@oh-my-pi/pi-coding-agent/utils/git";
-import * as git from "@oh-my-pi/pi-coding-agent/utils/git";
-import { getProjectDir, setProjectDir } from "@oh-my-pi/pi-utils";
+import type { StatusLineSettings } from "@oh-my-pi/pi-coding-agent/modes/view-model/status-line/types";
+import { github } from "@oh-my-pi/pi-coding-agent/utils/github";
+import type { VcsGitRepo, VcsRepo } from "@oh-my-pi/pi-natives";
+import * as vcs from "@oh-my-pi/pi-natives/vcs";
+import { flushStatus, lineText, statusLine, statusSession } from "./helpers/session-status-line";
 
-const originalProjectDir = getProjectDir();
+const prSettings: StatusLineSettings = {
+	preset: "custom",
+	leftSegments: ["git", "pr"],
+	rightSegments: [],
+	separator: "powerline-thin",
+	sessionAccent: false,
+	transparent: false,
+};
 
 beforeAll(async () => {
 	resetSettingsForTest();
 	await Settings.init({ inMemory: true });
-	await initTheme();
 });
 
 afterAll(() => {
 	resetSettingsForTest();
-	setProjectDir(originalProjectDir);
-});
-
-beforeEach(() => {
-	vi.spyOn(git.head, "resolveSync").mockReturnValue(fakeRefHead);
 });
 
 afterEach(() => {
 	vi.restoreAllMocks();
 });
 
-function makeSession() {
-	return {
-		state: { messages: [], model: undefined },
-		messages: [],
-		model: undefined,
-		systemPrompt: [],
-		agent: { state: { tools: [] } },
-		skills: [],
-		isStreaming: false,
-		isAutoThinking: false,
-		autoResolvedThinkingLevel: () => undefined,
-		isFastModeActive: () => false,
-		isFastModeEnabled: () => false,
-		getGoalModeState: () => null,
-		getAsyncJobSnapshot: () => ({ running: [] }),
-		modelRegistry: { isUsingOAuth: () => false },
-		sessionManager: {
-			getSessionName: () => "dispose-leak test",
-			getUsageStatistics: () => ({
-				input: 0,
-				output: 0,
-				cacheRead: 0,
-				cacheWrite: 0,
-				totalTokens: 0,
-				orchestrationInput: 0,
-				orchestrationOutput: 0,
-				orchestrationCacheRead: 0,
-				premiumRequests: 0,
-				cost: 0,
-			}),
-		},
-	} as unknown as ConstructorParameters<typeof StatusLineComponent>[0];
+function mockFeatureCheckout(): void {
+	const git = {
+		headSync: () => ({
+			kind: "ref",
+			branch: "feature/x",
+			refName: "refs/heads/feature/x",
+		}),
+		linkedWorktree: () => null,
+	} as unknown as VcsGitRepo;
+	const repo = {
+		kind: () => "git",
+		asGit: () => git,
+		asJj: () => null,
+		root: () => "/repo/dispose",
+		statusSummary: async () => ({ staged: 0, unstaged: 0, untracked: 0 }),
+	} as unknown as VcsRepo;
+	vi.spyOn(vcs, "repo").mockReturnValue(repo);
+	vi.spyOn(vcs, "repoForDisplay").mockReturnValue(repo);
 }
 
-const fakeRefHead: GitRefHead = {
-	kind: "ref",
-	branchName: "main",
-	ref: "refs/heads/main",
-	commit: null,
-	commonDir: "/fake/.git",
-	gitDir: "/fake/.git",
-	gitEntryPath: "/fake/.git",
-	headPath: "/fake/.git/HEAD",
-	repoRoot: "/fake",
-	headContent: "ref: refs/heads/main\n",
-};
+describe("status line dispose guards background reads", () => {
+	it("drops a PR lookup that resolves after dispose()", async () => {
+		mockFeatureCheckout();
+		const ghStarted = Promise.withResolvers<void>();
+		const releaseGh = Promise.withResolvers<void>();
+		vi.spyOn(github, "run").mockImplementation(async () => {
+			ghStarted.resolve();
+			await releaseGh.promise;
+			return {
+				exitCode: 0,
+				stdout: '{"number":7,"url":"https://example.test/x/7"}',
+				stderr: "",
+			};
+		});
+		const line = statusLine(statusSession(), prSettings);
+		const onPullRequest = vi.fn();
+		line.onPullRequest = onPullRequest;
 
-const gitSegmentSettings: StatusLineSettings = {
-	preset: "custom",
-	leftSegments: ["pr"],
-	rightSegments: ["session_name"],
-	separator: "powerline-thin",
-	sessionAccent: false,
-	transparent: false,
-};
+		lineText(line);
+		await ghStarted.promise;
+		const before = line.facts();
+		line.dispose();
 
-describe("StatusLineComponent dispose guards async callbacks", () => {
-	it("suppresses #onBranchChange when git.branch.default resolves after dispose()", async () => {
-		// #isDefaultBranch seeds #defaultBranch = "main" synchronously. The
-		// fake HEAD is on "main", so #isDefaultBranch("main") returns true
-		// and #lookupPr short-circuits without spawning `gh pr view` — but
-		// the git.branch.default IIFE still starts (it fires whenever
-		// #defaultBranch is undefined, regardless of the sync result). Delay
-		// it past dispose so the guard is the only thing preventing the
-		// callback.
-		let resolveDefault: ((v: string | null) => void) | undefined;
-		vi.spyOn(git.branch, "default").mockImplementation(() => new Promise<string | null>(r => (resolveDefault = r)));
+		releaseGh.resolve();
+		await flushStatus();
 
-		const onBranchChange = vi.fn();
-		const component = new StatusLineComponent(makeSession());
-		component.updateSettings(gitSegmentSettings);
-		component.watchBranch(onBranchChange);
-
-		// Render with a `pr` segment → #lookupPr → #isDefaultBranch("main")
-		// → starts the delayed git.branch.default IIFE (no gh spawn: the
-		// sync default-branch check returns true and PR lookup bails).
-		component.getTopBorder(80);
-		expect(resolveDefault).toBeDefined();
-
-		// Tear down the component before the awaited promise resolves.
-		component.dispose();
-		expect(onBranchChange).not.toHaveBeenCalled();
-
-		// Release the delayed lookup. Pre-fix this fired #onBranchChange.
-		resolveDefault!("develop");
-		await Promise.resolve();
-		await Promise.resolve();
-
-		expect(onBranchChange).not.toHaveBeenCalled();
+		expect(onPullRequest).not.toHaveBeenCalled();
+		expect(line.facts()).toBe(before);
 	});
 
-	it("suppresses #onBranchChange when a resolved IIFE's microtask runs after dispose()", async () => {
-		// Same guard, but the awaited promise resolves synchronously before
-		// dispose; the queued microtask must still be suppressed by the
-		// disposed flag checked inside the IIFE continuation.
-		vi.spyOn(git.branch, "default").mockResolvedValue("develop");
+	it("drops a PR lookup that resolves after the file reset the global settings", async () => {
+		mockFeatureCheckout();
+		const ghStarted = Promise.withResolvers<void>();
+		const releaseGh = Promise.withResolvers<void>();
+		vi.spyOn(github, "run").mockImplementation(async () => {
+			ghStarted.resolve();
+			await releaseGh.promise;
+			return { exitCode: 1, stdout: "", stderr: "" };
+		});
+		const line = statusLine(statusSession(), prSettings);
+		const onPullRequest = vi.fn();
+		line.onPullRequest = onPullRequest;
 
-		const onBranchChange = vi.fn();
-		const component = new StatusLineComponent(makeSession());
-		component.updateSettings(gitSegmentSettings);
-		component.watchBranch(onBranchChange);
-		component.getTopBorder(80);
-
-		// Dispose before the resolved-promise microtask gets a chance to run.
-		component.dispose();
-
-		await Promise.resolve();
-		await Promise.resolve();
-
-		expect(onBranchChange).not.toHaveBeenCalled();
+		lineText(line);
+		await ghStarted.promise;
+		line.dispose();
+		resetSettingsForTest();
+		try {
+			releaseGh.resolve();
+			await flushStatus();
+			expect(onPullRequest).not.toHaveBeenCalled();
+		} finally {
+			await Settings.init({ inMemory: true });
+		}
 	});
 });

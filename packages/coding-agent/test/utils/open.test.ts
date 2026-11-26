@@ -159,13 +159,8 @@ describe("openPath", () => {
 			// on Windows boxes where the machine PATH no longer references
 			// System32.
 			expect(call?.cmd[0]).toBe(powershellPath);
-			expect(call?.cmd.slice(1, -1)).toEqual([
-				"-NoProfile",
-				"-NonInteractive",
-				"-WindowStyle",
-				"Hidden",
-				"-EncodedCommand",
-			]);
+			expect(call?.cmd.slice(1, -1)).toEqual(["-NoProfile", "-NonInteractive", "-EncodedCommand"]);
+			expect(call?.options.windowsHide).toBe(true);
 			// The target rides inside the UTF-16LE payload: no cmd/PowerShell
 			// metacharacter parsing ever sees the `&` in the query string, and the
 			// terminating error preference makes Start-Process failures exit 1 so
@@ -216,7 +211,7 @@ describe("openPath", () => {
 		}
 	});
 
-	it("logs when the opener exits non-zero so Start-Process failures are diagnosable", async () => {
+	it("logs the non-zero exit and verification URL without its device code or fragment", async () => {
 		setPlatform("win32");
 		vi.spyOn(fs, "existsSync").mockReturnValue(true);
 		const warnSpy = vi.spyOn(piUtils.logger, "warn").mockImplementation((() => {}) as never);
@@ -227,13 +222,31 @@ describe("openPath", () => {
 		} as unknown as Subprocess;
 		vi.spyOn(Bun, "spawn").mockImplementation(() => failing);
 
-		openPath("https://example.com");
+		openPath("https://auth.x.ai/activate?user_code=ABCD-EFGH#t=workspace-secret");
 		await failing.exited;
 		await Promise.resolve();
 
 		expect(warnSpy).toHaveBeenCalledWith(
 			"External opener exited with non-zero status",
-			expect.objectContaining({ exitCode: 1 }),
+			expect.objectContaining({ exitCode: 1, target: "https://auth.x.ai/activate" }),
 		);
+	});
+
+	it("keeps URL secrets out of the log when the opener cannot spawn, but logs local paths verbatim", () => {
+		setPlatform("win32");
+		vi.spyOn(fs, "existsSync").mockReturnValue(true);
+		const warnSpy = vi.spyOn(piUtils.logger, "warn").mockImplementation((() => {}) as never);
+		vi.spyOn(Bun, "spawn").mockImplementation(() => {
+			throw Object.assign(new Error("spawn failed: mailto:me@example.com?token=argv-secret"), { code: "ENOENT" });
+		});
+
+		openPath("mailto:me@example.com?token=argv-secret");
+		openPath("C:\\notes\\a#b.html");
+
+		const logged = JSON.stringify(warnSpy.mock.calls);
+		expect(logged).not.toContain("argv-secret");
+		expect(logged).not.toContain("me@example.com");
+		expect(warnSpy.mock.calls[0]?.[1]).toMatchObject({ code: "ENOENT", target: "mailto:" });
+		expect(warnSpy.mock.calls[1]?.[1]).toMatchObject({ target: "C:\\notes\\a#b.html" });
 	});
 });

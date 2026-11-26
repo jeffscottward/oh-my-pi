@@ -6,19 +6,58 @@
  * in `./types.ts` 1:1; the types remain the source of truth for static typing,
  * and `Type` is asserted-compatible with them where possible.
  *
- * Envelope and fixed-shape schemas use `"+": "reject"` so unknown keys are
- * rejected — the previous implementation used a hand-rolled `hasOnlyFields`
- * allowlist for the same effect. The OAuth credential schema is the deliberate
- * exception (standard type keeps extra keys): it preserves provider-specific extension fields so
- * they round-trip through the broker instead of being dropped (see below).
+ * Response schemas accept keys they do not declare, and usage enums read a
+ * value they do not know as `"unknown"`, so a client keeps working against a
+ * newer broker. Request bodies the broker acts on use `"+": "reject"`: a broker
+ * must not apply a write whose fields it cannot read. The observed-usage report
+ * is the exception, since its unknown fields cannot change what gets recorded.
+ * The OAuth credential schema keeps extra keys on writes too: it preserves
+ * provider-specific extension fields so they round-trip through the broker
+ * instead of being dropped (see below).
  */
-import { type } from "arktype";
-import { REMOTE_REFRESH_SENTINEL } from "../auth-storage";
+import { type FluentType, type Type, type } from "@oh-my-pi/omptype";
+import {
+	type ApiKeyCredential,
+	type AuthCredential,
+	type AuthCredentialSnapshotEntry,
+	type DisabledCredentialSummary,
+	type OAuthCredential,
+	REMOTE_REFRESH_SENTINEL,
+	type RemoteOAuthCredential,
+	type SnapshotCredential,
+} from "../auth-storage";
+import { usageStatusSchema, usageUnitSchema } from "../usage";
+import type {
+	ClientUsageReportRequest,
+	ClientUsageReportResponse,
+	ClientUsageSummaryResponse,
+	CredentialBlockDeleteRequest,
+	CredentialBlockRequest,
+	CredentialBlockResponse,
+	CredentialBlockSnapshot,
+	CredentialBlocksDeleteResponse,
+	CredentialDisableResponse,
+	CredentialRefreshResponse,
+	CredentialUploadRequest,
+	CredentialUploadResponse,
+	DisabledCredentialsResponse,
+	HealthzResponse,
+	RefresherSchedule,
+	SnapshotEntry,
+	SnapshotResponse,
+	SnapshotStreamEntryEvent,
+	SnapshotStreamEvent,
+	SnapshotStreamRemovedEvent,
+	SnapshotStreamSnapshotEvent,
+	UsageHistoryResponse,
+	UsageResponse,
+	UsageStaleResponse,
+} from "./types";
 
-// ─── Credential payloads ───────────────────────────────────────────────────
+// ─── Credential payloads ─────────────────────────────────────────────────────
 
 /** Real OAuth credential (broker-side) — refresh token is the actual upstream value. */
-export const oauthCredentialSchema = type({
+export const oauthCredentialSchema: FluentType<OAuthCredential> = type({
 	"apiEndpoint?": "string",
 	type: "'oauth'",
 	refresh: type("string").narrow(
@@ -34,10 +73,20 @@ export const oauthCredentialSchema = type({
 	"accountId?": "string",
 	"orgId?": "string",
 	"orgName?": "string",
+	"region?": "string",
+	"inferenceRegion?": "'global' | 'eu' | 'us'",
+	"activeOrganizationId?": "string",
+	"authorizedAt?": "number",
+	"refreshExpires?": "number",
+	"scope?": "string",
+	"kiroClientId?": "string",
+	"kiroClientSecret?": "string",
+	"kiroOidcRegion?": "string",
+	"kiroProfileArn?": "string",
 });
 
 /** OAuth credential as it appears in broker snapshots — refresh replaced with sentinel. */
-export const remoteOauthCredentialSchema = type({
+export const remoteOauthCredentialSchema: FluentType<RemoteOAuthCredential> = type({
 	"apiEndpoint?": "string",
 	type: "'oauth'",
 	refresh: type.enumerated(REMOTE_REFRESH_SENTINEL),
@@ -49,9 +98,20 @@ export const remoteOauthCredentialSchema = type({
 	"accountId?": "string",
 	"orgId?": "string",
 	"orgName?": "string",
+	"region?": "string",
+	"inferenceRegion?": "'global' | 'eu' | 'us'",
+	"activeOrganizationId?": "string",
+	"authorizedAt?": "number",
+	"refreshExpires?": "number",
+	"scope?": "string",
+	"kiroClientId?": "string",
+	// Redacted by `redactCredentialForWire`; a snapshot carrying it is rejected.
+	"kiroClientSecret?": "undefined",
+	"kiroOidcRegion?": "string",
+	"kiroProfileArn?": "string",
 });
 
-export const apiKeyCredentialSchema = type({
+export const apiKeyCredentialSchema: FluentType<ApiKeyCredential> = type({
 	"+": "reject",
 	type: "'api_key'",
 	key: type("string").atLeastLength(1),
@@ -59,31 +119,39 @@ export const apiKeyCredentialSchema = type({
 });
 
 /** Discriminated union accepted on POST /v1/credential (writes). */
-export const writableAuthCredentialSchema = oauthCredentialSchema.or(apiKeyCredentialSchema);
+export const writableAuthCredentialSchema: FluentType<AuthCredential> =
+	oauthCredentialSchema.or(apiKeyCredentialSchema);
 
 /** Discriminated union returned in snapshots (refresh is sentinel for OAuth). */
-export const snapshotCredentialSchema = remoteOauthCredentialSchema.or(apiKeyCredentialSchema);
+export const snapshotCredentialSchema: FluentType<SnapshotCredential> = remoteOauthCredentialSchema.or(
+	apiKeyCredentialSchema.onUndeclaredKey("ignore"),
+);
 
-// ─── Snapshot ──────────────────────────────────────────────────────────────
+/**
+ * Reads an enum a newer broker may extend: a value this client does not know
+ * becomes `"unknown"` instead of failing the whole response.
+ */
+function readEnumOrUnknown<t extends string>(known: Type<t>): FluentType<t | "unknown", string> {
+	return type("string").pipe(value => (known.allows(value) ? value : "unknown"));
+}
 
-export const credentialSnapshotEntrySchema = type({
-	"+": "reject",
+// ─── Snapshot ────────────────────────────────────────────────────────────────
+
+export const credentialSnapshotEntrySchema: FluentType<AuthCredentialSnapshotEntry> = type({
 	id: "number.integer",
 	provider: type("string").atLeastLength(1),
 	credential: snapshotCredentialSchema,
 	identityKey: "string | null",
 });
 
-export const credentialBlockSnapshotSchema = type({
-	"+": "reject",
+export const credentialBlockSnapshotSchema: FluentType<CredentialBlockSnapshot> = type({
 	providerKey: type("string").atLeastLength(1),
 	blockScope: "string",
 	blockedUntilMs: "number",
 	"updatedAtMs?": "number",
 });
 
-export const snapshotEntrySchema = type({
-	"+": "reject",
+export const snapshotEntrySchema: FluentType<SnapshotEntry> = type({
 	id: "number.integer",
 	provider: type("string").atLeastLength(1),
 	credential: snapshotCredentialSchema,
@@ -92,16 +160,14 @@ export const snapshotEntrySchema = type({
 	"blocks?": credentialBlockSnapshotSchema.array(),
 });
 
-export const refresherScheduleSchema = type({
-	"+": "reject",
+export const refresherScheduleSchema: FluentType<RefresherSchedule> = type({
 	enabled: "boolean",
 	intervalMs: "number",
 	skewMs: "number",
 	nextSweepInMs: "number",
 });
 
-export const snapshotResponseSchema = type({
-	"+": "reject",
+export const snapshotResponseSchema: FluentType<SnapshotResponse> = type({
 	generation: "number.integer",
 	generatedAt: "number",
 	serverNowMs: "number",
@@ -109,11 +175,10 @@ export const snapshotResponseSchema = type({
 	credentials: snapshotEntrySchema.array(),
 });
 
-// ─── Snapshot stream (SSE) ────────────────────────────────────────────────
+// ─── Snapshot stream (SSE) ───────────────────────────────────────────────────
 
 /** First frame on connect — full snapshot embedded inline with a `kind` tag. */
-export const snapshotStreamSnapshotEventSchema = type({
-	"+": "reject",
+export const snapshotStreamSnapshotEventSchema: FluentType<SnapshotStreamSnapshotEvent> = type({
 	generation: "number.integer",
 	generatedAt: "number",
 	serverNowMs: "number",
@@ -123,8 +188,7 @@ export const snapshotStreamSnapshotEventSchema = type({
 });
 
 /** Per-credential upsert/refresh delta. */
-export const snapshotStreamEntryEventSchema = type({
-	"+": "reject",
+export const snapshotStreamEntryEventSchema: FluentType<SnapshotStreamEntryEvent> = type({
 	kind: "'entry'",
 	generation: "number.integer",
 	serverNowMs: "number",
@@ -133,8 +197,7 @@ export const snapshotStreamEntryEventSchema = type({
 });
 
 /** Per-credential delete delta. */
-export const snapshotStreamRemovedEventSchema = type({
-	"+": "reject",
+export const snapshotStreamRemovedEventSchema: FluentType<SnapshotStreamRemovedEvent> = type({
 	kind: "'removed'",
 	generation: "number.integer",
 	serverNowMs: "number",
@@ -143,22 +206,18 @@ export const snapshotStreamRemovedEventSchema = type({
 });
 
 /** Discriminated union over every event frame the snapshot stream emits. */
-export const snapshotStreamEventSchema = snapshotStreamSnapshotEventSchema
+export const snapshotStreamEventSchema: FluentType<SnapshotStreamEvent> = snapshotStreamSnapshotEventSchema
 	.or(snapshotStreamEntryEventSchema)
 	.or(snapshotStreamRemovedEventSchema);
 
-// ─── Healthz ────────────────────────────────────────────────────────────────
+// ─── Healthz ─────────────────────────────────────────────────────────────────
 
-export const healthzResponseSchema = type({
-	"+": "reject",
+export const healthzResponseSchema: FluentType<HealthzResponse> = type({
 	ok: "boolean",
 	"version?": "string",
 });
 
-// ─── Usage ─────────────────────────────────────────────────────────────────
-
-const usageUnitSchema = type("'percent' | 'tokens' | 'requests' | 'usd' | 'minutes' | 'bytes' | 'unknown'");
-const usageStatusSchema = type("'ok' | 'warning' | 'exhausted' | 'unknown'");
+// ─── Usage ───────────────────────────────────────────────────────────────────
 
 const usageWindowSchema = type({
 	id: "string",
@@ -173,7 +232,7 @@ const usageAmountSchema = type({
 	"remaining?": "number",
 	"usedFraction?": "number",
 	"remainingFraction?": "number",
-	unit: usageUnitSchema,
+	unit: readEnumOrUnknown(usageUnitSchema),
 });
 
 const usageScopeSchema = type({
@@ -185,6 +244,7 @@ const usageScopeSchema = type({
 	"tier?": "string",
 	"windowId?": "string",
 	"shared?": "boolean",
+	"sharedGroup?": "string",
 });
 
 const usageLimitSchema = type({
@@ -193,19 +253,31 @@ const usageLimitSchema = type({
 	scope: usageScopeSchema,
 	"window?": usageWindowSchema,
 	amount: usageAmountSchema,
-	"status?": usageStatusSchema,
+	"status?": readEnumOrUnknown(usageStatusSchema),
 	"notes?": "string[]",
-});
-
-const usageResetCreditDetailSchema = type({
-	"grantedAt?": "string",
-	"expiresAt?": "string",
-	"status?": "string",
 });
 
 const usageResetCreditsSchema = type({
 	availableCount: "number",
-	"credits?": usageResetCreditDetailSchema.array(),
+	"redeemableCount?": "number",
+	"nextCreditId?": "string",
+	"eligible?": "boolean",
+	"reason?": "string",
+	"cooldownUntil?": "string",
+	"credits?": type({
+		"id?": "string",
+		"title?": "string",
+		"program?": "string",
+		"remainingCount?": "number",
+		"usable?": "boolean",
+		"requiresLimit?": "boolean",
+		"clears?": "string[]",
+		"blocking?": "string[]",
+		"usedFractions?": { "[string]": "number" },
+		"grantedAt?": "string",
+		"expiresAt?": "string",
+		"status?": "string",
+	}).array(),
 });
 
 const arkUsageReportSchema = type({
@@ -224,8 +296,7 @@ const arkUsageReportSchema = type({
  * keep `raw` optional in the underlying schema so a misconfigured broker that
  * forgot to strip still validates.
  */
-export const usageResponseSchema = type({
-	"+": "reject",
+export const usageResponseSchema: Type<UsageResponse, unknown> = type({
 	generatedAt: "number",
 	reports: arkUsageReportSchema.array(),
 });
@@ -240,13 +311,12 @@ const usageHistoryEntrySchema = type({
 	label: "string",
 	"windowLabel?": "string",
 	"usedFraction?": "number",
-	"status?": "'ok' | 'warning' | 'exhausted' | 'unknown'",
+	"status?": readEnumOrUnknown(usageStatusSchema),
 	"resetsAt?": "number",
 });
 
 /** Broker `/v1/usage/history` response — recorded usage-limit snapshots, oldest first. */
-export const usageHistoryResponseSchema = type({
-	"+": "reject",
+export const usageHistoryResponseSchema: Type<UsageHistoryResponse, unknown> = type({
 	generatedAt: "number",
 	entries: usageHistoryEntrySchema.array(),
 });
@@ -264,26 +334,15 @@ const observedUsageEntrySchema = type({
 });
 
 /** Broker `POST /v1/usage/observed` request — one client's batched observed usage. */
-export const clientUsageReportRequestSchema = type({
-	"+": "reject",
+export const clientUsageReportRequestSchema: FluentType<ClientUsageReportRequest> = type({
 	installId: "string",
 	"hostname?": "string",
+	"app?": "string",
 	entries: observedUsageEntrySchema.array(),
 });
 
-export const clientUsageReportResponseSchema = type({
-	"+": "reject",
+export const clientUsageReportResponseSchema: FluentType<ClientUsageReportResponse> = type({
 	ok: "boolean",
-});
-
-const clientProviderUsageSchema = type({
-	provider: "string",
-	requests: "number",
-	inputTokens: "number",
-	outputTokens: "number",
-	cacheReadTokens: "number",
-	cacheWriteTokens: "number",
-	costUsd: "number",
 });
 
 const clientUsageClientSummarySchema = type({
@@ -291,63 +350,91 @@ const clientUsageClientSummarySchema = type({
 	"hostname?": "string",
 	firstSeen: "number",
 	lastSeen: "number",
-	providers: clientProviderUsageSchema.array(),
+	providers: type({
+		"app?": "string",
+		provider: "string",
+		requests: "number",
+		inputTokens: "number",
+		outputTokens: "number",
+		cacheReadTokens: "number",
+		cacheWriteTokens: "number",
+		costUsd: "number",
+	}).array(),
 });
 
 /** Broker `GET /v1/usage/clients` response — per-client token burn aggregates. */
-export const clientUsageSummaryResponseSchema = type({
-	"+": "reject",
+export const clientUsageSummaryResponseSchema: FluentType<ClientUsageSummaryResponse> = type({
 	generatedAt: "number",
 	clients: clientUsageClientSummarySchema.array(),
 });
 
-// ─── Refresh ───────────────────────────────────────────────────────────────
+// ─── Refresh ─────────────────────────────────────────────────────────────────
 
-export const credentialRefreshResponseSchema = type({
-	"+": "reject",
+export const credentialRefreshResponseSchema: FluentType<CredentialRefreshResponse> = type({
 	entry: credentialSnapshotEntrySchema,
 });
 
-// ─── Disable ───────────────────────────────────────────────────────────────
+// ─── Disable ─────────────────────────────────────────────────────────────────
 
-export const credentialDisableRequestSchema = type({
+export const credentialDisableRequestSchema: FluentType<{ cause?: string }> = type({
 	"+": "reject",
 	"cause?": "string",
 });
 
-export const credentialDisableResponseSchema = type({
-	"+": "reject",
+export const credentialDisableResponseSchema: FluentType<CredentialDisableResponse> = type({
 	ok: "boolean",
 });
 
-// ─── Credential blocks ──────────────────────────────────────────────────────
+/** One disabled-credential tombstone — identity + cause, never token material. */
+export const disabledCredentialSummarySchema: FluentType<DisabledCredentialSummary> = type({
+	id: "number.integer",
+	provider: type("string").atLeastLength(1),
+	type: "'oauth' | 'api_key'",
+	"email?": "string",
+	"accountId?": "string",
+	"orgId?": "string",
+	"orgName?": "string",
+	cause: "string",
+	"disabledAtMs?": "number",
+});
 
-export const credentialBlockRequestSchema = credentialBlockSnapshotSchema;
+/** Broker `GET /v1/credentials/disabled` response. */
+export const disabledCredentialsResponseSchema: FluentType<DisabledCredentialsResponse> = type({
+	generatedAt: "number",
+	disabled: disabledCredentialSummarySchema.array(),
+});
 
-export const credentialBlockResponseSchema = type({
+// ─── Credential blocks ───────────────────────────────────────────────────────
+
+export const credentialBlockRequestSchema: FluentType<CredentialBlockRequest> =
+	credentialBlockSnapshotSchema.onUndeclaredKey("reject");
+
+export const credentialBlockDeleteRequestSchema: FluentType<CredentialBlockDeleteRequest> = type({
 	"+": "reject",
+	providerKey: type("string").atLeastLength(1),
+	blockScope: "string",
+});
+
+export const credentialBlockResponseSchema: FluentType<CredentialBlockResponse> = type({
 	ok: "boolean",
 });
 
-export const credentialBlocksDeleteResponseSchema = type({
-	"+": "reject",
+export const credentialBlocksDeleteResponseSchema: FluentType<CredentialBlocksDeleteResponse> = type({
 	ok: "boolean",
 });
 
-export const usageStaleResponseSchema = type({
-	"+": "reject",
+export const usageStaleResponseSchema: FluentType<UsageStaleResponse> = type({
 	ok: "boolean",
 });
 
-// ─── Upload ────────────────────────────────────────────────────────────────
+// ─── Upload ──────────────────────────────────────────────────────────────────
 
-export const credentialUploadRequestSchema = type({
+export const credentialUploadRequestSchema: FluentType<CredentialUploadRequest> = type({
 	"+": "reject",
 	provider: type("string").atLeastLength(1),
 	credential: writableAuthCredentialSchema,
 });
 
-export const credentialUploadResponseSchema = type({
-	"+": "reject",
+export const credentialUploadResponseSchema: FluentType<CredentialUploadResponse> = type({
 	entries: credentialSnapshotEntrySchema.array(),
 });

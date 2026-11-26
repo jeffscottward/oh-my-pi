@@ -1,5 +1,10 @@
-import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import { logger } from "@oh-my-pi/pi-utils";
+import { type AgentMessage, ASIDE_MESSAGE_COMMIT, ASIDE_MESSAGE_DISCARD } from "@oh-my-pi/pi-agent-core";
+import { errorMessage, logger, toError } from "@oh-my-pi/pi-utils";
+
+/** Rejection message for a queued entry whose dispatcher's `isStale` dropped it. */
+export function yieldQueueStaleMessage(kind: string): string {
+	return `Yield queue entry became stale: ${kind}`;
+}
 
 export interface YieldDispatcher<P> {
 	/** Drop entries already delivered through another path. Called per-entry at flush time. */
@@ -25,14 +30,21 @@ interface StoredDispatcher {
 	skipIdleFlush?: boolean;
 }
 
-function formatError(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
+interface StoredEntry {
+	value: unknown;
+	resolve?: () => void;
+	reject?: (error: Error) => void;
+}
+
+interface BuiltMessage {
+	message: AgentMessage;
+	entries: StoredEntry[];
 }
 
 export class YieldQueue {
 	readonly #options: YieldQueueOptions;
 	readonly #dispatchers = new Map<string, StoredDispatcher>();
-	readonly #entries = new Map<string, unknown[]>();
+	readonly #entries = new Map<string, StoredEntry[]>();
 	#idleFlushPending = false;
 
 	constructor(options: YieldQueueOptions) {
@@ -49,14 +61,27 @@ export class YieldQueue {
 		return () => {
 			if (this.#dispatchers.get(kind) !== stored) return;
 			this.#dispatchers.delete(kind);
+			this.#rejectEntries(this.#entries.get(kind) ?? [], new Error(`Yield queue dispatcher removed: ${kind}`));
 			this.#entries.delete(kind);
 		};
 	}
 
 	enqueue<P>(kind: string, entry: P): void {
+		this.#enqueue(kind, { value: entry });
+	}
+
+	enqueueWithReceipt<P>(kind: string, entry: P): Promise<void> {
+		const { promise, resolve, reject } = Promise.withResolvers<void>();
+		if (!this.#enqueue(kind, { value: entry, resolve, reject })) {
+			reject(new Error(`Yield queue entry ignored for unregistered kind: ${kind}`));
+		}
+		return promise;
+	}
+
+	#enqueue(kind: string, entry: StoredEntry): boolean {
 		if (!this.#dispatchers.has(kind)) {
 			logger.warn("Yield queue entry ignored for unregistered kind", { kind });
-			return;
+			return false;
 		}
 		let entries = this.#entries.get(kind);
 		if (!entries) {
@@ -67,6 +92,7 @@ export class YieldQueue {
 		if (!this.#options.isStreaming() && !this.#dispatchers.get(kind)!.skipIdleFlush) {
 			this.#scheduleIdleFlush();
 		}
+		return true;
 	}
 
 	has(kind?: string): boolean {
@@ -77,31 +103,76 @@ export class YieldQueue {
 		return false;
 	}
 
+	/**
+	 * Non-consuming check for an entry of `kind` that the drain would deliver.
+	 * Unlike {@link has}, it skips entries the dispatcher reports stale, since
+	 * the drain drops those without a message.
+	 */
+	hasDeliverable(kind: string): boolean {
+		const entries = this.#entries.get(kind);
+		if (!entries || entries.length === 0) return false;
+		const isStale = this.#dispatchers.get(kind)?.isStale;
+		if (!isStale) return true;
+		return entries.some(entry => {
+			try {
+				return !isStale(entry.value);
+			} catch {
+				// The drain rejects an entry whose stale check throws.
+				return false;
+			}
+		});
+	}
+
+	/** Arrange an idle flush for entries queued near the end of a streaming run. */
+	requestIdleFlush(): void {
+		for (const [kind, dispatcher] of this.#dispatchers) {
+			if (!dispatcher.skipIdleFlush && this.has(kind)) {
+				this.#scheduleIdleFlush();
+				return;
+			}
+		}
+	}
+
 	async flush(mode: YieldFlushMode): Promise<void> {
 		if (mode === "idle") {
 			this.#idleFlushPending = false;
 		}
-		const idleMessages: AgentMessage[] = [];
+		const idleMessages: BuiltMessage[] = [];
 		for (const [kind, dispatcher] of this.#dispatchers) {
+			if (mode === "idle" && dispatcher.skipIdleFlush) continue;
 			const entries = this.#drain(kind);
 			if (entries.length === 0) continue;
-			const message = this.#build(kind, dispatcher, entries);
-			if (!message) continue;
+			const built = this.#build(kind, dispatcher, entries);
+			if (!built) continue;
 			if (mode === "streaming") {
 				try {
-					this.#options.injectStreaming?.(message);
+					if (!this.#options.injectStreaming) throw new Error("Streaming injection is unavailable");
+					this.#options.injectStreaming(built.message);
+					this.#resolveEntries(built.entries);
 				} catch (error) {
-					logger.warn("Yield queue streaming dispatch failed", { kind, error: formatError(error) });
+					const dispatchError = toError(error);
+					this.#rejectEntries(built.entries, dispatchError);
+					logger.warn("Yield queue streaming dispatch failed", { kind, error: errorMessage(error) });
 				}
 			} else {
-				idleMessages.push(message);
+				idleMessages.push(built);
 			}
 		}
 		if (mode === "idle" && idleMessages.length > 0) {
+			for (const item of idleMessages) this.#attachEntrySettlement(item);
 			try {
-				await this.#options.injectIdle(idleMessages);
+				await this.#options.injectIdle(idleMessages.map(item => item.message));
+				for (const item of idleMessages) {
+					(item.message as AgentMessage & { [ASIDE_MESSAGE_COMMIT]?: () => void })[ASIDE_MESSAGE_COMMIT]?.();
+				}
 			} catch (error) {
-				logger.warn("Yield queue idle dispatch failed", { error: formatError(error) });
+				const dispatchError = toError(error);
+				for (const item of idleMessages) {
+					(item.message as AgentMessage & { [ASIDE_MESSAGE_DISCARD]?: (error: Error) => void })[
+						ASIDE_MESSAGE_DISCARD
+					]?.(dispatchError);
+				}
+				logger.warn("Yield queue idle dispatch failed", { error: errorMessage(error) });
 			}
 		}
 	}
@@ -119,7 +190,12 @@ export class YieldQueue {
 		for (const [kind, dispatcher] of this.#dispatchers) {
 			const entries = this.#drain(kind);
 			if (entries.length === 0) continue;
-			thunks.push(() => this.#build(kind, dispatcher, entries));
+			thunks.push(() => {
+				const built = this.#build(kind, dispatcher, entries);
+				if (!built) return null;
+				this.#attachEntrySettlement(built);
+				return built.message;
+			});
 		}
 		return thunks;
 	}
@@ -127,11 +203,19 @@ export class YieldQueue {
 	/** Drop queued entries. With `kind`, drop only that kind's entries (leaving
 	 *  any pending idle-flush for other kinds intact); otherwise drop everything. */
 	clear(kind?: string): void {
+		const error = new Error("Yield queue entry cleared before dispatch");
 		if (kind !== undefined) {
+			this.#rejectEntries(this.#entries.get(kind) ?? [], error);
 			this.#entries.delete(kind);
 			return;
 		}
+		for (const entries of this.#entries.values()) this.#rejectEntries(entries, error);
 		this.#entries.clear();
+		this.#idleFlushPending = false;
+	}
+
+	/** Clear a scheduled-flush latch when its host task is cancelled before running. */
+	cancelIdleFlushScheduling(): void {
 		this.#idleFlushPending = false;
 	}
 
@@ -146,38 +230,80 @@ export class YieldQueue {
 			});
 		} catch (error) {
 			this.#idleFlushPending = false;
-			logger.warn("Yield queue idle flush scheduling failed", { error: formatError(error) });
+			logger.warn("Yield queue idle flush scheduling failed", { error: errorMessage(error) });
 		}
 	}
 
-	#drain(kind: string): unknown[] {
+	#drain(kind: string): StoredEntry[] {
 		const entries = this.#entries.get(kind);
 		if (!entries || entries.length === 0) return [];
 		this.#entries.delete(kind);
 		return entries;
 	}
 
-	#build(kind: string, dispatcher: StoredDispatcher, entries: unknown[]): AgentMessage | null {
-		const survivors: unknown[] = [];
+	#build(kind: string, dispatcher: StoredDispatcher, entries: StoredEntry[]): BuiltMessage | null {
+		const survivors: StoredEntry[] = [];
 		for (const entry of entries) {
 			if (dispatcher.isStale) {
 				let stale: boolean;
 				try {
-					stale = dispatcher.isStale(entry);
+					stale = dispatcher.isStale(entry.value);
 				} catch (error) {
-					logger.warn("Yield queue stale check failed", { kind, error: formatError(error) });
+					const staleError = toError(error);
+					entry.reject?.(staleError);
+					logger.warn("Yield queue stale check failed", { kind, error: errorMessage(error) });
 					continue;
 				}
-				if (stale) continue;
+				if (stale) {
+					entry.reject?.(new Error(yieldQueueStaleMessage(kind)));
+					continue;
+				}
 			}
 			survivors.push(entry);
 		}
 		if (survivors.length === 0) return null;
 		try {
-			return dispatcher.build(survivors);
+			const message = dispatcher.build(survivors.map(entry => entry.value));
+			if (!message) {
+				this.#rejectEntries(survivors, new Error(`Yield queue dispatcher skipped entry: ${kind}`));
+				return null;
+			}
+			return { message, entries: survivors };
 		} catch (error) {
-			logger.warn("Yield queue build failed", { kind, error: formatError(error) });
+			const buildError = toError(error);
+			this.#rejectEntries(survivors, buildError);
+			logger.warn("Yield queue build failed", { kind, error: errorMessage(error) });
 			return null;
 		}
+	}
+
+	#attachEntrySettlement(built: BuiltMessage): void {
+		let settled = false;
+		Object.defineProperties(built.message, {
+			[ASIDE_MESSAGE_COMMIT]: {
+				configurable: true,
+				value: () => {
+					if (settled) return;
+					settled = true;
+					this.#resolveEntries(built.entries);
+				},
+			},
+			[ASIDE_MESSAGE_DISCARD]: {
+				configurable: true,
+				value: (error: Error) => {
+					if (settled) return;
+					settled = true;
+					this.#rejectEntries(built.entries, error);
+				},
+			},
+		});
+	}
+
+	#resolveEntries(entries: StoredEntry[]): void {
+		for (const entry of entries) entry.resolve?.();
+	}
+
+	#rejectEntries(entries: StoredEntry[], error: Error): void {
+		for (const entry of entries) entry.reject?.(error);
 	}
 }

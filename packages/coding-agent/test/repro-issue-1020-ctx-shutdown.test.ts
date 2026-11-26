@@ -6,92 +6,156 @@ import type {
 	ExtensionUIContext,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { ExtensionUiController } from "@oh-my-pi/pi-coding-agent/modes/controllers/extension-ui-controller";
+import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 
-/**
- * Issue #1020: `ctx.shutdown()` is a no-op in interactive mode.
- *
- * The `contextActions.shutdown` handler wired by
- * `ExtensionUiController.initializeHookRunner` is supposed to flip
- * `InteractiveMode.shutdownRequested` so the main loop's
- * `checkShutdownRequested()` can drive the graceful shutdown path.
- */
-describe("issue #1020 - ctx.shutdown() in interactive mode", () => {
-	test("contextActions.shutdown sets InteractiveModeContext.shutdownRequested", () => {
-		let capturedContextActions: ExtensionContextActions | undefined;
-
-		const fakeExtensionRunner = {
-			initialize(
-				_actions: ExtensionActions,
-				contextActions: ExtensionContextActions,
-				_commandContextActions?: ExtensionCommandContextActions,
-				_uiContext?: ExtensionUIContext,
-			): void {
-				capturedContextActions = contextActions;
-			},
-		};
-
-		const ctxStub = {
+async function createHost() {
+	let actions: ExtensionContextActions | undefined;
+	const state = {
+		streaming: false,
+		queued: 0,
+		runActive: false,
+		closed: false,
+		admitted: 0,
+		pendingSubmission: false,
+		settleAdmitted: undefined as (() => void) | undefined,
+	};
+	const errors: string[] = [];
+	const runner = {
+		initialize(
+			_actions: ExtensionActions,
+			contextActions: ExtensionContextActions,
+			_commandActions?: ExtensionCommandContextActions,
+			_uiContext?: ExtensionUIContext,
+		) {
+			actions = contextActions;
+		},
+		getComposerShapes: () => [],
+		onError() {},
+		async emit() {},
+	};
+	// Own data properties shadow the mode's accessors (which read private state this fake never has).
+	const host = Object.create(
+		InteractiveMode.prototype,
+		Object.getOwnPropertyDescriptors({
 			shutdownRequested: false,
+			syncComposerShape() {},
+			syncExtensionLinks() {},
 			session: {
-				extensionRunner: fakeExtensionRunner,
-				// other session fields are only touched lazily by other actions; we
-				// only invoke `shutdown`, so leave them out.
+				extensionRunner: runner,
+				get isStreaming() {
+					return state.streaming;
+				},
+				get queuedMessageCount() {
+					return state.queued;
+				},
+				get hasAdmittedSubmission() {
+					return state.admitted > 0;
+				},
+				get isRunActive() {
+					return state.runActive;
+				},
+				async waitForIdle() {},
+				waitForAdmittedSubmissions() {
+					if (state.admitted === 0) return Promise.resolve();
+					const settled = Promise.withResolvers<void>();
+					state.settleAdmitted = settled.resolve;
+					return settled.promise;
+				},
 			},
-		} as unknown as InteractiveModeContext;
+			hasPendingSubmission: () => state.pendingSubmission,
+			async shutdown() {
+				state.closed = true;
+			},
+			showError(message: string) {
+				errors.push(message);
+			},
+			setToolUIContext() {},
+			composer: { setText() {}, insertText() {}, text: () => "" },
+			setWorkingMessage() {},
+			toolOutputExpanded: false,
+			setToolsExpanded() {},
+			get isShuttingDown() {
+				return state.closed;
+			},
+		}),
+	) as InteractiveModeContext;
+	const controller = new ExtensionUiController(host);
+	await controller.initHooksAndCustomTools();
+	if (!actions) throw new Error("Extension runtime was not initialized");
+	return { host, actions, state, errors };
+}
 
-		const controller = new ExtensionUiController(ctxStub);
-		controller.initializeHookRunner({} as ExtensionUIContext, false);
+async function flushShutdown() {
+	await Promise.resolve();
+	await Promise.resolve();
+	await Promise.resolve();
+}
 
-		expect(capturedContextActions).toBeDefined();
-		expect(typeof capturedContextActions?.shutdown).toBe("function");
-
-		capturedContextActions?.shutdown();
-
-		expect(ctxStub.shutdownRequested).toBe(true);
+describe("interactive extension shutdown", () => {
+	test("an idle background request closes the initialized host without terminal input", async () => {
+		const { actions, state, errors } = await createHost();
+		actions.shutdown();
+		await flushShutdown();
+		expect(state.closed).toBe(true);
+		expect(errors).toEqual([]);
 	});
 
-	test("initHooksAndCustomTools wires shutdown to set shutdownRequested", async () => {
-		let capturedContextActions: ExtensionContextActions | undefined;
+	test("keeps the request pending until streaming, queued input and the open run settle", async () => {
+		const { host, actions, state, errors } = await createHost();
+		state.streaming = true;
+		actions.shutdown();
+		await flushShutdown();
+		expect(state.closed).toBe(false);
 
-		const fakeExtensionRunner = {
-			initialize(
-				_actions: ExtensionActions,
-				contextActions: ExtensionContextActions,
-				_commandContextActions?: ExtensionCommandContextActions,
-				_uiContext?: ExtensionUIContext,
-			): void {
-				capturedContextActions = contextActions;
-			},
-			onError(_handler: (error: unknown) => void): void {},
-			async emit(_event: unknown): Promise<void> {},
-		};
+		state.streaming = false;
+		state.queued = 1;
+		await host.checkShutdownRequested();
+		expect(state.closed).toBe(false);
 
-		const ctxStub = {
-			shutdownRequested: false,
-			session: {
-				extensionRunner: fakeExtensionRunner,
-			},
-			setToolUIContext: () => {},
-			editor: {
-				setText: () => {},
-				handleInput: () => {},
-				getText: () => "",
-			},
-			setWorkingMessage: () => {},
-			setEditorComponent: () => {},
-			toolOutputExpanded: false,
-			setToolsExpanded: () => {},
-		} as unknown as InteractiveModeContext;
+		state.queued = 0;
+		state.runActive = true;
+		await host.checkShutdownRequested();
+		expect(state.closed).toBe(false);
 
-		const controller = new ExtensionUiController(ctxStub);
-		await controller.initHooksAndCustomTools();
+		state.runActive = false;
+		host.requestShutdown();
+		await flushShutdown();
+		expect(state.closed).toBe(true);
+		expect(errors).toEqual([]);
+	});
 
-		expect(capturedContextActions).toBeDefined();
-		expect(typeof capturedContextActions?.shutdown).toBe("function");
+	test("waits for an admitted extension submission and re-evaluates the turn it started", async () => {
+		const { host, actions, state, errors } = await createHost();
+		state.admitted = 1;
+		actions.shutdown();
+		await flushShutdown();
+		expect(state.closed).toBe(false);
 
-		capturedContextActions?.shutdown();
+		// The submission dispatches a turn as it settles: still not a shutdown boundary.
+		state.streaming = true;
+		state.admitted = 0;
+		state.settleAdmitted?.();
+		await flushShutdown();
+		expect(state.closed).toBe(false);
 
-		expect(ctxStub.shutdownRequested).toBe(true);
+		state.streaming = false;
+		host.requestShutdown();
+		await flushShutdown();
+		expect(state.closed).toBe(true);
+		expect(errors).toEqual([]);
+	});
+
+	test("keeps the request pending while a foreground submission is still being prepared", async () => {
+		const { host, actions, state, errors } = await createHost();
+		state.pendingSubmission = true;
+		actions.shutdown();
+		await flushShutdown();
+		expect(state.closed).toBe(false);
+
+		state.pendingSubmission = false;
+		await host.checkShutdownRequested();
+		expect(state.closed).toBe(true);
+		expect(errors).toEqual([]);
 	});
 });

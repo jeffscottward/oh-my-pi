@@ -1,1 +1,2 @@
-No polling is needed. Inspecting a settled job with `hub jobs` or `hub wait` makes that snapshot its delivery, so no duplicate `async-result` follows. Job IDs live in process memory for roughly five minutes after settlement; afterward, use the agent ID with `hub send`, `agent://<id>`, or `history://<id>`. `completed` means the subagent yielded successfully, not that claimed artifacts were verified.
+Results auto-deliver; NEVER poll.{{#if waitTool}} Completely blocked? Call `wait` until it returns the first settled job you started.{{/if}}
+`completed`: subagent yielded successfully; claimed artifacts unverified.

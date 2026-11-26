@@ -1,5 +1,20 @@
-import { describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
+import type { Model } from "@oh-my-pi/pi-ai";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
+import { formatModelString } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
+import { cfgEnabledModels } from "@oh-my-pi/pi-coding-agent/config/model-settings";
+import { lookup } from "@oh-my-pi/pi-coding-agent/config/registry";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { clearOmpExtensionCliRoots } from "@oh-my-pi/pi-coding-agent/discovery/omp-extension-roots";
+import { createAcpConnection } from "@oh-my-pi/pi-coding-agent/modes/acp/acp-mode";
+import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
+import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { TempDir } from "@oh-my-pi/pi-utils";
 import {
 	type Client,
 	ClientSideConnection,
@@ -9,15 +24,14 @@ import {
 	type RequestPermissionRequest,
 	type RequestPermissionResponse,
 	type SessionNotification,
-} from "@agentclientprotocol/sdk";
-import type { Model } from "@oh-my-pi/pi-ai";
-import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { createAcpConnection } from "@oh-my-pi/pi-coding-agent/modes/acp/acp-mode";
-import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { TempDir } from "@oh-my-pi/pi-utils";
+} from "@oh-my-pi/pi-utils/acp";
+import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
+
+import { cfgAsyncEnabled, cfgAsyncMaxJobs } from "@oh-my-pi/pi-coding-agent/tools/settings";
+import {
+	cfgBashAutoBackgroundEnabled,
+	cfgBashAutoBackgroundThresholdMs,
+} from "@oh-my-pi/pi-coding-agent/exec/settings";
 
 const TEST_MODEL: Model = buildModel({
 	id: "claude-sonnet-4-20250514",
@@ -30,6 +44,19 @@ const TEST_MODEL: Model = buildModel({
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 	contextWindow: 200_000,
 	maxTokens: 8_192,
+});
+
+let startupDir: TempDir;
+let startupAuthStorage: AuthStorage;
+
+beforeAll(() => {
+	startupDir = TempDir.createSync("@omp-acp-startup-shared-");
+	startupAuthStorage = createInMemoryAuthStorage();
+});
+
+afterAll(async () => {
+	startupAuthStorage.close();
+	await startupDir.remove();
 });
 
 function emptyWorkspaceTree(cwd: string) {
@@ -64,7 +91,26 @@ class LazyFakeSession {
 	queuedMessageCount = 0;
 	systemPrompt = "system";
 	disposed = false;
-	settings = { get: (_path: string) => false };
+	settings = Settings.isolated({ "plan.enabled": false });
+	scopedModels: AgentSession["scopedModels"] = [];
+	#disposers: Array<() => void> = [];
+	refreshScopedModels?: () => Promise<void>;
+
+	addDisposer(disposer: () => void): void {
+		this.#disposers.push(disposer);
+	}
+
+	setScopedModelsRefresher(refresh: () => Promise<void>): void {
+		this.refreshScopedModels = refresh;
+	}
+
+	setScopedModels(models: AgentSession["scopedModels"]): void {
+		this.scopedModels = models;
+	}
+
+	get isDisposed(): boolean {
+		return this.disposed;
+	}
 
 	constructor(cwd: string) {
 		this.sessionManager = SessionManager.inMemory(cwd);
@@ -107,6 +153,7 @@ class LazyFakeSession {
 	}
 	async dispose(): Promise<void> {
 		this.disposed = true;
+		for (const dispose of this.#disposers) dispose();
 		await this.sessionManager.close();
 	}
 	async reload(): Promise<void> {}
@@ -127,6 +174,10 @@ class LazyFakeSession {
 	}
 	setActiveToolsByName(): void {}
 	setClientBridge(): void {}
+	setMcpServerInstructionsSource(): void {}
+	registerSessionChangeCallback(): () => void {
+		return () => {};
+	}
 	getPlanModeState(): undefined {
 		return undefined;
 	}
@@ -149,13 +200,18 @@ class LazyFakeSession {
  */
 async function closeTransport(writable: WritableStream<unknown>): Promise<void> {
 	for (let i = 0; i < 100 && writable.locked; i++) {
-		await Bun.sleep(0);
+		await new Promise<void>(resolve => setImmediate(resolve));
 	}
 	await Promise.allSettled([writable.close()]);
 }
 
+// `runRootCommand` registers the CLI's extension roots (`--no-extensions` → explicit-only) process-wide.
+afterEach(() => {
+	clearOmpExtensionCliRoots();
+});
+
 describe("ACP lazy startup", () => {
-	it("applies schema defaults for ACP background jobs and preserves explicit overrides", async () => {
+	it("applies schema defaults for ACP background jobs", async () => {
 		const { runRootCommand } = await import("@oh-my-pi/pi-coding-agent/main");
 
 		type ObservedBackgroundSettings = {
@@ -166,9 +222,7 @@ describe("ACP lazy startup", () => {
 		};
 
 		const runAcpStartup = async (settings: Settings): Promise<ObservedBackgroundSettings> => {
-			using tempDir = TempDir.createSync("@omp-acp-background-settings-");
-			const cwd = tempDir.path();
-			const authStorage = await AuthStorage.create(path.join(cwd, "auth.db"));
+			const cwd = startupDir.path();
 			let observed: ObservedBackgroundSettings | undefined;
 			const stopMessage = "stop test ACP mode";
 			try {
@@ -179,6 +233,7 @@ describe("ACP lazy startup", () => {
 						fileArgs: [],
 						unknownFlags: new Map(),
 						unrecognizedFlags: [],
+						invalidFlagValues: [],
 						noSkills: true,
 						noRules: true,
 						noTools: true,
@@ -187,14 +242,14 @@ describe("ACP lazy startup", () => {
 					},
 					[],
 					{
-						discoverAuthStorage: async () => authStorage,
+						discoverAuthStorage: async () => startupAuthStorage,
 						settings,
 						runAcpMode: async () => {
 							observed = {
-								asyncEnabled: settings.get("async.enabled"),
-								asyncMaxJobs: settings.get("async.maxJobs"),
-								bashAutoBackground: settings.get("bash.autoBackground.enabled"),
-								bashAutoBackgroundThresholdMs: settings.get("bash.autoBackground.thresholdMs"),
+								asyncEnabled: cfgAsyncEnabled.get(settings),
+								asyncMaxJobs: cfgAsyncMaxJobs.get(settings),
+								bashAutoBackground: cfgBashAutoBackgroundEnabled.get(settings),
+								bashAutoBackgroundThresholdMs: cfgBashAutoBackgroundThresholdMs.get(settings),
 							};
 							throw new Error(stopMessage);
 						},
@@ -204,8 +259,6 @@ describe("ACP lazy startup", () => {
 				if (!(error instanceof Error) || error.message !== stopMessage) {
 					throw error;
 				}
-			} finally {
-				authStorage.close();
 			}
 
 			if (!observed) {
@@ -214,34 +267,16 @@ describe("ACP lazy startup", () => {
 			return observed;
 		};
 
-		// ACP startup must not clobber background-job settings: an unset config
-		// observes the schema defaults (async on since 844c8dbdfe)…
+		// An unset ACP config observes the background-job schema defaults.
 		await expect(runAcpStartup(Settings.isolated())).resolves.toEqual({
 			asyncEnabled: true,
 			asyncMaxJobs: 100,
-			bashAutoBackground: false,
-			bashAutoBackgroundThresholdMs: 60000,
-		});
-		// …and explicit overrides survive in both directions (here: async
-		// opted OUT against the default, auto-background opted IN).
-		await expect(
-			runAcpStartup(
-				Settings.isolated({
-					"async.enabled": false,
-					"async.maxJobs": 7,
-					"bash.autoBackground.enabled": true,
-					"bash.autoBackground.thresholdMs": 1234,
-				}),
-			),
-		).resolves.toEqual({
-			asyncEnabled: false,
-			asyncMaxJobs: 7,
 			bashAutoBackground: true,
-			bashAutoBackgroundThresholdMs: 1234,
+			bashAutoBackgroundThresholdMs: 60000,
 		});
 	});
 
-	it("honors explicit host-defaulted settings for protocol hosts", async () => {
+	it("honors explicit host-defaulted and todo settings for protocol hosts", async () => {
 		// Regression for #3207: in RPC/ACP startup, runtime overrides applied via
 		// `applyDefaultSettingOverrides` previously clobbered any explicitly
 		// configured value (caller, project, --config overlay, or global) with the
@@ -250,7 +285,8 @@ describe("ACP lazy startup", () => {
 		const { runRootCommand } = await import("@oh-my-pi/pi-coding-agent/main");
 
 		const explicit = {
-			"task.isolation.mode": "rcopy",
+			"task.isolation.enabled": true,
+			"isolation.backend": "rcopy",
 			"task.isolation.apply": false,
 			"task.isolation.merge": "branch",
 			"task.isolation.commits": "ai",
@@ -260,17 +296,20 @@ describe("ACP lazy startup", () => {
 			"task.maxRecursionDepth": 5,
 			"task.disabledAgents": ["scout"],
 			"task.agentModelOverrides": { task: "claude-sonnet-4-20250514" },
+			"task.agentAdvisor": { task: "on" },
 			"memory.backend": "local",
 			"memories.enabled": true,
 			"advisor.enabled": true,
-			"advisor.subagents": true,
 			"advisor.syncBacklog": "5",
 			"advisor.immuneTurns": 7,
+			"todo.enabled": false,
+			"todo.reminders": false,
+			"todo.eager": "always",
 		} as const;
 		const rpcOnlyExplicit = {
 			"async.enabled": false,
 			"async.maxJobs": 7,
-			"bash.autoBackground.enabled": true,
+			"bash.autoBackground.enabled": false,
 			"bash.autoBackground.thresholdMs": 5_000,
 		} as const;
 		const allPaths = [
@@ -280,16 +319,16 @@ describe("ACP lazy startup", () => {
 		type ObservedSettings = Record<string, unknown>;
 
 		const runProtocolStartup = async (mode: "rpc" | "rpc-ui" | "acp"): Promise<ObservedSettings> => {
-			using tempDir = TempDir.createSync("@omp-protocol-host-defaulted-");
-			const cwd = tempDir.path();
-			const authStorage = await AuthStorage.create(path.join(cwd, "auth.db"));
+			const cwd = startupDir.path();
 			const settings = Settings.isolated({ ...explicit, ...rpcOnlyExplicit });
 			let observed: ObservedSettings | undefined;
 			const stopMessage = "stop test host-defaulted settings";
 			const observe = () => {
 				observed = {};
 				for (const key of allPaths) {
-					observed[key] = settings.get(key);
+					const setting = lookup(key);
+					if (!setting) throw new Error(`Unknown setting: ${key}`);
+					observed[key] = setting.get(settings);
 				}
 				throw new Error(stopMessage);
 			};
@@ -302,6 +341,7 @@ describe("ACP lazy startup", () => {
 						fileArgs: [],
 						unknownFlags: new Map(),
 						unrecognizedFlags: [],
+						invalidFlagValues: [],
 						noSkills: true,
 						noRules: true,
 						noTools: true,
@@ -311,7 +351,7 @@ describe("ACP lazy startup", () => {
 					},
 					[],
 					{
-						discoverAuthStorage: async () => authStorage,
+						discoverAuthStorage: async () => startupAuthStorage,
 						settings,
 						createAgentSession: async () => observe(),
 						runAcpMode: async () => observe(),
@@ -321,8 +361,6 @@ describe("ACP lazy startup", () => {
 				if (!(error instanceof Error) || error.message !== stopMessage) {
 					throw error;
 				}
-			} finally {
-				authStorage.close();
 			}
 
 			if (!observed) {
@@ -336,86 +374,16 @@ describe("ACP lazy startup", () => {
 		}
 	});
 
-	it("honors explicit todo settings for protocol hosts", async () => {
-		const { runRootCommand } = await import("@oh-my-pi/pi-coding-agent/main");
-
-		type ObservedTodoSettings = {
-			enabled: boolean;
-			reminders: boolean;
-			eager: "default" | "preferred" | "always";
-		};
-
-		const runProtocolStartup = async (mode: "rpc" | "rpc-ui" | "acp"): Promise<ObservedTodoSettings> => {
-			using tempDir = TempDir.createSync("@omp-protocol-todo-settings-");
-			const cwd = tempDir.path();
-			const authStorage = await AuthStorage.create(path.join(cwd, "auth.db"));
-			const settings = Settings.isolated({
-				"todo.enabled": false,
-				"todo.reminders": false,
-				"todo.eager": "always",
-			});
-			let observed: ObservedTodoSettings | undefined;
-			const stopMessage = "stop test protocol todo settings";
-			const observe = () => {
-				observed = {
-					enabled: settings.get("todo.enabled"),
-					reminders: settings.get("todo.reminders"),
-					eager: settings.get("todo.eager"),
-				};
-				throw new Error(stopMessage);
-			};
-
-			try {
-				await runRootCommand(
-					{
-						mode,
-						messages: [],
-						fileArgs: [],
-						unknownFlags: new Map(),
-						unrecognizedFlags: [],
-						noSkills: true,
-						noRules: true,
-						noTools: true,
-						noLsp: true,
-						noExtensions: true,
-						sessionDir: cwd,
-					},
-					[],
-					{
-						discoverAuthStorage: async () => authStorage,
-						settings,
-						createAgentSession: async () => observe(),
-						runAcpMode: async () => observe(),
-					},
-				);
-			} catch (error) {
-				if (!(error instanceof Error) || error.message !== stopMessage) {
-					throw error;
-				}
-			} finally {
-				authStorage.close();
-			}
-
-			if (!observed) {
-				throw new Error("Expected protocol mode to start");
-			}
-			return observed;
-		};
-
-		for (const mode of ["rpc", "rpc-ui", "acp"] as const) {
-			await expect(runProtocolStartup(mode)).resolves.toEqual({
-				enabled: false,
-				reminders: false,
-				eager: "always",
-			});
-		}
-	});
 	it("answers initialize before creating the first AgentSession", async () => {
 		const clientToAgent = new TransformStream();
 		const agentToClient = new TransformStream();
 		const client = new TestClient();
 		let createCalls = 0;
-		const blockedCreation = Promise.withResolvers<AgentSession>();
+		const creationStarted = Promise.withResolvers<void>();
+		const blockedCreation = Promise.withResolvers<{
+			session: AgentSession;
+			setToolUIContext: () => void;
+		}>();
 
 		const agentConnection = new ClientSideConnection(
 			() => client,
@@ -424,40 +392,300 @@ describe("ACP lazy startup", () => {
 		const serverConnection = createAcpConnection(
 			ndJsonStream(agentToClient.writable, clientToAgent.readable),
 			async cwd => {
+				creationStarted.resolve();
 				createCalls++;
 				if (createCalls === 1) {
 					return await blockedCreation.promise;
 				}
-				return new LazyFakeSession(cwd) as unknown as AgentSession;
+				return {
+					session: new LazyFakeSession(cwd) as unknown as AgentSession,
+					setToolUIContext: () => {},
+				};
 			},
 		);
 
 		try {
-			const initializeResponse = await Promise.race([
-				agentConnection.initialize({ protocolVersion: 1, clientCapabilities: {} }),
-				Bun.sleep(50).then(() => "timeout" as const),
-			]);
-
-			expect(initializeResponse).not.toBe("timeout");
+			const initializeResponse = await agentConnection.initialize({ protocolVersion: 1, clientCapabilities: {} });
 			expect(initializeResponse).toEqual(
 				expect.objectContaining({
 					protocolVersion: 1,
-					agentInfo: expect.objectContaining({ name: "oh-my-pi" }),
 				}),
 			);
 			expect(createCalls).toBe(0);
 
 			const newSessionPromise = agentConnection.newSession({ cwd: "/tmp/acp-lazy-startup", mcpServers: [] });
-			await Bun.sleep(20);
+			await creationStarted.promise;
 			expect(createCalls).toBe(1);
 
-			blockedCreation.resolve(new LazyFakeSession("/tmp/acp-lazy-startup") as unknown as AgentSession);
+			blockedCreation.resolve({
+				session: new LazyFakeSession("/tmp/acp-lazy-startup") as unknown as AgentSession,
+				setToolUIContext: () => {},
+			});
 			const sessionResponse = await newSessionPromise;
 			expect(sessionResponse.sessionId).toEqual(expect.any(String));
 		} finally {
 			await closeTransport(clientToAgent.writable);
 			await closeTransport(agentToClient.writable);
 			await Promise.allSettled([agentConnection.closed, serverConnection.closed]);
+		}
+	});
+
+	it.each([false, true])("uses the workspace scope unless --models is explicit (%s)", async explicit => {
+		using launch = TempDir.createSync("@omp-acp-scope-launch-");
+		using workspace = TempDir.createSync("@omp-acp-scope-workspace-");
+		const launchSelector = "openrouter/z-ai/glm-4.7";
+		const workspaceSelector = "openrouter/deepseek/deepseek-chat";
+		await Bun.write(launch.join(".omp/config.yml"), `enabledModels:\n  - ${launchSelector}\n`);
+		await Bun.write(workspace.join(".omp/config.yml"), `enabledModels:\n  - ${workspaceSelector}\n`);
+		const settings = await Settings.loadIsolated({ cwd: launch.path(), agentDir: launch.join("agent") });
+		const authStorage = createInMemoryAuthStorage();
+		authStorage.keys.setRuntime("openrouter", "test-key");
+		if (!explicit) authStorage.keys.setRuntime("anthropic", "other-provider-key");
+		const { runRootCommand } = await import("@oh-my-pi/pi-coding-agent/main");
+		const rawArgs = explicit ? ["--models", launchSelector] : ["--api-key", "workspace-cli-key"];
+		let created: LazyFakeSession | undefined;
+		try {
+			await expect(
+				runRootCommand(
+					{
+						...parseArgs(rawArgs),
+						mode: "acp",
+						offline: true,
+						noExtensions: true,
+						sessionDir: launch.join("sessions"),
+					},
+					rawArgs,
+					{
+						discoverAuthStorage: async () => authStorage,
+						settings,
+						createAgentSession: async options => {
+							const session = new LazyFakeSession(workspace.path());
+							session.model = options?.model;
+							session.settings = options?.settings ?? session.settings;
+							session.scopedModels = options?.scopedModels ?? [];
+							created = session;
+							return { session, setToolUIContext: () => {} } as unknown as CreateAgentSessionResult;
+						},
+						runAcpMode: async createSession => {
+							if (!explicit) {
+								const other = workspace.join("other-provider");
+								await Bun.write(
+									path.join(other, ".omp/config.yml"),
+									"enabledModels:\n  - anthropic/claude-sonnet-4-5\n",
+								);
+								await expect(createSession(other)).rejects.toThrow("bound to openrouter, not anthropic");
+								expect(await authStorage.keys.get("anthropic")).toBe("other-provider-key");
+							}
+							await createSession(workspace.path());
+							throw new Error("stop test ACP mode");
+						},
+					},
+				),
+			).rejects.toThrow("stop test ACP mode");
+			if (!created?.model) throw new Error("Expected ACP startup model");
+			const selector = explicit ? launchSelector : workspaceSelector;
+			expect(formatModelString(created.model)).toBe(selector);
+			if (!explicit) expect(await authStorage.keys.get(created.model.provider)).toBe("workspace-cli-key");
+			expect(created.scopedModels.map(entry => formatModelString(entry.model))).toEqual([selector]);
+
+			cfgEnabledModels.override(created.settings, explicit ? [] : [launchSelector]);
+			const { promise, resolve } = Promise.withResolvers<void>();
+			setImmediate(resolve);
+			await promise;
+			expect(created.scopedModels.map(entry => formatModelString(entry.model))).toEqual([launchSelector]);
+		} finally {
+			await created?.dispose();
+			authStorage.close();
+			settings.cancelPendingSaves();
+		}
+	});
+
+	it.each([
+		[":high", "high"],
+		["", "low"],
+	])("seeds a workspace session's thinking level only when --model%s sets none", async (suffix, expected) => {
+		using launch = TempDir.createSync("@omp-acp-thinking-launch-");
+		using workspace = TempDir.createSync("@omp-acp-thinking-workspace-");
+		const selector = "openrouter/z-ai/glm-4.7";
+		await Bun.write(workspace.join(".omp/config.yml"), `enabledModels:\n  - ${selector}:low\n`);
+		const settings = await Settings.loadIsolated({ cwd: launch.path(), agentDir: launch.join("agent") });
+		const authStorage = createInMemoryAuthStorage();
+		authStorage.keys.setRuntime("openrouter", "test-key");
+		const { runRootCommand } = await import("@oh-my-pi/pi-coding-agent/main");
+		const rawArgs = ["--model", `${selector}${suffix}`];
+		let thinkingLevel: string | undefined;
+		try {
+			await expect(
+				runRootCommand(
+					{
+						...parseArgs(rawArgs),
+						mode: "acp",
+						offline: true,
+						noExtensions: true,
+						sessionDir: launch.join("sessions"),
+					},
+					rawArgs,
+					{
+						discoverAuthStorage: async () => authStorage,
+						settings,
+						createAgentSession: async options => {
+							thinkingLevel = options?.thinkingLevel;
+							return {
+								session: new LazyFakeSession(workspace.path()),
+								setToolUIContext: () => {},
+							} as unknown as CreateAgentSessionResult;
+						},
+						runAcpMode: async createSession => {
+							await createSession(workspace.path());
+							throw new Error("stop test ACP mode");
+						},
+					},
+				),
+			).rejects.toThrow("stop test ACP mode");
+			expect(thinkingLevel).toBe(expected);
+		} finally {
+			authStorage.close();
+			settings.cancelPendingSaves();
+		}
+	});
+
+	it("binds --api-key to the launch scope provider without a stored credential", async () => {
+		using launch = TempDir.createSync("@omp-acp-key-launch-");
+		using other = TempDir.createSync("@omp-acp-key-other-");
+		using match = TempDir.createSync("@omp-acp-key-match-");
+		const selector = "openrouter/z-ai/glm-4.7";
+		await Bun.write(launch.join(".omp/config.yml"), `enabledModels:\n  - ${selector}\n`);
+		await Bun.write(other.join(".omp/config.yml"), "enabledModels:\n  - anthropic/claude-sonnet-4-5\n");
+		await Bun.write(match.join(".omp/config.yml"), `enabledModels:\n  - ${selector}\n`);
+		const settings = await Settings.loadIsolated({ cwd: launch.path(), agentDir: launch.join("agent") });
+		const authStorage = createInMemoryAuthStorage();
+		authStorage.keys.setRuntime("anthropic", "own-anthropic-key");
+		const { runRootCommand } = await import("@oh-my-pi/pi-coding-agent/main");
+		const rawArgs = ["--api-key", "fake-launch-key"];
+		let created: LazyFakeSession | undefined;
+		try {
+			await expect(
+				runRootCommand(
+					{ ...parseArgs(rawArgs), mode: "acp", offline: true, noExtensions: true, sessionDir: launch.join("s") },
+					rawArgs,
+					{
+						discoverAuthStorage: async () => authStorage,
+						settings,
+						createAgentSession: async options => {
+							const session = new LazyFakeSession(match.path());
+							session.model = options?.model;
+							created = session;
+							return { session, setToolUIContext: () => {} } as unknown as CreateAgentSessionResult;
+						},
+						runAcpMode: async createSession => {
+							await expect(createSession(other.path())).rejects.toThrow("bound to openrouter, not anthropic");
+							expect(await authStorage.keys.get("anthropic")).toBe("own-anthropic-key");
+							await createSession(match.path());
+							throw new Error("stop test ACP mode");
+						},
+					},
+				),
+			).rejects.toThrow("stop test ACP mode");
+			if (!created?.model) throw new Error("Expected ACP startup model");
+			expect(formatModelString(created.model)).toBe(selector);
+			expect(await authStorage.keys.get("openrouter")).toBe("fake-launch-key");
+		} finally {
+			await created?.dispose();
+			authStorage.close();
+			settings.cancelPendingSaves();
+		}
+	});
+
+	it("opens a workspace without a scope on its own default once --api-key is bound", async () => {
+		using launch = TempDir.createSync("@omp-acp-key-default-launch-");
+		using plain = TempDir.createSync("@omp-acp-key-default-plain-");
+		const selector = "openrouter/z-ai/glm-4.7";
+		const openrouterModel = getBundledModel("openrouter", "z-ai/glm-4.7");
+		await Bun.write(launch.join(".omp/config.yml"), `enabledModels:\n  - ${selector}\n`);
+		const settings = await Settings.loadIsolated({ cwd: launch.path(), agentDir: launch.join("agent") });
+		const authStorage = createInMemoryAuthStorage();
+		authStorage.keys.setRuntime("anthropic", "own-anthropic-key");
+		const { runRootCommand } = await import("@oh-my-pi/pi-coding-agent/main");
+		const rawArgs = ["--api-key", "fake-launch-key"];
+		const sessions: LazyFakeSession[] = [];
+		// Stands in for the SDK's own default-role resolution in a workspace without a startup model.
+		let workspaceDefault: Model | undefined;
+		try {
+			await expect(
+				runRootCommand(
+					{ ...parseArgs(rawArgs), mode: "acp", offline: true, noExtensions: true, sessionDir: launch.join("s") },
+					rawArgs,
+					{
+						discoverAuthStorage: async () => authStorage,
+						settings,
+						createAgentSession: async options => {
+							const session = new LazyFakeSession(plain.path());
+							session.model = options?.model ?? workspaceDefault;
+							sessions.push(session);
+							return { session, setToolUIContext: () => {} } as unknown as CreateAgentSessionResult;
+						},
+						runAcpMode: async createSession => {
+							workspaceDefault = TEST_MODEL;
+							await expect(createSession(plain.path())).rejects.toThrow("bound to openrouter, not anthropic");
+							workspaceDefault = openrouterModel;
+							await createSession(plain.path());
+							throw new Error("stop test ACP mode");
+						},
+					},
+				),
+			).rejects.toThrow("stop test ACP mode");
+			expect(sessions.map(session => session.disposed)).toEqual([true, false]);
+			expect(sessions[1]?.model && formatModelString(sessions[1].model)).toBe(selector);
+			expect(await authStorage.keys.get("openrouter")).toBe("fake-launch-key");
+			expect(await authStorage.keys.get("anthropic")).toBe("own-anthropic-key");
+		} finally {
+			for (const session of sessions) if (!session.disposed) await session.dispose();
+			authStorage.close();
+			settings.cancelPendingSaves();
+		}
+	});
+
+	it("refuses --api-key at launch when neither a model nor the launch scope names its provider", async () => {
+		using launch = TempDir.createSync("@omp-acp-key-unnamed-launch-");
+		using workspace = TempDir.createSync("@omp-acp-key-unnamed-workspace-");
+		await Bun.write(workspace.join(".omp/config.yml"), "enabledModels:\n  - openrouter/z-ai/glm-4.7\n");
+		const settings = await Settings.loadIsolated({ cwd: launch.path(), agentDir: launch.join("agent") });
+		const authStorage = createInMemoryAuthStorage();
+		authStorage.keys.setRuntime("openrouter", "own-openrouter-key");
+		const { runRootCommand } = await import("@oh-my-pi/pi-coding-agent/main");
+		const rawArgs = ["--api-key", "fake-launch-key"];
+		const exit = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+			throw new Error(`exit ${code}`);
+		}) as typeof process.exit);
+		const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+		let opened = false;
+		try {
+			await expect(
+				runRootCommand(
+					{ ...parseArgs(rawArgs), mode: "acp", offline: true, noExtensions: true, sessionDir: launch.join("s") },
+					rawArgs,
+					{
+						discoverAuthStorage: async () => authStorage,
+						settings,
+						createAgentSession: async () => {
+							throw new Error("session constructed");
+						},
+						runAcpMode: async createSession => {
+							opened = true;
+							await createSession(workspace.path());
+							throw new Error("ACP mode started");
+						},
+					},
+				),
+			).rejects.toThrow("exit 1");
+			expect(stderr.mock.calls.map(call => String(call[0])).join("")).toContain("--api-key requires a model");
+			expect(opened).toBe(false);
+			expect(await authStorage.keys.get("openrouter")).toBe("own-openrouter-key");
+		} finally {
+			exit.mockRestore();
+			stderr.mockRestore();
+			authStorage.close();
+			settings.cancelPendingSaves();
 		}
 	});
 
@@ -486,7 +714,7 @@ describe("ACP lazy startup", () => {
 `,
 		);
 
-		const authStorage = await AuthStorage.create(path.join(cwd, "auth.db"));
+		const authStorage = createInMemoryAuthStorage();
 		try {
 			const settings = Settings.isolated({ "marketplace.autoUpdate": "off" });
 			const { runRootCommand } = await import("@oh-my-pi/pi-coding-agent/main");
@@ -503,9 +731,9 @@ describe("ACP lazy startup", () => {
 					fileArgs: [],
 					unknownFlags: new Map(),
 					unrecognizedFlags: [],
+					invalidFlagValues: [],
 					noSkills: true,
 					noRules: true,
-					noTools: true,
 					noLsp: true,
 					sessionDir: cwd,
 					extensions: [path.join(cwd, "runtime-provider.ts")],
@@ -525,7 +753,7 @@ describe("ACP lazy startup", () => {
 					},
 					settings,
 					runAcpMode: async createAcpSession => {
-						session = await createAcpSession(cwd);
+						session = (await createAcpSession(cwd)).session;
 						throw new Error("stop test ACP mode");
 					},
 				},

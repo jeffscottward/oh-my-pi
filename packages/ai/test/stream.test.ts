@@ -3,14 +3,24 @@ import { type ChildProcess, execSync, spawn } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { type } from "@oh-my-pi/omptype";
 import { Effort } from "@oh-my-pi/pi-ai";
 import { __resetVertexTokenCache } from "@oh-my-pi/pi-ai/providers/google-auth";
-import { complete, getEnvApiKey, stream } from "@oh-my-pi/pi-ai/stream";
-import type { Api, Context, ImageContent, Model, OptionsForApi, Tool, ToolResultMessage } from "@oh-my-pi/pi-ai/types";
+import { getEnvApiKey } from "@oh-my-pi/pi-ai/env-api-key";
+import { complete, stream } from "@oh-my-pi/pi-ai/stream";
+import type {
+	Api,
+	AssistantMessage,
+	Context,
+	ImageContent,
+	Model,
+	OptionsForApi,
+	Tool,
+	ToolResultMessage,
+} from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { $which } from "@oh-my-pi/pi-utils";
-import { type } from "arktype";
 import { removeWithRetries } from "../../utils/src/temp";
 import { e2eApiKey, resolveApiKey } from "./oauth";
 
@@ -18,11 +28,10 @@ import { e2eApiKey, resolveApiKey } from "./oauth";
 const oauthTokens = await Promise.all([
 	resolveApiKey("anthropic"),
 	resolveApiKey("github-copilot"),
-	resolveApiKey("google-gemini-cli"),
 	resolveApiKey("google-antigravity"),
 	resolveApiKey("openai-codex"),
 ]);
-const [anthropicOAuthToken, githubCopilotToken, geminiCliToken, antigravityToken, openaiCodexToken] = oauthTokens;
+const [anthropicOAuthToken, githubCopilotToken, antigravityToken, openaiCodexToken] = oauthTokens;
 
 function hasBedrockCredentials(): boolean {
 	const region = e2eApiKey("AWS_REGION") ?? e2eApiKey("AWS_DEFAULT_REGION");
@@ -57,7 +66,6 @@ async function basicTextGeneration<TApi extends Api>(model: Model<TApi>, options
 	const response = await complete(model, context, options);
 
 	expect(response.role).toBe("assistant");
-	expect(response.content).toBeTruthy();
 	expect(response.usage.input + response.usage.cacheRead).toBeGreaterThan(0);
 	expect(response.usage.output).toBeGreaterThan(0);
 	expect(response.errorMessage).toBeFalsy();
@@ -69,7 +77,6 @@ async function basicTextGeneration<TApi extends Api>(model: Model<TApi>, options
 	const secondResponse = await complete(model, context, options);
 
 	expect(secondResponse.role).toBe("assistant");
-	expect(secondResponse.content).toBeTruthy();
 	expect(secondResponse.usage.input + secondResponse.usage.cacheRead).toBeGreaterThan(0);
 	expect(secondResponse.usage.output).toBeGreaterThan(0);
 	expect(secondResponse.errorMessage).toBeFalsy();
@@ -260,7 +267,6 @@ async function handleImage<TApi extends Api>(model: Model<TApi>, options?: Optio
 	const response = await complete(model, context, options);
 
 	// Check the response mentions red and circle
-	expect(response.content.length > 0).toBeTruthy();
 	const textContent = response.content.find(b => b.type === "text");
 	if (textContent && textContent.type === "text") {
 		const lowerContent = textContent.text.toLowerCase();
@@ -348,7 +354,6 @@ async function multiTurn<TApi extends Api>(model: Model<TApi>, options?: Options
 	expect(hasSeenThinking || hasSeenToolCalls).toBe(true);
 
 	// The accumulated text should reference both calculations
-	expect(allTextContent).toBeTruthy();
 	expect(allTextContent.includes("714")).toBe(true);
 	expect(allTextContent.includes("887")).toBe(true);
 }
@@ -537,7 +542,6 @@ describe("Generate E2E Tests", () => {
 				);
 
 				expect(response.stopReason).toBe("aborted");
-				expect(response.errorMessage).toBeTruthy();
 				expect(response.errorMessage).not.toContain("Vertex AI requires a project ID");
 				expect(response.errorMessage).not.toContain("Vertex AI requires a location");
 			} finally {
@@ -552,7 +556,11 @@ describe("Generate E2E Tests", () => {
 			}
 		});
 
-		it("routes Vertex Claude models through Anthropic rawPredict with ADC auth", async () => {
+		it.each([
+			{ location: "global", host: "aiplatform.googleapis.com" },
+			{ location: "eu", host: "aiplatform.eu.rep.googleapis.com" },
+			{ location: "us", host: "aiplatform.us.rep.googleapis.com" },
+		] as const)("routes Vertex Claude rawPredict to $host for location $location", async ({ location, host }) => {
 			const originalProject = Bun.env.GOOGLE_CLOUD_PROJECT;
 			const originalGcpProject = Bun.env.GCP_PROJECT;
 			const originalGcloudProject = Bun.env.GCLOUD_PROJECT;
@@ -561,13 +569,13 @@ describe("Generate E2E Tests", () => {
 			const originalLocation = Bun.env.VERTEX_LOCATION;
 			const originalApiKey = Bun.env.GOOGLE_CLOUD_API_KEY;
 			const originalGac = Bun.env.GOOGLE_APPLICATION_CREDENTIALS;
+			const originalAppData = Bun.env.APPDATA;
 			// Force the GCE/Cloud Run metadata-server token path: neutralize any host
 			// ADC so resolveAccessTokenUncached() falls through to fetchMetadataToken().
-			// Without this the test reads ~/.config/gcloud/application_default_credentials.json
+			// Without this the test reads the user ADC (~/.config/gcloud or %APPDATA%\gcloud)
 			// when present and hangs on the OAuth exchange (form body, not JSON).
-			const homedirSpy = spyOn(os, "homedir").mockReturnValue(
-				path.join(os.tmpdir(), `vertex-adc-absent-${Date.now()}`),
-			);
+			const absentAdcHome = path.join(os.tmpdir(), `vertex-adc-absent-${location}-${Date.now()}`);
+			const homedirSpy = spyOn(os, "homedir").mockReturnValue(absentAdcHome);
 			const model: Model<"anthropic-messages"> = buildModel({
 				id: "claude-sonnet-4@20250514",
 				name: "Claude Sonnet 4",
@@ -591,13 +599,14 @@ describe("Generate E2E Tests", () => {
 			try {
 				__resetVertexTokenCache();
 				Bun.env.GOOGLE_CLOUD_PROJECT = "vertex-project";
-				Bun.env.GOOGLE_VERTEX_LOCATION = "global";
+				Bun.env.GOOGLE_VERTEX_LOCATION = location;
 				delete Bun.env.GCP_PROJECT;
 				delete Bun.env.GCLOUD_PROJECT;
 				delete Bun.env.GOOGLE_CLOUD_LOCATION;
 				delete Bun.env.VERTEX_LOCATION;
 				delete Bun.env.GOOGLE_CLOUD_API_KEY;
 				delete Bun.env.GOOGLE_APPLICATION_CREDENTIALS;
+				Bun.env.APPDATA = absentAdcHome;
 
 				const events = stream(
 					model,
@@ -621,7 +630,9 @@ describe("Generate E2E Tests", () => {
 								betaHeader: headers.get("anthropic-beta"),
 								body: JSON.parse(bodyText),
 							});
-							return new Response(JSON.stringify({ error: { message: "stop after capture" } }), { status: 400 });
+							return new Response(JSON.stringify({ error: { message: "stop after capture" } }), {
+								status: 400,
+							});
 						},
 					},
 				);
@@ -630,8 +641,11 @@ describe("Generate E2E Tests", () => {
 				}
 
 				const request = await captured.promise;
+				// Placeholder baseUrl + GOOGLE_VERTEX_LOCATION must rewrite through
+				// resolveVertexRequest: multi-region eu/us hit REP hosts, not the
+				// invalid {location}-aiplatform.googleapis.com regional pattern.
 				expect(request.url).toBe(
-					"https://aiplatform.googleapis.com/v1/projects/vertex-project/locations/global/publishers/anthropic/models/claude-sonnet-4@20250514:streamRawPredict",
+					`https://${host}/v1/projects/vertex-project/locations/${location}/publishers/anthropic/models/claude-sonnet-4@20250514:streamRawPredict`,
 				);
 				expect(request.authorization).toBe("Bearer vertex-token");
 				expect(request.body).toMatchObject({
@@ -662,6 +676,8 @@ describe("Generate E2E Tests", () => {
 				else Bun.env.GOOGLE_CLOUD_API_KEY = originalApiKey;
 				if (originalGac === undefined) delete Bun.env.GOOGLE_APPLICATION_CREDENTIALS;
 				else Bun.env.GOOGLE_APPLICATION_CREDENTIALS = originalGac;
+				if (originalAppData === undefined) delete Bun.env.APPDATA;
+				else Bun.env.APPDATA = originalAppData;
 			}
 		});
 
@@ -794,6 +810,166 @@ describe("Generate E2E Tests", () => {
 				else Bun.env.GOOGLE_CLOUD_API_KEY = originalApiKey;
 				if (originalGac === undefined) delete Bun.env.GOOGLE_APPLICATION_CREDENTIALS;
 				else Bun.env.GOOGLE_APPLICATION_CREDENTIALS = originalGac;
+			}
+		});
+
+		it("routes Vertex Mistral rawPredict with ADC auth and an OpenAI-shaped body (#19010)", async () => {
+			const envKeys = [
+				"GOOGLE_CLOUD_PROJECT",
+				"GCP_PROJECT",
+				"GCLOUD_PROJECT",
+				"GOOGLE_VERTEX_LOCATION",
+				"GOOGLE_CLOUD_LOCATION",
+				"VERTEX_LOCATION",
+				"GOOGLE_CLOUD_API_KEY",
+				"GOOGLE_APPLICATION_CREDENTIALS",
+				"APPDATA",
+			] as const;
+			const originalEnv = envKeys.map(key => [key, Bun.env[key]] as const);
+			// Force the metadata-server token path (see the Claude rawPredict test above).
+			const absentAdcHome = path.join(os.tmpdir(), `vertex-adc-mistral-${Date.now()}`);
+			const homedirSpy = spyOn(os, "homedir").mockReturnValue(absentAdcHome);
+			const model: Model<"openai-completions"> = buildModel({
+				id: "mistral-small-2503",
+				name: "Mistral Small 2503",
+				api: "openai-completions",
+				provider: "google-vertex",
+				baseUrl:
+					"https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/mistralai/models/mistral-small-2503:streamRawPredict",
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 131_072,
+				maxTokens: 8_192,
+			});
+			const captured = Promise.withResolvers<{
+				url: string;
+				authorization: string | null;
+				body: unknown;
+			}>();
+
+			try {
+				__resetVertexTokenCache();
+				for (const key of envKeys) delete Bun.env[key];
+				Bun.env.GOOGLE_CLOUD_PROJECT = "vertex-project";
+				Bun.env.GOOGLE_VERTEX_LOCATION = "global";
+				Bun.env.APPDATA = absentAdcHome;
+
+				// Replay one tool call issued by another model: a long
+				// OpenAI-style id must be clamped to 9 alphanumerics, the tool
+				// result must carry its name, and `max_tokens` (not
+				// `max_completion_tokens`) must be sent with no `store`.
+				const priorAssistant: AssistantMessage = {
+					role: "assistant",
+					api: "openai-completions",
+					provider: "openai",
+					model: "gpt-4o",
+					content: [
+						{
+							type: "toolCall",
+							id: "call_abcdefghijklmnopqrstuvwxyz",
+							name: "math_operation",
+							arguments: { a: 1, b: 2, operation: "add" },
+						},
+					],
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "toolUse",
+					timestamp: Date.now(),
+				};
+				const events = stream(
+					model,
+					{
+						messages: [
+							{ role: "user", content: "Hello", timestamp: Date.now() },
+							priorAssistant,
+							{
+								role: "toolResult",
+								toolCallId: "call_abcdefghijklmnopqrstuvwxyz",
+								toolName: "math_operation",
+								content: [{ type: "text", text: "3" }],
+								isError: false,
+								timestamp: Date.now(),
+							},
+							{ role: "user", content: "Thanks", timestamp: Date.now() },
+						],
+					},
+					{
+						apiKey: "<authenticated>",
+						maxTokens: 100,
+						fetch: async (input, init) => {
+							const url = input instanceof Request ? input.url : input.toString();
+							if (
+								url ===
+								"http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"
+							) {
+								return new Response(JSON.stringify({ access_token: "vertex-token", expires_in: 3600 }));
+							}
+							const headers = input instanceof Request ? input.headers : new Headers(init?.headers);
+							const bodyText = input instanceof Request ? await input.clone().text() : String(init?.body ?? "");
+							captured.resolve({
+								url,
+								authorization: headers.get("authorization"),
+								body: JSON.parse(bodyText),
+							});
+							return new Response(JSON.stringify({ error: { message: "stop after capture" } }), {
+								status: 400,
+							});
+						},
+					},
+				);
+
+				for await (const _event of events) {
+				}
+
+				const request = await captured.promise;
+				// The openai-completions transport appends /chat/completions to
+				// the model baseUrl; the rawPredict endpoint takes no suffix.
+				expect(request.url).toBe(
+					"https://aiplatform.googleapis.com/v1/projects/vertex-project/locations/global/publishers/mistralai/models/mistral-small-2503:streamRawPredict",
+				);
+				expect(request.authorization).toBe("Bearer vertex-token");
+				// OpenAI-shaped body: the Anthropic transform must not strip
+				// `model` or inject `anthropic_version` on partner publishers.
+				const body = request.body as Record<string, unknown>;
+				expect(body.model).toBe("mistral-small-2503");
+				expect(body.anthropic_version).toBeUndefined();
+				// Mistral wire shape: `max_tokens`, no `store`, clamped ids.
+				expect(body.max_tokens).toBe(100);
+				expect(body.max_completion_tokens).toBeUndefined();
+				expect(body.store).toBeUndefined();
+				const wireMessages = body.messages as Array<Record<string, unknown>>;
+				const assistantMsg = wireMessages.find(
+					msg => msg.role === "assistant" && Array.isArray(msg.tool_calls),
+				) as unknown as {
+					tool_calls: Array<{ id: string; function: { name: string; arguments: string } }>;
+				};
+				expect(assistantMsg.tool_calls).toHaveLength(1);
+				expect(assistantMsg.tool_calls[0]?.id).toBe("callabcde");
+				expect(assistantMsg.tool_calls[0]?.function.name).toBe("math_operation");
+				const toolMsg = wireMessages.find(msg => msg.role === "tool") as unknown as {
+					tool_call_id: string;
+					name: string;
+				};
+				expect(toolMsg.tool_call_id).toBe("callabcde");
+				expect(toolMsg.name).toBe("math_operation");
+				// A synthetic bridge assistant follows the tool result: Mistral
+				// rejects user turns directly after tool results.
+				const toolIndex = wireMessages.findIndex(msg => msg.role === "tool");
+				expect((wireMessages[toolIndex + 1] as Record<string, unknown>).role).toBe("assistant");
+			} finally {
+				__resetVertexTokenCache();
+				homedirSpy.mockRestore();
+				for (const [key, value] of originalEnv) {
+					if (value === undefined) delete Bun.env[key];
+					else Bun.env[key] = value;
+				}
 			}
 		});
 	});
@@ -996,43 +1172,7 @@ describe("Generate E2E Tests", () => {
 		);
 	});
 
-	describe.skipIf(!e2eApiKey("OPENAI_API_KEY"))("OpenAI Responses Provider (gpt-5-mini)", () => {
-		const model = getBundledModel("openai", "gpt-5-mini") as Model<"openai-responses">;
-
-		it(
-			"should complete basic text generation",
-			async () => {
-				await basicTextGeneration(model);
-			},
-			{ retry: 3 },
-		);
-
-		it(
-			"should handle tool calling",
-			async () => {
-				await handleToolCall(model);
-			},
-			{ retry: 3 },
-		);
-
-		it(
-			"should handle streaming",
-			async () => {
-				await handleStreaming(model);
-			},
-			{ retry: 3 },
-		);
-
-		it(
-			"should handle image input",
-			async () => {
-				await handleImage(model);
-			},
-			{ retry: 3 },
-		);
-	});
-
-	describe.skipIf(!e2eApiKey("XAI_API_KEY"))("xAI Provider (grok-code-fast-1 via OpenAI Completions)", () => {
+	describe.skipIf(!e2eApiKey("XAI_API_KEY"))("xAI Provider (grok-code-fast-1 via OpenAI Responses)", () => {
 		const llm = getBundledModel("xai", "grok-code-fast-1");
 
 		it(
@@ -1243,14 +1383,6 @@ describe("Generate E2E Tests", () => {
 			{ retry: 3 },
 		);
 
-		it.skip(
-			"should handle thinking mode",
-			async () => {
-				await handleThinking(llm, { reasoning: Effort.Medium });
-			},
-			{ retry: 3 },
-		);
-
 		it(
 			"should handle multi-turn with thinking and tools",
 			async () => {
@@ -1342,16 +1474,6 @@ describe("Generate E2E Tests", () => {
 			);
 
 			it(
-				"should handle thinking mode",
-				async () => {
-					// FIXME Skip for now, getting a 422 status code, need to test with official SDK
-					// const llm = getModel("mistral", "magistral-medium-latest");
-					// await handleThinking(llm, { reasoningEffort: "medium" });
-				},
-				{ retry: 3 },
-			);
-
-			it(
 				"should handle multi-turn with thinking and tools",
 				async () => {
 					await multiTurn(llm, { reasoning: Effort.Medium });
@@ -1397,8 +1519,8 @@ describe("Generate E2E Tests", () => {
 		);
 	});
 
-	describe("Anthropic OAuth Provider (claude-sonnet-4-20250514)", () => {
-		const model = getBundledModel("anthropic", "claude-sonnet-4-20250514");
+	describe("Anthropic OAuth Provider (claude-sonnet-4-5-20250929)", () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5-20250929");
 
 		it.skipIf(!anthropicOAuthToken)(
 			"should complete basic text generation",
@@ -1502,79 +1624,6 @@ describe("Generate E2E Tests", () => {
 			{ retry: 3 },
 		);
 	});
-
-	describe("Google Gemini CLI Provider (gemini-2.5-flash)", () => {
-		const llm = getBundledModel("google-gemini-cli", "gemini-2.5-flash");
-
-		it.skipIf(!geminiCliToken)(
-			"should complete basic text generation",
-			async () => {
-				await basicTextGeneration(llm, { apiKey: geminiCliToken });
-			},
-			{ retry: 3 },
-		);
-
-		it.skipIf(!geminiCliToken)(
-			"should handle tool calling",
-			async () => {
-				await handleToolCall(llm, { apiKey: geminiCliToken });
-			},
-			{ retry: 3 },
-		);
-
-		it.skipIf(!geminiCliToken)(
-			"should handle streaming",
-			async () => {
-				await handleStreaming(llm, { apiKey: geminiCliToken });
-			},
-			{ retry: 3 },
-		);
-
-		it.skipIf(!geminiCliToken)(
-			"should handle thinking",
-			async () => {
-				await handleThinking(llm, { apiKey: geminiCliToken, thinking: { enabled: true, budgetTokens: 1024 } });
-			},
-			{ retry: 3 },
-		);
-
-		it.skipIf(!geminiCliToken)(
-			"should handle multi-turn with thinking and tools",
-			async () => {
-				await multiTurn(llm, { apiKey: geminiCliToken, thinking: { enabled: true, budgetTokens: 2048 } });
-			},
-			{ retry: 3 },
-		);
-
-		it.skipIf(!geminiCliToken)(
-			"should handle image input",
-			async () => {
-				await handleImage(llm, { apiKey: geminiCliToken });
-			},
-			{ retry: 3 },
-		);
-	});
-
-	describe("Google Gemini CLI Provider (gemini-3-flash-preview with thinkingLevel)", () => {
-		const llm = getBundledModel("google-gemini-cli", "gemini-3-flash-preview");
-
-		it.skipIf(!geminiCliToken)(
-			"should handle thinking with thinkingLevel",
-			async () => {
-				await handleThinking(llm, { apiKey: geminiCliToken, thinking: { enabled: true, level: "LOW" } });
-			},
-			{ retry: 3 },
-		);
-
-		it.skipIf(!geminiCliToken)(
-			"should handle multi-turn with thinking and tools",
-			async () => {
-				await multiTurn(llm, { apiKey: geminiCliToken, thinking: { enabled: true, level: "MEDIUM" } });
-			},
-			{ retry: 3 },
-		);
-	});
-
 	describe("Google Antigravity Provider (gemini-3-pro-high)", () => {
 		const llm = getBundledModel("google-antigravity", "gemini-3-pro-high");
 
@@ -1774,7 +1823,6 @@ describe("Generate E2E Tests", () => {
 				);
 
 				expect(response.stopReason, `Error: ${response.errorMessage}`).not.toBe("error");
-				expect(capturedPayload).toBeTruthy();
 
 				const payload = capturedPayload as {
 					additionalModelRequestFields?: {

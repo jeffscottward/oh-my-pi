@@ -1,18 +1,17 @@
-import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
-import * as path from "node:path";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { ReadToolGroupComponent } from "@oh-my-pi/pi-coding-agent/modes/components/read-tool-group";
-import { ToolExecutionComponent } from "@oh-my-pi/pi-coding-agent/modes/components/tool-execution";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
-import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { buildSessionContext } from "@oh-my-pi/pi-coding-agent/session/session-context";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import type { PendingTool } from "../src/modes/types";
+import { initTheme } from "../src/ui/theme/service";
+import { createModeTerminal, transcriptText } from "./helpers/mode-terminal";
 
 /**
  * Regression for issue #6516 — a tool call renders twice in the transcript.
@@ -38,7 +37,7 @@ const usage = {
 };
 
 function countCommand(mode: InteractiveMode): number {
-	const rendered = Bun.stripANSI(mode.chatContainer.render(120).join("\n"));
+	const rendered = transcriptText(mode.shell);
 	let count = 0;
 	let index = 0;
 	while (true) {
@@ -51,29 +50,22 @@ function countCommand(mode: InteractiveMode): number {
 
 describe("issue #6516 — tool output appears twice", () => {
 	let authStorage: AuthStorage;
+	let modelRegistry: ModelRegistry;
 	let mode: InteractiveMode;
 	let session: AgentSession;
 	let tempDir: TempDir;
-	const created: ToolExecutionComponent[] = [];
-
-	beforeAll(() => {
+	let settingsDir: TempDir;
+	beforeAll(async () => {
 		initTheme();
+		resetSettingsForTest();
+		settingsDir = TempDir.createSync("@pi-issue-6516-settings-");
+		await Settings.init({ inMemory: true, cwd: settingsDir.path() });
+		authStorage = await AuthStorage.create(":memory:");
+		modelRegistry = new ModelRegistry(authStorage);
 	});
 
-	beforeEach(async () => {
-		vi.spyOn(process.stdout, "write").mockReturnValue(true);
-		vi.spyOn(process.stdin, "resume").mockReturnValue(process.stdin);
-		vi.spyOn(process.stdin, "pause").mockReturnValue(process.stdin);
-		vi.spyOn(process.stdin, "setEncoding").mockReturnValue(process.stdin);
-		if (typeof process.stdin.setRawMode === "function") {
-			vi.spyOn(process.stdin, "setRawMode").mockReturnValue(process.stdin);
-		}
-
-		resetSettingsForTest();
+	beforeEach(() => {
 		tempDir = TempDir.createSync("@pi-issue-6516-");
-		await Settings.init({ inMemory: true, cwd: tempDir.path() });
-		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
-		const modelRegistry = new ModelRegistry(authStorage);
 		const model = modelRegistry.find("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected claude-sonnet-4-5 test model");
 
@@ -83,34 +75,48 @@ describe("issue #6516 — tool output appears twice", () => {
 			settings: Settings.isolated(),
 			modelRegistry,
 		});
-		mode = new InteractiveMode(session, "test");
-		mode.ui.requestRender = vi.fn();
+		mode = new InteractiveMode(
+			session,
+			"test",
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			createModeTerminal().frame,
+		);
 	});
 
 	afterEach(async () => {
-		for (const component of created.splice(0)) component.stopAnimation();
 		mode?.stop();
 		vi.restoreAllMocks();
 		await session?.dispose();
-		authStorage?.close();
 		tempDir?.removeSync();
+	});
+
+	afterAll(() => {
+		authStorage.close();
+		settingsDir.removeSync();
 		resetSettingsForTest();
 	});
 
-	function addLiveBash(): ToolExecutionComponent {
-		const component = new ToolExecutionComponent(
-			"bash",
-			{ command: CMD },
-			{},
-			undefined,
-			mode.ui,
-			tempDir.path(),
-			"call-1",
-		);
-		created.push(component);
-		mode.chatContainer.addChild(component);
-		mode.pendingTools.set("call-1", component);
-		return component;
+	function addLiveBash(): PendingTool {
+		const tool = mode.presentToolCall({
+			name: "bash",
+			args: { command: CMD },
+			tool: undefined,
+			id: "call-1",
+			cwd: tempDir.path(),
+		});
+		mode.pendingTools.set("call-1", tool);
+		return tool;
+	}
+
+	/** The transcript's tool entries (cards and read groups). */
+	function toolEntries(): PendingTool[] {
+		return mode.shell.transcript.blocks().flatMap(block => {
+			const entry = mode.transcriptEntry(block);
+			return entry?.kind === "tool" ? [entry.tool] : [];
+		});
 	}
 
 	it("renders a completed tool once when its component lingers in pendingTools during a rebuild", () => {
@@ -260,22 +266,18 @@ describe("issue #6516 — tool output appears twice", () => {
 			buildSessionContext(entries, undefined, undefined, { transcript: true }),
 		);
 
-		const live = new ToolExecutionComponent(
-			"task",
-			{ description: "run", prompt: "go" },
-			{},
-			undefined,
-			mode.ui,
-			tempDir.path(),
-			"call-1",
-		);
+		const live = mode.presentToolCall({
+			name: "task",
+			args: { description: "run", prompt: "go" },
+			tool: undefined,
+			id: "call-1",
+			cwd: tempDir.path(),
+		});
 		live.updateResult(
 			{ content: [{ type: "text", text: "running…" }], details: runningDetails, isError: false },
 			true,
 			"call-1",
 		);
-		created.push(live);
-		mode.chatContainer.addChild(live);
 		mode.pendingTools.set("call-1", live);
 
 		mode.rebuildChatFromMessages();
@@ -284,7 +286,7 @@ describe("issue #6516 — tool output appears twice", () => {
 		// tool_execution_update/_end settles it instead of stranding on "running",
 		// without also leaving the replayed snapshot on screen.
 		expect(mode.pendingTools.get("call-1")).toBe(live);
-		expect(mode.chatContainer.children.filter(child => child instanceof ToolExecutionComponent)).toHaveLength(1);
+		expect(toolEntries()).toHaveLength(1);
 	});
 
 	it("keeps a shared read group attached while a sibling read is still in flight", () => {
@@ -338,10 +340,9 @@ describe("issue #6516 — tool output appears twice", () => {
 
 		// One group component shared by both read ids, exactly as the live path
 		// wires it (ui-helpers sets the same ReadToolGroupComponent per read id).
-		const group = new ReadToolGroupComponent();
+		const group = mode.presentReadGroup();
 		group.updateArgs({ path: "a.txt" }, "call-1");
 		group.updateArgs({ path: "b.txt" }, "call-2");
-		mode.chatContainer.addChild(group);
 		mode.pendingTools.set("call-1", group);
 		mode.pendingTools.set("call-2", group);
 
@@ -352,7 +353,7 @@ describe("issue #6516 — tool output appears twice", () => {
 		// display, while replaying call-1 would duplicate the group.
 		expect(mode.pendingTools.get("call-1")).toBeUndefined();
 		expect(mode.pendingTools.get("call-2")).toBe(group);
-		expect(mode.chatContainer.children.includes(group)).toBe(true);
-		expect(mode.chatContainer.children.filter(child => child instanceof ReadToolGroupComponent)).toHaveLength(1);
+		expect(mode.shell.transcript.blocks().includes(group.block)).toBe(true);
+		expect(toolEntries().filter(tool => tool.group !== undefined)).toHaveLength(1);
 	});
 });

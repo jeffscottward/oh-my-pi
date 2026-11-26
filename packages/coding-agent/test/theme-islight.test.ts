@@ -3,27 +3,27 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { generateThemeVars } from "@oh-my-pi/pi-coding-agent/export/html";
-import { defaultThemes } from "@oh-my-pi/pi-coding-agent/modes/theme/defaults";
-import { getResolvedThemeColors, getThemeByName, isLightTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { sessionAccentHex } from "@oh-my-pi/pi-coding-agent/ui/status/accent";
+import { getResolvedThemeColors, getThemeByName, isLightTheme } from "@oh-my-pi/pi-coding-agent/ui/theme/service";
+import { builtinThemes } from "@oh-my-pi/pi-tui/theme/loader";
 import { getAgentDir, getCustomThemesDir, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
 
-describe("Theme.isLight", () => {
+describe("theme lightness", () => {
 	it("classifies built-in themes by their status-line surface", async () => {
 		// porcelain styles a dark chat bubble (userMessageBg) on an otherwise-light
 		// theme with a light status line. Session accents render on the status line,
 		// so it must read as light — classifying by userMessageBg got this wrong.
-		expect((await getThemeByName("porcelain"))?.isLight).toBe(true);
-		expect((await getThemeByName("light-catppuccin"))?.isLight).toBe(true);
-		expect((await getThemeByName("dark-catppuccin"))?.isLight).toBe(false);
+		expect((await getThemeByName("porcelain"))?.dark).toBe(false);
+		expect((await getThemeByName("light-catppuccin"))?.dark).toBe(false);
+		expect((await getThemeByName("dark-catppuccin"))?.dark).toBe(true);
 	});
 
-	it("exposes the status-line surface luminance for accent sizing", async () => {
+	it("sizes session accents against a light status-line surface", async () => {
 		const light = await getThemeByName("light-catppuccin");
 		const dark = await getThemeByName("dark-catppuccin");
-		// Light themes hand the real surface luminance to getSessionAccentHex...
-		expect(light?.accentSurfaceLuminance).toBeGreaterThan(0.5);
-		// ...dark themes pass undefined so accents stay vivid.
-		expect(dark?.accentSurfaceLuminance).toBeUndefined();
+		if (!light || !dark) throw new Error("Catppuccin themes are unavailable");
+		// The same title picks a different accent once the light surface luminance applies.
+		expect(sessionAccentHex(light, "session")).not.toBe(sessionAccentHex(dark, "session"));
 	});
 });
 
@@ -83,7 +83,7 @@ describe("getResolvedThemeColors HTML export defaults", () => {
 		tempAgentDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-theme-export-"));
 		setAgentDir(tempAgentDir);
 
-		const { export: _ignoredExport, ...themeWithoutExport } = defaultThemes.porcelain;
+		const { export: _ignoredExport, ...themeWithoutExport } = builtinThemes().porcelain;
 		const customThemeName = "light-status-dark-export-derived";
 		await Bun.write(
 			path.join(getCustomThemesDir(), `${customThemeName}.json`),

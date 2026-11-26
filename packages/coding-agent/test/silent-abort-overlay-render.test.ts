@@ -3,23 +3,24 @@
  *
  * Codex review flagged that the old observer overlay rendered `errorMessage`
  * without filtering the silent-abort sentinel; the hub chat view now renders
- * assistant messages through AssistantMessageComponent. This test exercises the
+ * assistant messages through the transcript's assistant blocks. This test exercises the
  * full chat-rebuild path through a real JSONL session file and an isolated
  * agent registry.
  */
-import { afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { AgentTranscriptViewer } from "@oh-my-pi/pi-coding-agent/modes/components/agent-transcript-viewer";
-import type { ObservableSession } from "@oh-my-pi/pi-coding-agent/modes/session-observer-registry";
-import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { agentTranscriptSource } from "@oh-my-pi/pi-coding-agent/modes/agent-hub-runtime";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { SILENT_ABORT_MARKER } from "@oh-my-pi/pi-coding-agent/session/messages";
-import type { TUI } from "@oh-my-pi/pi-tui";
+import type { ObservableSession } from "@oh-my-pi/pi-coding-agent/task/session-observer-registry";
 import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
+import { AgentTranscriptViewer } from "../src/ui/overlays/panels/agent-transcript-viewer";
+import { AgentTranscriptViewerModel } from "../src/ui/overlays/panels/agent-transcript-viewer-model";
+import { type LayerTerminal, mountLayer } from "./helpers/layer-terminal";
 
 const SESSION_ID = "test-session-1";
 
@@ -33,13 +34,14 @@ function makeJsonlSessionFile(dirPath: string, entries: object[]): string {
 function makeSubagentRegistry(sessions: ObservableSession[]) {
 	return {
 		getSessions: () => sessions,
+		getSession: (id: string) => sessions.find(session => session.id === id),
 		onChange: () => () => {},
 		setMainSession: () => {},
 		getActiveSubagentCount: () => sessions.filter(s => s.status === "active").length,
-	} as unknown as import("@oh-my-pi/pi-coding-agent/modes/session-observer-registry").SessionObserverRegistry;
+	} as unknown as import("@oh-my-pi/pi-coding-agent/task/session-observer-registry").SessionObserverRegistry;
 }
 
-function makeViewer(sessionFile: string, observed: ObservableSession[]): AgentTranscriptViewer {
+function makeViewer(sessionFile: string, observed: ObservableSession[]): LayerTerminal {
 	const agents = new AgentRegistry();
 	agents.register({
 		id: SESSION_ID,
@@ -50,27 +52,32 @@ function makeViewer(sessionFile: string, observed: ObservableSession[]): AgentTr
 		sessionFile,
 		status: "parked",
 	});
-	const ui = { requestRender: () => {}, requestComponentRender: () => {} } as unknown as TUI;
-	return new AgentTranscriptViewer({
+	const model = new AgentTranscriptViewerModel({
+		transcript: agentTranscriptSource,
 		agentId: SESSION_ID,
 		registry: agents,
 		observers: makeSubagentRegistry(observed),
-		ui,
-		cwd: path.dirname(sessionFile),
+		terminalRows: () => 40,
 		expandKeys: ["ctrl+o"],
 		hubKeys: ["ctrl+s"],
-		requestRender: () => {},
 		onClose: () => {},
 		onHubClose: () => {},
 	});
+	const viewer = mountLayer(() => AgentTranscriptViewer({ model }), {
+		columns: 120,
+		rows: 40,
+	});
+	return {
+		...viewer,
+		dispose() {
+			viewer.dispose();
+			model.dispose();
+		},
+	};
 }
 
 describe("Agent hub silent-abort regression", () => {
 	let tmpDir: string;
-
-	beforeAll(() => {
-		initTheme();
-	});
 
 	beforeEach(async () => {
 		resetSettingsForTest();
@@ -85,7 +92,12 @@ describe("Agent hub silent-abort regression", () => {
 
 	it("renders no error line for silent-abort assistant messages with empty content", () => {
 		const sessionFile = makeJsonlSessionFile(tmpDir, [
-			{ type: "session", version: 3, id: SESSION_ID, timestamp: new Date().toISOString() },
+			{
+				type: "session",
+				version: 3,
+				id: SESSION_ID,
+				timestamp: new Date().toISOString(),
+			},
 			{
 				type: "message",
 				id: "msg-user-1",
@@ -112,7 +124,13 @@ describe("Agent hub silent-abort regression", () => {
 						cacheRead: 0,
 						cacheWrite: 0,
 						totalTokens: 0,
-						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						cost: {
+							input: 0,
+							output: 0,
+							cacheRead: 0,
+							cacheWrite: 0,
+							total: 0,
+						},
 					},
 					timestamp: Date.now(),
 				},
@@ -142,7 +160,12 @@ describe("Agent hub silent-abort regression", () => {
 
 	it("renders no error line for bit-classified silent aborts without marker text", () => {
 		const sessionFile = makeJsonlSessionFile(tmpDir, [
-			{ type: "session", version: 3, id: SESSION_ID, timestamp: new Date().toISOString() },
+			{
+				type: "session",
+				version: 3,
+				id: SESSION_ID,
+				timestamp: new Date().toISOString(),
+			},
 			{
 				type: "message",
 				id: "msg-user-bit",
@@ -169,7 +192,13 @@ describe("Agent hub silent-abort regression", () => {
 						cacheRead: 0,
 						cacheWrite: 0,
 						totalTokens: 0,
-						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						cost: {
+							input: 0,
+							output: 0,
+							cacheRead: 0,
+							cacheWrite: 0,
+							total: 0,
+						},
 					},
 					timestamp: Date.now(),
 				},
@@ -194,7 +223,12 @@ describe("Agent hub silent-abort regression", () => {
 
 	it("renders normal error messages with an Error: line", () => {
 		const sessionFile = makeJsonlSessionFile(tmpDir, [
-			{ type: "session", version: 3, id: SESSION_ID, timestamp: new Date().toISOString() },
+			{
+				type: "session",
+				version: 3,
+				id: SESSION_ID,
+				timestamp: new Date().toISOString(),
+			},
 			{
 				type: "message",
 				id: "msg-user-2",
@@ -221,7 +255,13 @@ describe("Agent hub silent-abort regression", () => {
 						cacheRead: 0,
 						cacheWrite: 0,
 						totalTokens: 0,
-						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						cost: {
+							input: 0,
+							output: 0,
+							cacheRead: 0,
+							cacheWrite: 0,
+							total: 0,
+						},
 					},
 					timestamp: Date.now(),
 				},

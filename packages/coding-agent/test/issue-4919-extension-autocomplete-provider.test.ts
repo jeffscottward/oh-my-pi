@@ -17,20 +17,23 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import { type Api, Effort, type Model } from "@oh-my-pi/pi-ai";
-import type { AutocompleteProvider } from "@oh-my-pi/pi-tui";
+import type { AutocompleteProvider } from "@oh-my-pi/pi-coding-agent/autocomplete/autocomplete";
 import { logger, TempDir } from "@oh-my-pi/pi-utils";
-import { type } from "arktype";
 import { ModelRegistry } from "../src/config/model-registry";
 import { resetSettingsForTest, Settings } from "../src/config/settings";
 import { loadExtensions } from "../src/extensibility/extensions/loader";
 import { ExtensionRunner } from "../src/extensibility/extensions/runner";
 import { InteractiveMode } from "../src/modes/interactive-mode";
-import { initTheme } from "../src/modes/theme/theme";
+import { initTheme } from "../src/ui/theme/service";
 import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
+
+import { cfgStartupQuiet } from "@oh-my-pi/pi-coding-agent/modes/settings";
+import { createModeTerminal } from "./helpers/mode-terminal";
 
 function makeTool(name: string): AgentTool {
 	return {
@@ -87,9 +90,9 @@ describe("extension autocomplete provider API (#4919)", () => {
 		originalHome = process.env.HOME;
 		process.env.HOME = tempDir.path();
 		await Settings.init({ inMemory: true, cwd: tempDir.path() });
-		Settings.instance.set("startup.quiet", true);
+		cfgStartupQuiet.set(Settings.instance, true);
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
-		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		authStorage.keys.setRuntime("anthropic", "test-key");
 		registry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
 		const resolved = registry.find("anthropic", "claude-sonnet-4-5");
 		if (!resolved) throw new Error("Expected anthropic model claude-sonnet-4-5 to exist");
@@ -135,7 +138,15 @@ describe("extension autocomplete provider API (#4919)", () => {
 			toolRegistry: new Map(tools.map(tool => [tool.name, tool])),
 			promptTemplates: [],
 		});
-		const createdMode = new InteractiveMode(created, "test");
+		const createdMode = new InteractiveMode(
+			created,
+			"test",
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			createModeTerminal().frame,
+		);
 		session = created;
 		mode = createdMode;
 		return { mode: createdMode, session: created };
@@ -143,8 +154,9 @@ describe("extension autocomplete provider API (#4919)", () => {
 
 	function captureAutocompleteProvider(target: InteractiveMode): { current: AutocompleteProvider | undefined } {
 		const slot: { current: AutocompleteProvider | undefined } = { current: undefined };
-		vi.spyOn(target.editor, "setAutocompleteProvider").mockImplementation(provider => {
-			slot.current = provider;
+		// The mode hands the composer its own provider (with inline hints); the composer's type is narrower.
+		vi.spyOn(target.composer, "setAutocomplete").mockImplementation(provider => {
+			slot.current = provider as AutocompleteProvider | undefined;
 		});
 		return slot;
 	}

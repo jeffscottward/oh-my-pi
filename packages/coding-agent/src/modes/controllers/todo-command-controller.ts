@@ -5,10 +5,15 @@ import {
 	markdownToPhases,
 	phasesToMarkdown,
 	resolveTodoMarkdownPath,
-	type TodoItem,
-	type TodoPhase,
-	USER_TODO_EDIT_CUSTOM_TYPE,
 } from "../../tools/todo";
+import type { TodoPhase } from "../../tools/details/todo";
+import {
+	findPhaseFuzzy,
+	findTaskFuzzy,
+	titleCaseSentence,
+	titleCaseWords,
+	tokenize,
+} from "../../slash-commands/helpers/todo";
 import { copyToClipboard } from "../../utils/clipboard";
 import { getEditorCommand, openInEditor } from "../../utils/external-editor";
 import type { InteractiveModeContext } from "../types";
@@ -18,6 +23,8 @@ const USAGE = [
 	"  /todo                              Show current todos",
 	"  /todo edit                         Open todos in $EDITOR",
 	"  /todo copy                         Copy todos as Markdown to clipboard",
+	"  /todo expand                       Show every phase and task in the HUD",
+	"  /todo collapse                     Restore the bounded HUD preview",
 	"  /todo export [<path>]              Write todos to file (default: TODO.md)",
 	"  /todo import [<path>]              Replace todos from file (default: TODO.md)",
 	"  /todo append [<phase>] <task...>   Append a task; phase fuzzy-matched or auto-created",
@@ -26,91 +33,6 @@ const USAGE = [
 	"  /todo drop   [<task|phase>]        Mark task/phase/all abandoned",
 	"  /todo rm     [<task|phase>]        Remove task/phase/all",
 ].join("\n");
-
-// =============================================================================
-// Argument tokenizer (respects double-quoted strings)
-// =============================================================================
-
-function tokenize(input: string): string[] {
-	const tokens: string[] = [];
-	let cur = "";
-	let inQuote = false;
-	for (let i = 0; i < input.length; i++) {
-		const ch = input[i];
-		if (ch === "\\" && i + 1 < input.length) {
-			cur += input[++i];
-			continue;
-		}
-		if (ch === '"') {
-			inQuote = !inQuote;
-			continue;
-		}
-		if (!inQuote && /\s/.test(ch)) {
-			if (cur) {
-				tokens.push(cur);
-				cur = "";
-			}
-			continue;
-		}
-		cur += ch;
-	}
-	if (cur) tokens.push(cur);
-	return tokens;
-}
-
-// =============================================================================
-// Name normalization
-// =============================================================================
-
-function titleCase(s: string): string {
-	return s
-		.split(/\s+/)
-		.filter(Boolean)
-		.map(word => word[0].toUpperCase() + word.slice(1))
-		.join(" ");
-}
-
-// =============================================================================
-// Fuzzy matching
-// =============================================================================
-
-function findPhaseFuzzy(phases: TodoPhase[], query: string): TodoPhase | undefined {
-	const q = query.trim().toLowerCase();
-	if (!q) return undefined;
-	// Exact name (case-insensitive)
-	const byName = phases.find(p => p.name.toLowerCase() === q);
-	if (byName) return byName;
-	// Substring (prefer prefix match)
-	const prefixMatches = phases.filter(p => p.name.toLowerCase().startsWith(q));
-	if (prefixMatches.length === 1) return prefixMatches[0];
-	const subMatches = phases.filter(p => p.name.toLowerCase().includes(q));
-	if (subMatches.length === 1) return subMatches[0];
-	return undefined;
-}
-
-function findTaskFuzzy(phases: TodoPhase[], query: string): { task: TodoItem; phase: TodoPhase } | undefined {
-	const q = query.trim().toLowerCase();
-	if (!q) return undefined;
-	// Exact content (case-insensitive)
-	for (const phase of phases) {
-		for (const task of phase.tasks) {
-			if (task.content.toLowerCase() === q) return { task, phase };
-		}
-	}
-	const matches: Array<{ task: TodoItem; phase: TodoPhase }> = [];
-	for (const phase of phases) {
-		for (const task of phase.tasks) {
-			if (task.content.toLowerCase().includes(q)) {
-				matches.push({ task, phase });
-			}
-		}
-	}
-	if (matches.length === 1) return matches[0];
-	// Prefer single in_progress/pending hit when ambiguous
-	const active = matches.filter(m => m.task.status === "in_progress" || m.task.status === "pending");
-	if (active.length === 1) return active[0];
-	return undefined;
-}
 
 // =============================================================================
 // Build system reminder
@@ -155,6 +77,12 @@ export class TodoCommandController {
 		const rest = spaceIdx === -1 ? "" : trimmed.slice(spaceIdx + 1).trim();
 
 		switch (verb) {
+			case "expand":
+				this.ctx.setTodoExpanded(true);
+				return;
+			case "collapse":
+				if (this.ctx.todoExpanded) this.ctx.toggleTodoExpansion();
+				return;
 			case "edit":
 				await this.#editInExternalEditor();
 				return;
@@ -279,7 +207,7 @@ export class TodoCommandController {
 		if (phaseName) {
 			targetPhase = findPhaseFuzzy(next, phaseName);
 			if (!targetPhase) {
-				targetPhase = { name: titleCase(phaseName), tasks: [] };
+				targetPhase = { name: titleCaseWords(phaseName), tasks: [] };
 				next.push(targetPhase);
 			}
 		} else if (next.length > 0) {
@@ -326,8 +254,10 @@ export class TodoCommandController {
 		const current = this.#currentPhases();
 		const trimmed = rest.trim();
 		if (!trimmed) {
-			// no-arg: apply to all
-			const { phases, errors } = applyOpsToPhases(current, [{ op }]);
+			// no-arg: apply to all. The tool refuses a bare done/drop, so every task is named.
+			const all = current.flatMap(phase => phase.tasks.map(task => task.content));
+			const { phases, errors } =
+				all.length > 0 ? applyOpsToPhases(current, [{ op, task: all }]) : { phases: current, errors: [] };
 			if (errors.length > 0) {
 				this.ctx.showError(errors.join("; "));
 				return;
@@ -410,16 +340,10 @@ export class TodoCommandController {
 		const initialMarkdown =
 			current.length > 0 ? phasesToMarkdown(current) : "# Todos\n- [ ] (replace this with your tasks)\n";
 
-		const fileHandle = await this.#openTtyHandle();
-		this.ctx.ui.stop();
 		try {
-			const stdio: [number | "inherit", number | "inherit", number | "inherit"] = fileHandle
-				? [fileHandle.fd, fileHandle.fd, fileHandle.fd]
-				: ["inherit", "inherit", "inherit"];
-			const result = await openInEditor(editorCmd, initialMarkdown, {
-				extension: ".todo.md",
-				stdio,
-			});
+			const result = await this.ctx.suspend(() =>
+				openInEditor(editorCmd, initialMarkdown, { extension: ".todo.md" }),
+			);
 			if (result === null) {
 				this.ctx.showWarning("Editor exited without saving; todos unchanged.");
 				return;
@@ -436,33 +360,13 @@ export class TodoCommandController {
 			this.ctx.showWarning(
 				`Failed to open external editor: ${error instanceof Error ? error.message : String(error)}`,
 			);
-		} finally {
-			if (fileHandle) {
-				await fileHandle.close().catch(() => {});
-			}
-			this.ctx.ui.start();
-			this.ctx.ui.requestRender();
-		}
-	}
-
-	async #openTtyHandle(): Promise<fs.FileHandle | null> {
-		const stdinPath = (process.stdin as unknown as { path?: string }).path;
-		const candidate = typeof stdinPath === "string" ? stdinPath : undefined;
-		if (!candidate) return null;
-		try {
-			return await fs.open(candidate, "r+");
-		} catch {
-			return null;
 		}
 	}
 
 	#commit(nextPhases: TodoPhase[], action: string, opts?: { removed?: boolean }): void {
-		// 1. In-memory + UI state
-		this.ctx.session.setTodoPhases(nextPhases);
+		// Commit first so HUD visibility binds to the new canonical source.
+		this.ctx.session.commitTodoPhases(nextPhases);
 		this.ctx.setTodos(nextPhases);
-
-		// 2. Persist for reload survival via custom session entry.
-		this.ctx.sessionManager.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, { phases: nextPhases });
 
 		// 3. Inject system reminder so the agent learns about the change next turn.
 		//    Removals carry explicit intent so the agent does not rebuild the
@@ -477,11 +381,4 @@ export class TodoCommandController {
 		this.ctx.agent.appendMessage(message);
 		this.ctx.sessionManager.appendMessage(message);
 	}
-}
-
-/** Capitalize first letter only — keeps acronyms / casing in the rest of the sentence intact. */
-function titleCaseSentence(s: string): string {
-	const trimmed = s.trim();
-	if (!trimmed) return trimmed;
-	return trimmed[0].toUpperCase() + trimmed.slice(1);
 }

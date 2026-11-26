@@ -1,6 +1,9 @@
-// biome-ignore-all lint/suspicious/noTemplateCurlyInString: sample source-code strings (read fixtures) intentionally contain literal ${...}.
+// oxlint-disable no-template-curly-in-string -- sample source-code strings intentionally contain literal placeholders.
 // Gallery fixtures for the filesystem tools (read, write, glob).
-import { ReadToolGroupComponent } from "../../modes/components/read-tool-group";
+import type { Usage } from "@oh-my-pi/pi-ai";
+import { printRows } from "../../ui/print-rows";
+import "../../ui/styles/transcript/read-group";
+import { ReadGroup, ReadGroupBlock } from "../../ui/transcript/read-group";
 import type { GalleryFixture, GalleryFixtureState, GalleryResult } from "./types";
 
 const readSnippet = [
@@ -47,17 +50,27 @@ const groupedReadDelimitedPath = groupedReadTargets.join(",");
 const groupedReadRepeatedFile = "packages/coding-agent/src/task/render.ts";
 const groupedReadRepeatedRanges = `${groupedReadRepeatedFile}:507-605,1070-1194,1210-1240,1270-1274`;
 
+const GROUPED_READ_USAGE: Usage = {
+	input: 2400,
+	output: 113,
+	cacheRead: 103_000,
+	cacheWrite: 0,
+	totalTokens: 105_513,
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+};
+
 function textResult(text: string, details?: unknown, isError?: boolean): GalleryResult {
 	return { content: [{ type: "text", text }], details, isError };
 }
 
-function addGroupedReadArgs(component: ReadToolGroupComponent): void {
+function addGroupedReadArgs(component: ReadGroup): void {
 	component.updateArgs({ path: groupedReadDelimitedPath }, "read-delimited");
 	component.updateArgs({ path: groupedReadRepeatedRanges }, "read-ranges");
 }
 
 function renderReadGroupFixtureState(state: GalleryFixtureState, width: number, expanded: boolean): readonly string[] {
-	const component = new ReadToolGroupComponent();
+	const component = new ReadGroup();
+	const render = (): readonly string[] => printRows(() => ReadGroupBlock({ group: component }), width);
 	component.setExpanded(expanded);
 
 	if (state === "streaming") {
@@ -70,16 +83,23 @@ function renderReadGroupFixtureState(state: GalleryFixtureState, width: number, 
 			},
 			"read-delimited",
 		);
-		return component.render(width);
+		return render();
 	}
 
 	addGroupedReadArgs(component);
-	if (state === "progress") return component.render(width);
+	if (state === "progress") return render();
 
 	component.updateResult(
 		textResult("Read three focused test ranges.", { displayReadTargets: groupedReadTargets }),
 		false,
 		"read-delimited",
+	);
+	component.attachUsage(
+		["read-delimited"],
+		GROUPED_READ_USAGE,
+		5300,
+		2200,
+		new Date(2026, 6, 28, 21, 5, 47).getTime(),
 	);
 
 	if (state === "error") {
@@ -88,11 +108,19 @@ function renderReadGroupFixtureState(state: GalleryFixtureState, width: number, 
 			false,
 			"read-ranges",
 		);
-		return component.render(width);
+		component.attachUsage(
+			["read-ranges"],
+			GROUPED_READ_USAGE,
+			4700,
+			1900,
+			new Date(2026, 6, 28, 21, 5, 52).getTime(),
+		);
+		return render();
 	}
 
 	component.updateResult(textResult("Read four render.ts ranges."), false, "read-ranges");
-	return component.render(width);
+	component.attachUsage(["read-ranges"], GROUPED_READ_USAGE, 4700, 1900, new Date(2026, 6, 28, 21, 5, 52).getTime());
+	return render();
 }
 
 export const fsFixtures: Record<string, GalleryFixture> = {
@@ -122,9 +150,11 @@ export const fsFixtures: Record<string, GalleryFixture> = {
 					].join("\n"),
 				},
 			],
+			// A plain range read records its absolute path only in `meta.source`
+			// (`resolvedPath` marks corrected, URL, and archive reads), so the
+			// renderer paints no `Resolved path` line for it.
 			details: {
 				kind: "file",
-				resolvedPath: "/Users/dev/Projects/pi/packages/coding-agent/src/tools/glob.ts",
 				contentType: "text/typescript",
 				displayContent: { text: readSnippet, startLine: 437 },
 			},

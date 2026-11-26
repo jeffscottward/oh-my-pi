@@ -1,10 +1,9 @@
-import type { Component } from "@oh-my-pi/pi-tui";
 import { parseStreamingJson, parseStreamingJsonThrottled, STREAMING_JSON_PARSE_MIN_GROWTH } from "@oh-my-pi/pi-utils";
 import { nextStep, STREAMING_REVEAL_FRAME_MS } from "./streaming-reveal";
 
-/** Minimal component surface the reveal pushes frames into. */
-type ToolArgsRevealComponent = Component & {
-	updateArgs(args: unknown, toolCallId?: string): void;
+/** What the reveal pushes frames into (a pending tool's handle). */
+type ToolArgsRevealComponent = {
+	updateArgs(args: unknown, toolCallId: string): void;
 };
 
 // Top-level string args a renderer reads mid-stream. The streamed-args decode
@@ -13,8 +12,6 @@ type ToolArgsRevealComponent = Component & {
 // STREAMING_JSON_PARSE_MIN_GROWTH bytes at a time. Nested-array modes (edit
 // patch/replace `edits[].diff`) still fall through to the throttled parse.
 const STREAMING_STRING_KEYS_BY_TOOL: Record<string, readonly string[]> = {
-	// write.content also carries xd:// device args (a JSON string) — the same
-	// incremental decode feeds the delegated tool renderer live inner args.
 	write: ["content"],
 	edit: ["input", "_input"],
 	eval: ["code"],
@@ -28,10 +25,6 @@ export function streamingStringKeysForTool(toolName: string, rawInput: boolean):
 
 type ToolArgsRevealControllerOptions = {
 	getSmoothStreaming(): boolean;
-	/** Called after each reveal tick with the component whose subtree changed;
-	 *  callers scope the render to that subtree instead of forcing a full-tree
-	 *  walk at 30fps (issue #4377). */
-	requestRender(component: Component): void;
 };
 
 type StreamingJsonStringExtractorResult = {
@@ -83,6 +76,10 @@ class StreamingJsonStringExtractor {
 	#targetEscaped = false;
 	#targetUnicode = "";
 	#values: Record<string, string> = {};
+	// Chunked accumulation: text runs append into per-key chunk lists joined
+	// once per update() instead of one concat + record store per character
+	// (~1M ops per 1MB payload). Escapes/\uXXXX still go char-by-char.
+	#chunks: Record<string, string[]> = {};
 	#changed = false;
 
 	constructor(keys: readonly string[]) {
@@ -102,16 +99,40 @@ class StreamingJsonStringExtractor {
 		this.#targetEscaped = false;
 		this.#targetUnicode = "";
 		this.#values = {};
+		this.#chunks = {};
 		this.#changed = false;
 	}
 
-	update(prefix: string): StreamingJsonStringExtractorResult {
-		if (!prefix.startsWith(this.#source)) {
+	/**
+	 * Advance the decode to `prefix`. A `prefix` that does not extend the
+	 * previous one restarts from scratch; `knownAppend` lets a caller that
+	 * already guarantees the extension skip the O(prefix) re-verification
+	 * (only the length is checked).
+	 */
+	update(prefix: string, knownAppend = false): StreamingJsonStringExtractorResult {
+		if (knownAppend ? prefix.length < this.#source.length : !prefix.startsWith(this.#source)) {
 			this.reset();
 		}
 		this.#source = prefix;
 		this.#changed = false;
 		while (this.#offset < prefix.length) {
+			if (this.#state === "target" && !this.#targetEscaped && !this.#targetUnicode) {
+				// Fast run: copy straight text until the next JSON escape,
+				// closing quote, or control byte in one slice instead of one
+				// state-machine step + concat per character.
+				const ch = prefix[this.#offset]!;
+				if (ch !== "\\" && ch !== '"' && ch >= " ") {
+					let end = this.#offset + 1;
+					while (end < prefix.length) {
+						const c = prefix[end]!;
+						if (c === "\\" || c === '"' || c < " ") break;
+						end++;
+					}
+					this.#appendTarget(prefix.slice(this.#offset, end));
+					this.#offset = end;
+					continue;
+				}
+			}
 			const ch = prefix[this.#offset]!;
 			switch (this.#state) {
 				case "scan":
@@ -131,6 +152,7 @@ class StreamingJsonStringExtractor {
 					break;
 			}
 		}
+		this.#flushChunks();
 		return { values: { ...this.#values }, changed: this.#changed };
 	}
 
@@ -278,8 +300,21 @@ class StreamingJsonStringExtractor {
 
 	#appendTarget(text: string): void {
 		if (!this.#targetKey || text.length === 0) return;
-		this.#values[this.#targetKey] = `${this.#values[this.#targetKey] ?? ""}${text}`;
+		const key = this.#targetKey;
+		const list = this.#chunks[key];
+		if (list) list.push(text);
+		else this.#chunks[key] = [text];
 		this.#changed = true;
+	}
+
+	/** Join pending chunks into `#values` once per update, not per character. */
+	#flushChunks(): void {
+		for (const key in this.#chunks) {
+			const list = this.#chunks[key]!;
+			if (list.length === 0) continue;
+			this.#values[key] = `${this.#values[key] ?? ""}${list.join("")}`;
+			list.length = 0;
+		}
 	}
 }
 
@@ -379,7 +414,11 @@ function displayArgsForPrefix(entry: RevealEntry, prefix: string, forceParse = f
 			parsedChanged = true;
 		}
 	}
-	const extracted = entry.stringExtractor?.update(prefix);
+	// Every prefix handed here extends the extractor's previous one: the entry
+	// only ever reveals forward within `target`, and setTarget resets the
+	// display state (extractor included) whenever a new target is not an
+	// append of the old one.
+	const extracted = entry.stringExtractor?.update(prefix, true);
 	if (extracted?.changed) {
 		entry.parsedArgs = { ...entry.parsedArgs, ...extracted.values };
 		parsedChanged = true;
@@ -444,13 +483,11 @@ export function decodeStreamedToolArgs(partialJson: string, source: StreamedTool
  */
 export class ToolArgsRevealController {
 	readonly #getSmoothStreaming: () => boolean;
-	readonly #requestRender: (component: Component) => void;
 	readonly #entries = new Map<string, RevealEntry>();
 	#timer: NodeJS.Timeout | undefined;
 
 	constructor(options: ToolArgsRevealControllerOptions) {
 		this.#getSmoothStreaming = options.getSmoothStreaming;
-		this.#requestRender = options.requestRender;
 	}
 
 	/**
@@ -566,26 +603,15 @@ export class ToolArgsRevealController {
 
 	#tick(): void {
 		let advanced = false;
-		// Collect components with changed display args; render each subtree once
-		// per tick even when multiple entries share a component (they don't
-		// today, but the API contract doesn't prevent it).
-		const rendered = new Set<ToolArgsRevealComponent>();
 		for (const [id, entry] of this.#entries) {
 			const backlog = entry.target.length - entry.revealed;
 			if (backlog <= 0 || !entry.component) continue;
 			entry.revealed = clampSliceEnd(entry.target, entry.revealed + nextStep(backlog));
 			const display = displayArgsForPrefix(entry, entry.target.slice(0, entry.revealed));
-			if (display.changed) {
-				entry.component.updateArgs(display.args, id);
-				rendered.add(entry.component);
-			}
+			if (display.changed) entry.component.updateArgs(display.args, id);
 			advanced = true;
 		}
-		if (advanced) {
-			for (const component of rendered) this.#requestRender(component);
-		} else {
-			// Every entry caught up (or unbound); setTarget restarts on growth.
-			this.#stopTimer();
-		}
+		// Every entry caught up (or unbound); setTarget restarts on growth.
+		if (!advanced) this.#stopTimer();
 	}
 }

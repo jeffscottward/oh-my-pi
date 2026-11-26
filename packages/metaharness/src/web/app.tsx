@@ -17,7 +17,7 @@ import { createRoot } from "react-dom/client";
 type RunRole = "baseline" | "variant" | "";
 
 interface RunRow {
-	benchmark: "harbor" | "edit" | "snapcompact";
+	benchmark: "harbor" | "edit" | "snapcompact" | "scope";
 	jobName: string;
 	dataset: string;
 	agent: string;
@@ -1822,7 +1822,7 @@ function RunsPage({ selected }: { selected: string | null }) {
 						{trace && (
 							<div ref={traceRef} className="h-2/5 overflow-auto border-t border-zinc-800 bg-zinc-950/60">
 								{(traceData?.entries ?? []).map((e, i) => (
-									// biome-ignore lint/suspicious/noArrayIndexKey: tail window, entries have no ids
+									// oxlint-disable-next-line react/no-array-index-key -- tail window, entries have no ids
 									<div key={i} className="border-b border-zinc-900 px-4 py-2">
 										<div className="text-xs text-zinc-500">
 											{e.kind === "assistant" ? (e.model ?? "assistant") : (e.tool ?? e.kind)}
@@ -1902,6 +1902,7 @@ function LaunchForm({ onDone }: { onDone: () => void }) {
 				<option value="harbor">Harbor</option>
 				<option value="edit">TypeScript edit</option>
 				<option value="snapcompact">SnapCompact</option>
+				<option value="scope">Scope &amp; speed</option>
 			</select>
 			<input name="model" placeholder="model (required)" required className={input} />
 			<input name="dataset" placeholder="dataset (terminal-bench@2.0)" className={input} />

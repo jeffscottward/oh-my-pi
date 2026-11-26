@@ -1,16 +1,16 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
-import * as path from "node:path";
-import { Agent, type AgentTool, type AsideMessage } from "@oh-my-pi/pi-agent-core";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { Agent, type AgentTool, type AsideBoundary, type AsideMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, TextContent, ToolCall } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import type { CustomMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TodoTool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { cfgTodoMidRunNudges } from "@oh-my-pi/pi-coding-agent/tools/settings";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
 /**
  * Regression coverage for issue #3651 and its redesign: the mid-run todo
@@ -25,8 +25,13 @@ import { TempDir } from "@oh-my-pi/pi-utils";
  *      `todo` call, the aside provider injects a hidden custom message
  *      (`display: false`) — NO `todo_reminder` event, nothing renders.
  *   3. A `todo` tool result resets the counter.
- *   4. At most {@link MID_RUN_TODO_NUDGE_MAX_PER_CYCLE} nudges fire per
- *      prompt cycle.
+ *   4. `todo.midRunNudges` shapes the budget between state-writing `todo`
+ *      results (`view` reads and errored attempts do not re-arm it; a new
+ *      prompt cycle re-arms it unconditionally):
+ *        - `off` never nudges;
+ *        - `capped` (default) stops after two unanswered nudges;
+ *        - `backoff` doubles the runway after each unanswered nudge (12, 24,
+ *          48, 96, then every 192) instead of falling silent.
  *   5. The counter update lands synchronously with the message_end emit.
  *
  * Drives the aside provider directly: the production agent loop polls it
@@ -34,17 +39,25 @@ import { TempDir } from "@oh-my-pi/pi-utils";
  * after a batch of synthesized `message_end` events mirrors that injection
  * point without spinning a real model.
  */
+const sharedAuthStorage = createInMemoryAuthStorage();
+sharedAuthStorage.keys.setRuntime("anthropic", "test-key");
+const sharedModelRegistry = new ModelRegistry(sharedAuthStorage);
+
+afterAll(() => {
+	sharedAuthStorage.close();
+});
+
 describe("AgentSession mid-run todo reconciliation nudge", () => {
 	let tempDir: TempDir;
 	let session: AgentSession;
 	let sessionManager: SessionManager;
-	let authStorage: AuthStorage;
-	let modelRegistry: ModelRegistry;
+	let settings: Settings;
 	let reminderEvents: Array<Extract<AgentSessionEvent, { type: "todo_reminder" }>>;
-	let asideProvider: (() => AsideMessage[] | Promise<AsideMessage[]>) | undefined;
+	let asideProvider: ((boundary: AsideBoundary) => AsideMessage[] | Promise<AsideMessage[]>) | undefined;
 
-	const THRESHOLD = 12; // mirrors MID_RUN_TODO_NUDGE_MUTATION_THRESHOLD
-	const MAX_PER_CYCLE = 2; // mirrors MID_RUN_TODO_NUDGE_MAX_PER_CYCLE
+	const THRESHOLD = 12; // mirrors MID_RUN_NUDGE_MUTATION_THRESHOLD
+	const MAX_PER_CYCLE = 2; // mirrors MID_RUN_NUDGE_MAX_PER_CYCLE
+	const BACKOFF_DOUBLINGS = 4; // mirrors MID_RUN_NUDGE_BACKOFF_DOUBLINGS
 	const NUDGE_TYPE = "mid-run-todo-nudge"; // mirrors MID_RUN_TODO_NUDGE_MESSAGE_TYPE
 
 	function toolUseAssistant(toolName: string): AssistantMessage {
@@ -88,16 +101,14 @@ describe("AgentSession mid-run todo reconciliation nudge", () => {
 			timestamp: Date.now(),
 		};
 	}
-
-	async function emitTextOnlyStop(): Promise<void> {
+	function emitTextOnlyStop(): void {
 		const msg = textOnlyAssistant();
 		session.agent.emitExternalEvent({ type: "message_end", message: msg });
-		await settle();
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [msg] });
 	}
 
 	/** Production-shaped tool round trip: assistant toolCall turn + toolResult. */
-	function emitToolResult(toolName: string, opts?: { isError?: boolean }): void {
+	function emitToolResult(toolName: string, opts?: { isError?: boolean; details?: unknown }): void {
 		const toolCallId = `call_${toolName}_${Date.now()}_${Math.random()}`;
 		session.agent.emitExternalEvent({ type: "message_end", message: toolUseAssistant(toolName) });
 		const content: TextContent[] = [{ type: "text", text: "ok" }];
@@ -108,29 +119,16 @@ describe("AgentSession mid-run todo reconciliation nudge", () => {
 				toolCallId,
 				toolName,
 				content,
+				details: opts?.details,
 				isError: opts?.isError ?? false,
 				timestamp: Date.now(),
 			},
 		});
 	}
 
-	/**
-	 * #processAgentEvent fires off message_end handlers as async microtasks that
-	 * chain on `#messageEndPersistenceTail`. After a batch of synchronous emits
-	 * the counter only catches up once every queued persist task drains, so
-	 * tests yield a full event-loop tick before draining asides.
-	 *
-	 * Real-timer exception (ts-no-test-timers): `Bun.sleep(0)` is a single
-	 * event-loop tick, not a tuned duration — the private persistence tail
-	 * exposes no drain promise to await, and fake timers cannot flush it.
-	 */
-	async function settle(): Promise<void> {
-		await Bun.sleep(0);
-	}
-
 	async function drainNudges(): Promise<CustomMessage[]> {
 		if (!asideProvider) throw new Error("aside provider was never captured");
-		const thunks = await asideProvider();
+		const thunks = await asideProvider("work");
 		const out: CustomMessage[] = [];
 		for (const entry of thunks) {
 			const message = typeof entry === "function" ? entry() : entry;
@@ -142,17 +140,14 @@ describe("AgentSession mid-run todo reconciliation nudge", () => {
 		return out;
 	}
 
-	beforeEach(async () => {
+	beforeEach(() => {
 		tempDir = TempDir.createSync("@pi-todo-mid-run-nudge-");
-		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
-		authStorage.setRuntimeApiKey("anthropic", "test-key");
-		modelRegistry = new ModelRegistry(authStorage);
-		sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
+		sessionManager = SessionManager.inMemory(tempDir.path());
 
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected built-in anthropic model to exist");
 
-		const settings = Settings.isolated({
+		settings = Settings.isolated({
 			"compaction.enabled": false,
 			"todo.enabled": true,
 			"todo.reminders": true,
@@ -190,7 +185,7 @@ describe("AgentSession mid-run todo reconciliation nudge", () => {
 			agent,
 			sessionManager,
 			settings,
-			modelRegistry,
+			modelRegistry: sharedModelRegistry,
 		});
 
 		reminderEvents = [];
@@ -212,7 +207,6 @@ describe("AgentSession mid-run todo reconciliation nudge", () => {
 
 	afterEach(async () => {
 		await session.dispose();
-		authStorage.close();
 		try {
 			await tempDir.remove();
 		} catch {}
@@ -222,7 +216,6 @@ describe("AgentSession mid-run todo reconciliation nudge", () => {
 	it("read-only exploration never ticks the counter, no matter how long", async () => {
 		for (let i = 0; i < THRESHOLD * 3; i++) emitToolResult(i % 2 === 0 ? "grep" : "read");
 
-		await settle();
 		expect(await drainNudges()).toEqual([]);
 		expect(reminderEvents).toEqual([]);
 	});
@@ -230,7 +223,6 @@ describe("AgentSession mid-run todo reconciliation nudge", () => {
 	it("stays silent below the mutation threshold", async () => {
 		for (let i = 0; i < THRESHOLD - 1; i++) emitToolResult("edit");
 
-		await settle();
 		expect(await drainNudges()).toEqual([]);
 		expect(reminderEvents).toEqual([]);
 	});
@@ -238,7 +230,6 @@ describe("AgentSession mid-run todo reconciliation nudge", () => {
 	it("injects a hidden custom nudge at the threshold — no event, no render", async () => {
 		for (let i = 0; i < THRESHOLD; i++) emitToolResult("edit");
 
-		await settle();
 		const nudges = await drainNudges();
 		expect(nudges.length).toBe(1);
 		const nudge = nudges[0];
@@ -264,7 +255,6 @@ describe("AgentSession mid-run todo reconciliation nudge", () => {
 	it("errored mutating results do not tick the counter", async () => {
 		for (let i = 0; i < THRESHOLD; i++) emitToolResult("bash", { isError: true });
 
-		await settle();
 		expect(await drainNudges()).toEqual([]);
 	});
 
@@ -273,20 +263,136 @@ describe("AgentSession mid-run todo reconciliation nudge", () => {
 		emitToolResult("todo");
 		for (let i = 0; i < THRESHOLD - 1; i++) emitToolResult("write");
 
-		await settle();
 		expect(await drainNudges()).toEqual([]);
 		expect(reminderEvents).toEqual([]);
 	});
 
-	it("caps nudges per prompt cycle", async () => {
+	/** Fires one ignored nudge per runway; returns how many fired. */
+	async function ignoreNudges(runways: number[]): Promise<number> {
 		let fired = 0;
-		for (let cycle = 0; cycle < MAX_PER_CYCLE + 2; cycle++) {
-			for (let i = 0; i < THRESHOLD; i++) emitToolResult("edit");
-			await settle();
+		for (const runway of runways) {
+			for (let i = 0; i < runway; i++) emitToolResult("edit");
 			fired += (await drainNudges()).length;
 		}
-		expect(fired).toBe(MAX_PER_CYCLE);
+		return fired;
+	}
+
+	/** Neither a read-only view nor a failed attempt nor a details-less Cursor read snapshot wrote state. */
+	async function expectReadOnlyTodoResultsDoNotReArm(): Promise<void> {
+		emitToolResult("todo", { details: { op: "view", phases: [] } });
+		for (let i = 0; i < THRESHOLD; i++) emitToolResult("edit");
+		expect(await drainNudges()).toEqual([]);
+
+		emitToolResult("todo", { isError: true, details: { op: "done", phases: [] } });
+		for (let i = 0; i < THRESHOLD; i++) emitToolResult("edit");
+		expect(await drainNudges()).toEqual([]);
+
+		emitToolResult("todo");
+		for (let i = 0; i < THRESHOLD; i++) emitToolResult("edit");
+		expect(await drainNudges()).toEqual([]);
 		expect(reminderEvents).toEqual([]);
+	}
+
+	describe("todo.midRunNudges: capped (default)", () => {
+		it("is the default mode", () => {
+			expect(cfgTodoMidRunNudges.get(settings)).toBe("capped");
+		});
+
+		it("caps nudges per prompt cycle", async () => {
+			expect(await ignoreNudges(Array(MAX_PER_CYCLE + 2).fill(THRESHOLD))).toBe(MAX_PER_CYCLE);
+			// A long tail of further work stays silent until a reset.
+			for (let i = 0; i < THRESHOLD * 2 ** BACKOFF_DOUBLINGS; i++) emitToolResult("edit");
+			expect(await drainNudges()).toEqual([]);
+			expect(reminderEvents).toEqual([]);
+		});
+
+		it("re-arms the nudge budget after a todo state write", async () => {
+			expect(await ignoreNudges(Array(MAX_PER_CYCLE).fill(THRESHOLD))).toBe(MAX_PER_CYCLE);
+			for (let i = 0; i < THRESHOLD; i++) emitToolResult("edit");
+			expect(await drainNudges()).toEqual([]);
+
+			// The agent acted on a nudge and wrote todo state — the same path the
+			// native tool, a Cursor sync, and a bridged call all take.
+			session.setTodoPhases([
+				{ name: "Refactor pass", tasks: [{ content: "Sweep call sites", status: "pending" }] },
+			]);
+			for (let i = 0; i < THRESHOLD; i++) emitToolResult("edit");
+
+			expect((await drainNudges()).length).toBe(1);
+			expect(reminderEvents).toEqual([]);
+		});
+
+		it("read-only todo results do not re-arm the nudge budget", async () => {
+			expect(await ignoreNudges(Array(MAX_PER_CYCLE).fill(THRESHOLD))).toBe(MAX_PER_CYCLE);
+			await expectReadOnlyTodoResultsDoNotReArm();
+		});
+	});
+
+	describe("todo.midRunNudges: backoff", () => {
+		beforeEach(() => {
+			cfgTodoMidRunNudges.set(settings, "backoff");
+		});
+
+		it("backs off instead of falling silent when nudges are ignored", async () => {
+			const runways = [THRESHOLD, THRESHOLD * 2, THRESHOLD * 4, THRESHOLD * 8, THRESHOLD * 2 ** BACKOFF_DOUBLINGS];
+			for (const runway of runways) {
+				// One short of the runway stays silent; the runway itself fires once.
+				for (let i = 0; i < runway - 1; i++) emitToolResult("edit");
+				expect(await drainNudges()).toEqual([]);
+				emitToolResult("edit");
+				const nudges = await drainNudges();
+				expect(nudges.length).toBe(1);
+				expect(nudges[0]?.display).toBe(false);
+				expect(await drainNudges()).toEqual([]);
+				expect(reminderEvents).toEqual([]);
+			}
+
+			// At the ceiling it settles into a steady reminder rate instead of
+			// going silent for the rest of the turn.
+			for (let cycle = 0; cycle < 2; cycle++) {
+				for (let i = 0; i < THRESHOLD * 2 ** BACKOFF_DOUBLINGS; i++) emitToolResult("edit");
+				expect((await drainNudges()).length).toBe(1);
+			}
+			expect(reminderEvents).toEqual([]);
+		});
+
+		it("resets the backoff after a todo state write", async () => {
+			expect(await ignoreNudges([THRESHOLD, THRESHOLD * 2])).toBe(2);
+			expect(await drainNudges()).toEqual([]);
+
+			session.setTodoPhases([
+				{ name: "Refactor pass", tasks: [{ content: "Sweep call sites", status: "pending" }] },
+			]);
+			for (let i = 0; i < THRESHOLD; i++) emitToolResult("edit");
+
+			expect((await drainNudges()).length).toBe(1);
+			expect(reminderEvents).toEqual([]);
+		});
+
+		it("read-only todo results do not reset the backoff", async () => {
+			expect(await ignoreNudges([THRESHOLD, THRESHOLD * 2])).toBe(2);
+			// The next runway is 48; each check above stays below it.
+			await expectReadOnlyTodoResultsDoNotReArm();
+		});
+	});
+
+	describe("todo.midRunNudges: off", () => {
+		beforeEach(() => {
+			cfgTodoMidRunNudges.set(settings, "off");
+		});
+
+		it("never nudges, however long the turn", async () => {
+			expect(await ignoreNudges(Array(4).fill(THRESHOLD * 2 ** BACKOFF_DOUBLINGS))).toBe(0);
+			expect(reminderEvents).toEqual([]);
+		});
+
+		it("applies a mode change on the next nudge decision", async () => {
+			for (let i = 0; i < THRESHOLD; i++) emitToolResult("edit");
+			expect(await drainNudges()).toEqual([]);
+
+			cfgTodoMidRunNudges.set(settings, "capped");
+			expect((await drainNudges()).length).toBe(1);
+		});
 	});
 
 	it("counter update lands synchronously with the message_end emit (no microtask drain required)", () => {
@@ -299,7 +405,7 @@ describe("AgentSession mid-run todo reconciliation nudge", () => {
 		for (let i = 0; i < THRESHOLD; i++) emitToolResult("edit");
 
 		if (!asideProvider) throw new Error("aside provider was never captured");
-		const result = asideProvider();
+		const result = asideProvider("work");
 		if (result instanceof Promise) throw new Error("aside provider unexpectedly returned a Promise");
 		const nudges = result
 			.map(entry => (typeof entry === "function" ? entry() : entry))
@@ -317,7 +423,6 @@ describe("AgentSession mid-run todo reconciliation nudge", () => {
 		expect(session.getActiveToolNames()).not.toContain("todo");
 
 		for (let i = 0; i < THRESHOLD; i++) emitToolResult("edit");
-		await settle();
 		expect(await drainNudges()).toEqual([]);
 		expect(reminderEvents).toEqual([]);
 	});
@@ -326,8 +431,7 @@ describe("AgentSession mid-run todo reconciliation nudge", () => {
 		vi.spyOn(session.agent, "continue").mockResolvedValue();
 		for (let i = 0; i < THRESHOLD - 1; i++) emitToolResult("edit");
 
-		await settle();
-		await emitTextOnlyStop();
+		emitTextOnlyStop();
 		await session.waitForIdle();
 		// The stop-time path is the user-visible ladder: it emits the event.
 		expect(reminderEvents.length).toBe(1);
@@ -336,7 +440,6 @@ describe("AgentSession mid-run todo reconciliation nudge", () => {
 		// The stop-time reminder reset the mutation counter, so one more landed
 		// mutation (crossing the stale pre-reminder threshold) must stay silent.
 		emitToolResult("edit");
-		await settle();
 		expect(await drainNudges()).toEqual([]);
 		expect(reminderEvents.length).toBe(1);
 	});

@@ -1,25 +1,21 @@
-Runs commands in a persistent shell session.
-
-Use ONLY for: single binary call or short pipeline that COMPUTES a fact (`wc -l`, `sort | uniq -c`, `comm`, `diff`).
-{{#if hasLaunch}}Services, watchers, debuggers, REPLs → `hub` (`op:"start"`).{{/if}}
-{{#if hasEval}}Inline scripts, heredocs, shell control flow, `$(…)`, multi-stage pipelines, `&&`-chains, quote/JSON escaping → `eval` cells.{{else}}Inline scripts, heredocs, shell control flow, `$(…)`, multi-stage pipelines, `&&`-chains → purpose-built tool or checked-in script.{{/if}}
-
-<instruction>
-- `cwd` sets working dir (not `cd dir && …`). `env: { NAME: "…" }` for multiline/quote-heavy values; `"$NAME"` to expand.
-- `pty: true` only for real terminal needs (`sudo`, `ssh`); default `false`.
-- Multiple calls run concurrently; NEVER split order-dependent commands — chain with `&&` in one call (`;` only to continue past failure).
-- Internal URIs (`skill://`, `agent://`, …) auto-resolve to FS paths.
-{{#if hasShellBuiltins}}- aux utils available: mkdir, head, tail, wc, sort, ls, find, grep, rg, fd, cat, uniq, base64, cmp, md5sum, sha{1,224,256,384,512}sum, b2sum, basename, dirname, readlink, realpath, touch, stat, date, mktemp, seq, yes, printenv, truncate, tac, nproc, uname, whoami, hostname, which, diff, cut, tee, tr, paste, comm, sed, xargs, jq, rm, mv, ln, ts, sponge, ifne, isutf8, combine{{#unless isWindows}}, errno{{/unless}}{{/if}}
-{{#if asyncEnabled}}- `async: true` defers reporting for finite commands needing no later input.{{/if}}
-</instruction>
-
-<critical>
-{{#if hasGrep}}- NEVER shell out to search: `grep`/`rg` → built-in `grep`.{{/if}}
-{{#if hasRead}}{{#if hasGlob}}- NEVER use `ls` or `find` — `ls` → `read`, `find` → `glob`. NON-NEGOTIABLE.{{/if}}{{/if}}
-- Avoid head/tail/redirections: stderr merged, output auto-truncated, full capture at `artifact://<id>`.
-{{#if hasLaunch}}- NEVER launch daemons/watchers/servers/debuggers/REPLs through bash — use `hub` (`op:"start"`).{{/if}}
-</critical>
-
-{{#if asyncEnabled}}- `timeout`: nonzero clamped 1–3600, killed on elapse. `async: true` defers reporting only, doesn't extend timeout.{{/if}}
-{{#if autoBackgroundEnabled}}- Long foreground calls may auto-background; result arrives as follow-up — NOT a failure. Need inline? Raise timeout{{#if asyncEnabled}} or `async: true`{{/if}}.{{/if}}
-- Long output truncated, test/lint filtered to failures. Footer links full capture. No footer = what you see is exact output.
+Persistent bash 5.3.
+Each call starts in the session cwd with `set -e` off; use `cwd`, not `cd`{{#if hasPty}}; `pty` = interactive{{/if}}.
+Internal URIs work as paths for builtins/coreutils, redirects, globs.
+In-process builtins, ahead of PATH: {{join builtins ", "}}.
+{{#if asyncEnabled}}
+`async` defers finite results but keeps the deadline (default {{defaultTimeoutSec}}s); `timeout: 0` for watchers and long jobs.
+`notify` (regex; implies `async`) sends each matching output line as a follow-up while the job runs, ahead of its result. Match only lines you'd act on: too many matches switch it off.
+{{/if}}
+Don't trunc output by habit, result will be summarized and saved as an artifact.
+{{#if hasLaunch}}
+Long-lived services:
+- unique name; ready requires name; no async/timeout; pty defaults true.
+- ready needs log regex or port (both if given); host defaults localhost, ready.timeout 30s.
+- `notify` (regex) sends each matching output line as a follow-up while the service runs.
+- Shell command `o2ctl services add <name> <pid|%job>` keeps an already-running process (`cmd &`, `nohup cmd &`) as a service, without restarting it; `o2ctl services ls`; `o2ctl services stop <name>`.
+{{/if}}
+{{#if autoBackgroundEnabled}}
+Non-`pty` calls still running after {{autoBackgroundSeconds}}s (or 1s before `timeout`, if sooner) usually move to background job `bg_N` and keep running to `timeout`.
+No backgrounding when the client terminal runs the command or the job cap is reached.
+The result arrives automatically as a follow-up message. NEVER poll.
+{{/if}}

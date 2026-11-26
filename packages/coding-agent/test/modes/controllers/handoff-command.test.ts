@@ -1,120 +1,155 @@
-import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
-import { CommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/command-controller";
-import { getThemeByName, setThemeInstance } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
-import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+import { afterEach, beforeAll, expect, it } from "bun:test";
+import * as path from "node:path";
+import { Agent } from "@oh-my-pi/pi-agent-core";
+import { createMockModel, type MockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
+import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { TempDir } from "@oh-my-pi/pi-utils";
+import { initTheme } from "../../../src/ui/theme/service";
+import { createModeTerminal, type ModeTerminal } from "../../helpers/mode-terminal";
 
-function createContainer() {
+beforeAll(() => initTheme());
+afterEach(() => resetSettingsForTest());
+
+/** The background run's working row in the empty status row. */
+const IDLE_ROW = "Compacting context in the background…";
+/** The background run's HUD row beside a turn that holds the status row. */
+const HUD_ROW = "Compacting context in the background (";
+
+/**
+ * An interactive session after one answered prompt: its next turn waits on
+ * `liveResponse`, a handoff summary on `handoffResponse`.
+ */
+interface Harness extends AsyncDisposable {
+	readonly session: AgentSession;
+	readonly manager: SessionManager;
+	readonly terminal: ModeTerminal;
+	readonly side: MockModel;
+	readonly liveStarted: PromiseWithResolvers<void>;
+	readonly liveResponse: PromiseWithResolvers<MockResponse>;
+	readonly handoffStarted: PromiseWithResolvers<void>;
+	readonly handoffResponse: PromiseWithResolvers<MockResponse>;
+	/** The viewport as plain text. */
+	screen(): string;
+}
+
+async function startHarness(): Promise<Harness> {
+	const dir = TempDir.createSync("@pi-background-handoff-");
+	resetSettingsForTest();
+	await Settings.init({ inMemory: true, cwd: dir.path() });
+	const auth = await AuthStorage.create(path.join(dir.path(), "auth.db"));
+	const modelRegistry = new ModelRegistry(auth);
+	const model = modelRegistry.find("anthropic", "claude-sonnet-4-5");
+	if (!model) throw new Error("Expected the bundled test model");
+	auth.keys.setRuntime(model.provider, "test-key");
+	const liveStarted = Promise.withResolvers<void>();
+	const liveResponse = Promise.withResolvers<MockResponse>();
+	const handoffStarted = Promise.withResolvers<void>();
+	const handoffResponse = Promise.withResolvers<MockResponse>();
+	const live = createMockModel({
+		responses: [
+			{ content: ["Earlier reply"] },
+			() => {
+				liveStarted.resolve();
+				return liveResponse.promise;
+			},
+		],
+	});
+	const side = createMockModel({
+		handler: () => {
+			handoffStarted.resolve();
+			return handoffResponse.promise;
+		},
+	});
+	const manager = SessionManager.inMemory(dir.path());
+	const session = new AgentSession({
+		agent: new Agent({
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: live.stream,
+			getApiKey: () => "test-key",
+		}),
+		sessionManager: manager,
+		settings: Settings.isolated({ "compaction.enabled": false, "compaction.keepRecentTokens": 1 }),
+		modelRegistry,
+		sideStreamFn: side.stream,
+	});
+	const terminal = createModeTerminal({ columns: 120, rows: 36 });
+	const mode = new InteractiveMode(session, "test", () => {}, undefined, undefined, undefined, terminal.frame);
+	await session.prompt("Earlier request");
+	await mode.init({ suppressWelcomeIntro: true });
+	void mode.getUserInput();
 	return {
-		children: [] as unknown[],
-		addChild(child: unknown) {
-			this.children.push(child);
-		},
-		clear() {
-			this.children = [];
-		},
-		disposeChildren() {
-			this.children = [];
+		session,
+		manager,
+		terminal,
+		side,
+		liveStarted,
+		liveResponse,
+		handoffStarted,
+		handoffResponse,
+		screen: () => terminal.screen().join("\n"),
+		async [Symbol.asyncDispose]() {
+			liveResponse.resolve({ content: ["Stopped test"] });
+			handoffResponse.resolve({ content: ["## Goal\nStopped test"] });
+			mode.stop();
+			await mode.shell.stop();
+			terminal.dispose();
+			await session.dispose();
+			auth.close();
+			dir.removeSync();
 		},
 	};
 }
 
-describe("/handoff command", () => {
-	beforeAll(async () => {
-		const theme = await getThemeByName("dark");
-		if (!theme) throw new Error("Expected dark theme");
-		setThemeInstance(theme);
-	});
+it("runs /handoff from the live composer and keeps the reply on the compacted transcript", async () => {
+	await using h = await startHarness();
+	const livePrompt = h.session.prompt("Keep working on the report");
+	await h.liveStarted.promise;
+	await h.terminal.waitFor(() => h.screen().includes("Working"));
 
-	afterEach(() => {
-		vi.restoreAllMocks();
-	});
+	h.terminal.type("/handoff keep report constraints");
+	h.terminal.press("enter");
+	await h.handoffStarted.promise;
+	await h.terminal.waitFor(() => h.screen().includes(HUD_ROW));
+	expect(h.screen()).toContain(HUD_ROW);
+	expect(h.screen()).toContain("Working");
+	expect(JSON.stringify(h.side.calls[0]?.context.messages)).toContain("keep report constraints");
 
-	it("shows a cancellable loader while handoff generation is running", async () => {
-		const handoffStarted = Promise.withResolvers<void>();
-		const handoffDone = Promise.withResolvers<{ document: string }>();
-		let isGeneratingHandoff = false;
-		const statusContainer = createContainer();
-		const chatContainer = createContainer();
-		const abortHandoff = vi.fn();
-		// InputController installs the real Esc handler; CommandController should
-		// leave it in place while showing the handoff loader.
-		const originalOnEscape = vi.fn(() => {
-			if (isGeneratingHandoff) abortHandoff();
-		});
-		const requestRender = vi.fn();
-		const ctx = {
-			sessionManager: {
-				getEntries: () => [{ type: "message" }, { type: "message" }],
-			},
-			session: {
-				handoff: vi.fn(async () => {
-					isGeneratingHandoff = true;
-					handoffStarted.resolve();
-					try {
-						return await handoffDone.promise;
-					} finally {
-						isGeneratingHandoff = false;
-					}
-				}),
-				abortHandoff,
-			},
-			loadingAnimation: undefined,
-			statusContainer,
-			chatContainer,
-			ui: { requestRender, requestComponentRender: vi.fn() },
-			editor: { onEscape: originalOnEscape },
-			rebuildChatFromMessages: vi.fn(),
-			statusLine: { invalidate: vi.fn() },
-			updateEditorTopBorder: vi.fn(),
-			updateEditorBorderColor: vi.fn(),
-			reloadTodos: vi.fn(async () => undefined),
-			showStatus: vi.fn(),
-			showWarning: vi.fn(),
-			showError: vi.fn(),
-		} as unknown as InteractiveModeContext;
-		const controller = new CommandController(ctx);
+	h.handoffResponse.resolve({ content: ["## Goal\nPreserve the report constraints"] });
+	h.liveResponse.resolve({ content: ["The report finished without interruption"] });
+	await livePrompt;
+	await h.terminal.waitFor(() => h.screen().includes("Compaction complete"));
+	expect(h.screen()).toContain("The report finished without interruption");
+	expect(h.manager.getBranch().findLast(entry => entry.type === "compaction")).toMatchObject({ method: "handoff" });
+});
 
-		const commandPromise = controller.handleHandoffCommand("focus on tests");
-		await handoffStarted.promise;
+it("shows an idle /handoff in the status row and steps beside a turn that starts", async () => {
+	await using h = await startHarness();
+	h.terminal.type("/handoff");
+	h.terminal.press("enter");
+	await h.handoffStarted.promise;
+	await h.terminal.waitFor(() => h.screen().includes(IDLE_ROW));
+	expect(h.screen()).toContain(IDLE_ROW);
 
-		expect(statusContainer.children).toHaveLength(1);
-		expect(ctx.editor.onEscape).toBe(originalOnEscape);
-		ctx.editor.onEscape?.();
-		expect(abortHandoff).toHaveBeenCalledTimes(1);
+	const livePrompt = h.session.prompt("Keep working on the report");
+	await h.liveStarted.promise;
+	await h.terminal.waitFor(() => h.screen().includes("Working") && h.screen().includes(HUD_ROW));
+	expect(h.screen()).toContain("Working");
+	expect(h.screen()).toContain(HUD_ROW);
+	expect(h.screen()).not.toContain(IDLE_ROW);
 
-		handoffDone.resolve({ document: "## Goal\nContinue" });
-		await commandPromise;
+	h.liveResponse.resolve({ content: ["The report finished"] });
+	await livePrompt;
+	await h.terminal.waitFor(() => h.screen().includes(IDLE_ROW));
+	expect(h.screen()).toContain(IDLE_ROW);
+	expect(h.screen()).not.toContain(HUD_ROW);
 
-		expect(statusContainer.children).toHaveLength(0);
-		expect(ctx.editor.onEscape).toBe(originalOnEscape);
-		expect(ctx.session.handoff).toHaveBeenCalledWith("focus on tests");
-	});
-
-	it("refuses to hand off while a response is streaming", async () => {
-		// Bug: /handoff dispatches before the streaming-queue branch, so without a
-		// guard it resets the agent mid-turn and the live stream keeps emitting into
-		// the torn-down session. Streaming must short-circuit with a warning.
-		const handoff = vi.fn();
-		const showWarning = vi.fn();
-		const statusContainer = createContainer();
-		const ctx = {
-			sessionManager: {
-				getEntries: () => [{ type: "message" }, { type: "message" }],
-			},
-			session: { isStreaming: true, handoff },
-			loadingAnimation: undefined,
-			statusContainer,
-			ui: { requestRender: vi.fn(), requestComponentRender: vi.fn() },
-			showWarning,
-			showError: vi.fn(),
-			showStatus: vi.fn(),
-		} as unknown as InteractiveModeContext;
-		const controller = new CommandController(ctx);
-
-		await controller.handleHandoffCommand();
-
-		expect(handoff).not.toHaveBeenCalled();
-		expect(showWarning).toHaveBeenCalledTimes(1);
-		expect(statusContainer.children).toHaveLength(0);
-	});
+	h.handoffResponse.resolve({ content: ["## Goal\nFinish the report"] });
+	await h.terminal.waitFor(() => h.screen().includes("Compaction complete"));
+	expect(h.screen()).toContain("Compaction complete");
+	expect(h.screen()).not.toContain("Compacting context in the background");
 });

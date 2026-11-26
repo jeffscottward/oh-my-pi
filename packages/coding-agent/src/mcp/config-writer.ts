@@ -7,8 +7,8 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { isEnoent } from "@oh-my-pi/pi-utils";
+import { withFileLock } from "@oh-my-pi/pi-utils/file-lock";
 import { invalidate as invalidateFsCache } from "../capability/fs";
-import { withFileLock } from "../config/file-lock";
 
 import { validateServerConfig } from "./config";
 import { MCP_CONFIG_SCHEMA_URL, type MCPConfigFile, type MCPServerConfig } from "./types";
@@ -90,13 +90,15 @@ export function validateServerName(name: string): string | undefined {
 	if (name.length > 100) {
 		return "Server name is too long (max 100 characters)";
 	}
-	// Check for invalid characters. Colon is allowed so namespaced plugin servers
-	// (e.g. "cloudflare:cloudflare-api" from a Claude Code marketplace plugin) can
-	// be persisted: the runtime already accepts colons in server names (tool names
-	// sanitize them via createMCPToolName) and `/mcp reauth` writes such names back
-	// as a user-config override that shadows the discovered entry.
-	if (!/^[a-zA-Z0-9_.:-]+$/.test(name)) {
-		return "Server name can only contain letters, numbers, dash, underscore, dot, and colon";
+	// Check for invalid characters. Colons and spaces are allowed so namespaced
+	// plugin servers (e.g. "cloudflare:cloudflare-api" from a Claude Code
+	// marketplace plugin) and human display labels (e.g. "MaaS Slack") can be
+	// persisted: the runtime already accepts them in server names (tool names
+	// sanitize them via createMCPToolName, ownership matches on the raw name) and
+	// `/mcp reauth` writes such names back as a user-config override that shadows
+	// the discovered entry.
+	if (!/^[a-zA-Z0-9_.:-]+(?: [a-zA-Z0-9_.:-]+)*$/.test(name)) {
+		return "Server name can only contain letters, numbers, dash, underscore, dot, colon, and single spaces";
 	}
 	return undefined;
 }
@@ -254,7 +256,7 @@ export async function setServerDisabled(filePath: string, name: string, disabled
 
 /**
  * Read the user-level force-enable list (allowlist that overrides a
- * non-writable source config's `enabled: false`).
+ * non-writable source config's `enabled: false` and a built-in transform's drop).
  */
 export async function readEnabledServers(filePath: string): Promise<string[]> {
 	const config = await readMCPConfigFile(filePath);
@@ -263,8 +265,8 @@ export async function readEnabledServers(filePath: string): Promise<string[]> {
 
 /**
  * Add or remove a server name from the user-level force-enable list.
- * The list overrides a discovered server's `enabled: false` flag but does
- * NOT override the `disabledServers` denylist.
+ * The list overrides a discovered server's `enabled: false` flag and a
+ * built-in transform's drop, but does NOT override the `disabledServers` denylist.
  */
 export async function setServerForceEnabled(filePath: string, name: string, force: boolean): Promise<void> {
 	// Serialize the read-modify-write (see addMCPServer).
@@ -294,7 +296,8 @@ export async function setServerForceEnabled(filePath: string, name: string, forc
 /** Paths and target state for toggling one MCP server across known config files. */
 export interface SetMcpServerEnabledOptions {
 	userPath: string;
-	projectPath: string;
+	/** Omit when project MCP config is disabled so an ignored project file is never written. */
+	projectPath?: string;
 	/**
 	 * Absolute path to the loaded row's source mcp.json. Provide ONLY for
 	 * formats this codebase owns (native `.omp/mcp.json` and `mcp-json`

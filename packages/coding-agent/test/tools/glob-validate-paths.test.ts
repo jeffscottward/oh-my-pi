@@ -1,35 +1,21 @@
-import { afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { RenderResultOptions } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools/types";
-import { getThemeByName, initTheme, type Theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { InternalUrlFilesystem } from "@oh-my-pi/pi-coding-agent/internal-urls/url-filesystem";
 import {
 	expandDelimitedPathEntries,
 	parseFindPattern,
 	resolveToolSearchScope,
 	splitDelimitedPathEntry,
 } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
-import type { Component } from "@oh-my-pi/pi-tui";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
-import { globToolRenderer } from "../../src/tools/glob";
+import { ToolCall } from "../../src/ui/transcript/tool-block";
+import { toolCallText, toolText } from "../helpers/tool-text";
+import { currentTheme, setCurrentTheme } from "@oh-my-pi/pi-tui/theme/runtime";
 
-let uiTheme: Theme;
-
-beforeAll(async () => {
-	await initTheme(false, undefined, undefined, "dark", "light");
-	const theme = await getThemeByName("dark");
-	if (!theme) throw new Error("Missing dark theme");
-	uiTheme = theme;
-});
-const renderOptions: RenderResultOptions = {
-	expanded: false,
-	isPartial: true,
-};
-
-function renderText(component: Component): string {
-	return Bun.stripANSI(component.render(160).join("\n"));
-}
+const restoreTheme = currentTheme();
+afterAll(() => setCurrentTheme(restoreTheme));
 
 describe("delimited path expansion", () => {
 	let tempDir: string;
@@ -106,6 +92,24 @@ describe("delimited path expansion", () => {
 		).toEqual(["apps/**/*.txt", "packages/**/*.txt"]);
 	});
 
+	it("splits a semicolon list whose joined string exceeds NAME_MAX (issue #7597)", async () => {
+		// Bare filenames in one directory form a single slash-free run once joined,
+		// so ~12 short entries already push the run past NAME_MAX (255). lstat on
+		// the joined string then throws ENAMETOOLONG, which used to be read as an
+		// inconclusive probe and suppress the split, collapsing the whole list to
+		// one non-existent literal path.
+		const names: string[] = [];
+		for (let i = 0; i < 20; i++) {
+			const name = `enametoolong-probe-${String(i).padStart(2, "0")}.txt`;
+			await Bun.write(path.join(tempDir, name), "needle\n");
+			names.push(name);
+		}
+		const joined = names.join("; ");
+		expect(joined.length).toBeGreaterThan(255);
+		expect(await splitDelimitedPathEntry(joined, tempDir)).toEqual(names);
+		expect(await expandDelimitedPathEntries([joined], tempDir)).toEqual(names);
+	});
+
 	it("normalizes Windows path separators before parsing find globs", async () => {
 		expect(parseFindPattern("apps\\**\\*.txt")).toEqual({
 			basePath: "apps",
@@ -127,6 +131,7 @@ describe("delimited path expansion", () => {
 			rawPaths: ["apps\\**\\*.txt"],
 			cwd: tempDir,
 			internalUrlAction: "search",
+			filesystem: new InternalUrlFilesystem({ context: {}, tier: "read" }),
 		});
 
 		expect(scope.searchPath).toBe(path.join(tempDir, "apps"));
@@ -134,33 +139,39 @@ describe("delimited path expansion", () => {
 	});
 });
 
-describe("globToolRenderer", () => {
-	it("accepts a single string paths value before validation", async () => {
+describe("glob tool card", () => {
+	it("accepts a single string paths value before validation", () => {
 		const args = { paths: "src/**/*.ts" };
 		const renderings = [
-			globToolRenderer.renderCall(args, renderOptions, uiTheme),
-			globToolRenderer.renderResult(
-				{ content: [{ type: "text", text: "src/index.ts\n" }] },
-				renderOptions,
-				uiTheme,
+			toolCallText(new ToolCall({ id: "call-1", name: "glob", args }), 160),
+			toolText({
+				name: "glob",
 				args,
-			),
-			globToolRenderer.renderResult(
-				{ content: [{ type: "text", text: "" }], details: { fileCount: 0, files: [] } },
-				renderOptions,
-				uiTheme,
+				result: { content: [{ type: "text", text: "src/index.ts\n" }] },
+				partial: true,
+				width: 160,
+			}),
+			toolText({
+				name: "glob",
 				args,
-			),
-			globToolRenderer.renderResult(
-				{ content: [{ type: "text", text: "src/index.ts" }], details: { fileCount: 1, files: ["src/index.ts"] } },
-				renderOptions,
-				uiTheme,
+				result: { content: [{ type: "text", text: "" }], details: { fileCount: 0, files: [] } },
+				partial: true,
+				width: 160,
+			}),
+			toolText({
+				name: "glob",
 				args,
-			),
+				result: {
+					content: [{ type: "text", text: "src/index.ts" }],
+					details: { fileCount: 1, files: ["src/index.ts"] },
+				},
+				partial: true,
+				width: 160,
+			}),
 		];
 
-		for (const component of renderings) {
-			expect(renderText(component)).toContain("src/**/*.ts");
+		for (const rendered of renderings) {
+			expect(rendered).toContain("src/**/*.ts");
 		}
 	});
 });

@@ -1,7 +1,7 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
-import type { Api, Model } from "@oh-my-pi/pi-ai";
+import type { Api, Model, ProviderSessionState } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -10,22 +10,33 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import {
+	lookupBuiltinSlashCommand,
+	type SlashCommandRuntime,
+} from "@oh-my-pi/pi-coding-agent/slash-commands/builtin-registry";
+import { withOfficialAnthropicEndpoint } from "./helpers/anthropic-endpoint";
+
+withOfficialAnthropicEndpoint();
 
 describe("/fast targets the current model's service-tier family", () => {
 	let tempDir: TempDir;
 	let authStorage: AuthStorage;
-	let session: AgentSession;
+	let session: AgentSession | undefined;
 	let modelRegistry: ModelRegistry;
 
-	beforeEach(() => {
+	beforeAll(async () => {
 		tempDir = TempDir.createSync("@pi-fast-mode-scope-");
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
+		modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
 	});
 
 	afterEach(async () => {
-		if (session) {
-			await session.dispose();
-		}
-		authStorage?.close();
+		await session?.dispose();
+		session = undefined;
+	});
+
+	afterAll(() => {
+		authStorage.close();
 		tempDir.removeSync();
 	});
 
@@ -41,9 +52,7 @@ describe("/fast targets the current model's service-tier family", () => {
 		const agent = new Agent({
 			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
 		});
-		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
-		authStorage.setRuntimeApiKey(model.provider, "token");
-		modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
+		authStorage.keys.setRuntime(model.provider, "token");
 		session = new AgentSession({
 			agent,
 			sessionManager: SessionManager.inMemory(),
@@ -59,6 +68,28 @@ describe("/fast targets the current model's service-tier family", () => {
 		session.setFastMode(true);
 		expect(session.serviceTierByFamily).toEqual({ anthropic: "priority" });
 		expect(session.isFastModeEnabled()).toBe(true);
+	});
+
+	it("keeps Anthropic priority enabled while an exact-model provider fallback makes it inactive", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled test model anthropic/claude-sonnet-4-5 to exist");
+		const session = await createSessionForModel(model);
+		session.setFastMode(true);
+		const state = {
+			strictToolsDisabled: false,
+			fastModeDisabled: true,
+			replayUnsignedThinkingDisabled: false,
+			close: () => {},
+		} as ProviderSessionState & { fastModeDisabled: boolean };
+		session.providerSessionState.set(`anthropic-messages:${model.baseUrl}\u0000${model.id}`, state);
+
+		expect(session.isFastModeEnabled()).toBe(true);
+		expect(session.isFastModeActive()).toBe(false);
+
+		session.setFastMode(true);
+		expect(session.isFastModeEnabled()).toBe(true);
+		expect(session.isFastModeActive()).toBe(true);
+		expect(state.fastModeDisabled).toBe(false);
 	});
 
 	it("enables priority on the OpenAI family for an OpenAI model", async () => {
@@ -89,25 +120,60 @@ describe("/fast targets the current model's service-tier family", () => {
 		expect(session.isFastModeActive()).toBe(true);
 	});
 
+	/** A Fireworks model, whose provider owns a tier control outside the service-tier families. */
+	const fireworksModel = () =>
+		buildModel({
+			id: "gpt-oss-120b",
+			name: "GPT OSS 120B",
+			api: "openai-completions",
+			provider: "fireworks",
+			baseUrl: "https://api.fireworks.ai/inference/v1",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 64_000,
+		});
+
 	it("leaves Fireworks models on the dedicated Fireworks tier control", async () => {
-		const session = await createSessionForModel(
-			buildModel({
-				id: "gpt-oss-120b",
-				name: "GPT OSS 120B",
-				api: "openai-completions",
-				provider: "fireworks",
-				baseUrl: "https://api.fireworks.ai/inference/v1",
-				reasoning: true,
-				input: ["text"],
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-				contextWindow: 128_000,
-				maxTokens: 64_000,
-			}),
-		);
+		const session = await createSessionForModel(fireworksModel());
 		expect(session.setFastMode(true)).toBe(false);
 		expect(session.serviceTierByFamily).toEqual({});
 		expect(session.isFastModeEnabled()).toBe(false);
 		expect(session.isFastModeActive()).toBe(false);
+	});
+
+	const devinModel = (priorityLane?: { id: string; routes: Record<string, string> }) =>
+		buildModel({
+			id: "claude-opus-5",
+			name: "Claude Opus 5",
+			api: "devin-agent",
+			provider: "devin",
+			baseUrl: "https://server.codeium.com",
+			requestModelId: "claude-opus-5-medium",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 200_000,
+			maxTokens: 64_000,
+			...(priorityLane && {
+				priorityLane: { ...priorityLane, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } },
+			}),
+		});
+
+	it("enables Devin's fast lanes on a Devin model that has one, and refuses without one", async () => {
+		const laned = await createSessionForModel(
+			devinModel({ id: "claude-opus-5-fast", routes: { "claude-opus-5-medium": "claude-opus-5-medium-fast" } }),
+		);
+		expect(laned.setFastMode(true)).toBe(true);
+		expect(laned.serviceTierByFamily).toEqual({ devin: "priority" });
+		expect(laned.isFastModeActive()).toBe(true);
+		await laned.dispose();
+
+		const plain = await createSessionForModel(devinModel());
+		expect(plain.setFastMode(true)).toBe(false);
+		expect(plain.serviceTierByFamily).toEqual({});
+		expect(plain.isFastModeActive()).toBe(false);
 	});
 
 	it("clears only the current model's family when disabled", async () => {
@@ -124,5 +190,94 @@ describe("/fast targets the current model's service-tier family", () => {
 		expect(session.serviceTierByFamily.anthropic).toBe("priority");
 		expect(session.toggleFastMode()).toBe(false);
 		expect(session.serviceTierByFamily.anthropic).toBeUndefined();
+	});
+
+	const codexModel = (serviceTiers: string[]) =>
+		buildModel({
+			id: "gpt-6.1-sol",
+			name: "GPT-6.1 Sol",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 272_000,
+			maxTokens: 128_000,
+			serviceTiers,
+		});
+
+	it("refuses Ultrafast on a Codex model that does not advertise it", async () => {
+		const session = await createSessionForModel(codexModel(["priority"]));
+		expect(session.setUltrafastMode(true)).toBe(false);
+		expect(session.serviceTierByFamily).toEqual({});
+		expect(session.isUltrafastModeEnabled()).toBe(false);
+	});
+
+	it("refuses /fast on a Codex model whose discovered tiers omit priority", async () => {
+		const session = await createSessionForModel(codexModel(["ultrafast"]));
+		expect(session.setFastMode(true)).toBe(false);
+		expect(session.serviceTierByFamily).toEqual({});
+		expect(session.isFastModeActive()).toBe(false);
+	});
+
+	it("keeps /fast on a Codex model whose discovered tier list is empty", async () => {
+		const session = await createSessionForModel(codexModel([]));
+		expect(session.setFastMode(true)).toBe(true);
+		expect(session.serviceTierByFamily).toEqual({ openai: "priority" });
+		expect(session.isFastModeActive()).toBe(true);
+		expect(session.setUltrafastMode(true)).toBe(false);
+	});
+
+	it("selects Ultrafast on an advertising Codex model and clears it with /fast off", async () => {
+		const session = await createSessionForModel(codexModel(["priority", "ultrafast"]));
+		expect(session.setUltrafastMode(true)).toBe(true);
+		expect(session.serviceTierByFamily).toEqual({ openai: "ultrafast" });
+		expect(session.isUltrafastModeEnabled()).toBe(true);
+		expect(session.isFastModeEnabled()).toBe(true);
+		expect(session.isFastModeActive()).toBe(true);
+		session.setFastMode(false);
+		expect(session.serviceTierByFamily).toEqual({});
+		expect(session.isFastModeActive()).toBe(false);
+	});
+	// The /fast command's message contract, driven through the builtin's
+	// portable handler: the text-mode/ACP runtime is where the reply is the
+	// only signal a host sees (the TUI overlays it with the session notice).
+	const fastCommand = lookupBuiltinSlashCommand("fast");
+
+	async function runFastCommand(session: AgentSession, args: string): Promise<string[]> {
+		const outputs: string[] = [];
+		const result = await fastCommand!.handle!({ name: "fast", args, text: `/fast ${args}`.trim() }, {
+			session,
+			output: (text: string) => {
+				outputs.push(text);
+			},
+		} as unknown as SlashCommandRuntime);
+		expect(result).toEqual({ consumed: true });
+		return outputs;
+	}
+
+	it("reports /fast off as unavailable for a model with no service-tier control", async () => {
+		const session = await createSessionForModel(fireworksModel());
+		expect(await runFastCommand(session, "off")).toEqual(["Fast mode is unavailable for the current model."]);
+		expect(session.serviceTierByFamily).toEqual({});
+	});
+
+	it("reports bare /fast as unavailable for a model with no service-tier control", async () => {
+		const session = await createSessionForModel(fireworksModel());
+		expect(await runFastCommand(session, "")).toEqual(["Fast mode is unavailable for the current model."]);
+		expect(await runFastCommand(session, "toggle")).toEqual(["Fast mode is unavailable for the current model."]);
+		expect(session.serviceTierByFamily).toEqual({});
+	});
+
+	it("disables fast mode with /fast off and toggles it both ways for a family model", async () => {
+		const session = await createSession("anthropic", "claude-sonnet-4-5");
+		session.setFastMode(true);
+		expect(await runFastCommand(session, "off")).toEqual(["Fast mode disabled."]);
+		expect(session.serviceTierByFamily).toEqual({});
+		expect(await runFastCommand(session, "")).toEqual(["Fast mode enabled."]);
+		expect(session.serviceTierByFamily.anthropic).toBe("priority");
+		expect(await runFastCommand(session, "")).toEqual(["Fast mode disabled."]);
+		expect(session.serviceTierByFamily).toEqual({});
 	});
 });

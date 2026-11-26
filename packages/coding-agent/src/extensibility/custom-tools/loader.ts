@@ -1,23 +1,26 @@
 /**
- * Custom tool loader - loads TypeScript tool modules using native Bun import.
+ * Custom tool loader - loads TypeScript tool modules through the same loader
+ * as extensions, so `@oh-my-pi/*` imports resolve to the host's bundled copy
+ * (in the compiled binary there is no other copy to resolve).
  *
- * Dependencies (the zod-backed typebox shim and pi-coding-agent) are injected via the
- * CustomToolAPI to avoid import resolution issues with custom tools loaded from user directories.
+ * Dependencies are also injected through CustomToolAPI so tools loaded from
+ * user directories need no workspace module resolution.
  */
 import * as path from "node:path";
+import { type } from "@oh-my-pi/omptype";
+import * as zod from "@oh-my-pi/omptype/zod";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { logger } from "@oh-my-pi/pi-utils";
-import { type } from "arktype";
-import * as zodModule from "zod/v4";
 import { toolCapability } from "../../capability/tool";
+import type { EffectiveExtensionRoots } from "../../capability/types";
 import { type CustomTool, loadCapability } from "../../discovery";
 import type { ExecOptions } from "../../exec/exec";
 import { execCommand } from "../../exec/exec";
 import type { HookUIContext } from "../../extensibility/hooks/types";
 import { getAllPluginToolPaths } from "../../extensibility/plugins/loader";
-// Runtime self-reference: dereference this namespace only inside loader functions to keep the index.ts cycle safe.
-import * as PiCodingAgent from "../../index";
-import * as typebox from "../typebox";
+import { loadLegacyPiModule } from "../plugins/legacy-pi-compat";
+import { getCodingAgentApi } from "../host-api";
+import * as typebox from "../legacy-typebox";
 import { createNoOpUIContext, resolvePath, withHostGuard } from "../utils";
 import type { CustomToolAPI, CustomToolFactory, LoadedCustomTool, ToolLoadError } from "./types";
 
@@ -50,7 +53,22 @@ function invalidToolError(path: string, index: number, source: ToolLoadError["so
 }
 
 /**
- * Load a single tool module using native Bun import.
+ * The factory a tool module exports. A CommonJS module's namespace `default` is
+ * its whole `module.exports`, so transpiled output (`exports.default = factory`
+ * with `__esModule`) carries the factory one level down.
+ */
+function customToolFactoryOf(module: { default?: unknown }): CustomToolFactory | undefined {
+	const candidate = module.default ?? module;
+	if (typeof candidate === "function") return candidate as CustomToolFactory;
+	if (typeof candidate === "object" && candidate !== null && "default" in candidate) {
+		const nested = candidate.default;
+		if (typeof nested === "function") return nested as CustomToolFactory;
+	}
+	return undefined;
+}
+
+/**
+ * Load a single tool module through the host-package loader.
  */
 async function loadTool(
 	toolPath: string,
@@ -75,8 +93,13 @@ async function loadTool(
 	}
 
 	try {
-		const module = await withHostGuard(() => import(resolvedPath));
-		const factory = (module.default ?? module) as CustomToolFactory;
+		// `reload: false`: a tool module and its helpers are evaluated once per
+		// process and shared, as with a native import; each session still calls
+		// the factory with its own API.
+		const module = (await withHostGuard(() => loadLegacyPiModule(resolvedPath, { reload: false }))) as {
+			default?: unknown;
+		};
+		const factory = customToolFactoryOf(module);
 
 		if (typeof factory !== "function") {
 			return { tools: [], errors: [{ path: toolPath, error: "Tool must export a default function", source }] };
@@ -130,7 +153,6 @@ export class CustomToolLoader {
 	#seenNames: Set<string>;
 
 	constructor(
-		pi: typeof PiCodingAgent,
 		cwd: string,
 		builtInToolNames: string[],
 		pushPendingAction?: (action: {
@@ -149,8 +171,10 @@ export class CustomToolLoader {
 			logger,
 			typebox,
 			arktype: type,
-			zod: zodModule,
-			pi,
+			zod,
+			get pi() {
+				return getCodingAgentApi();
+			},
 			pushPendingAction: action => {
 				if (!pushPendingAction) {
 					throw new Error("Pending action store unavailable for custom tools in this runtime.");
@@ -211,7 +235,7 @@ export async function loadCustomTools(
 		reject?(reason: string): Promise<AgentToolResult<unknown> | undefined>;
 	}) => void,
 ) {
-	const loader = new CustomToolLoader(PiCodingAgent, cwd, builtInToolNames, pushPendingAction);
+	const loader = new CustomToolLoader(cwd, builtInToolNames, pushPendingAction);
 	await loader.load(pathsWithSources);
 	return {
 		tools: loader.tools,
@@ -220,6 +244,18 @@ export async function loadCustomTools(
 			loader.setUIContext(uiContext, hasUI);
 		},
 	};
+}
+
+export interface DiscoverCustomToolPathOptions {
+	/**
+	 * Include ambient sources: native/Claude/Codex tool dirs, marketplace and
+	 * installed plugins. `false` (an explicit-only `disableExtensionDiscovery`
+	 * session) keeps only the `tools/` of explicitly named extension package
+	 * roots and the configured paths. Default: true.
+	 */
+	ambient?: boolean;
+	/** Session-local extension roots for loads outside the construction-time scope. */
+	extensionRoots?: EffectiveExtensionRoots;
 }
 
 /**
@@ -234,8 +270,16 @@ export async function loadCustomTools(
  *
  * @param configuredPaths - Explicit paths from settings.json and CLI --tool flags
  * @param cwd - Current working directory
+ * @param agentDir - Native user config dir. Default: getAgentDir()
+ * @param options - Ambient-source gate and session-local extension roots
  */
-export async function discoverCustomToolPaths(configuredPaths: string[], cwd: string): Promise<ToolPathWithSource[]> {
+export async function discoverCustomToolPaths(
+	configuredPaths: string[],
+	cwd: string,
+	agentDir?: string,
+	options: DiscoverCustomToolPathOptions = {},
+): Promise<ToolPathWithSource[]> {
+	const ambient = options.ambient !== false;
 	const allPathsWithSources: ToolPathWithSource[] = [];
 	const seen = new Set<string>();
 
@@ -248,8 +292,17 @@ export async function discoverCustomToolPaths(configuredPaths: string[], cwd: st
 		}
 	};
 
-	// 1. Discover tools via capability system (user + project from all providers)
-	const discoveredTools = await loadCapability<CustomTool>(toolCapability.id, { cwd });
+	// Capability providers also expose metadata and scripts. Filter before deduplication
+	// so those entries cannot shadow executable modules with the same name.
+	// Non-ambient discovery reads only the `omp-plugins` provider, which in
+	// explicit-only mode lists just the explicit extension package roots.
+	const discoveredTools = await loadCapability<CustomTool>(toolCapability.id, {
+		cwd,
+		agentDir,
+		filter: tool => /\.(ts|js|mjs|cjs)$/.test(tool.path) && !tool.path.endsWith(".d.ts"),
+		...(ambient ? {} : { providers: ["omp-plugins"] }),
+		...(options.extensionRoots ? { extensionRoots: options.extensionRoots } : {}),
+	});
 	for (const tool of discoveredTools.items) {
 		addPath(tool.path, {
 			provider: tool._source.provider,
@@ -259,8 +312,10 @@ export async function discoverCustomToolPaths(configuredPaths: string[], cwd: st
 	}
 
 	// 2. Plugin tools: ~/.omp/plugins/node_modules/*/
-	for (const pluginPath of await getAllPluginToolPaths(cwd)) {
-		addPath(pluginPath, { provider: "plugin", providerName: "Plugin", level: "user" });
+	if (ambient) {
+		for (const pluginPath of await getAllPluginToolPaths(cwd)) {
+			addPath(pluginPath, { provider: "plugin", providerName: "Plugin", level: "user" });
+		}
 	}
 
 	// 3. Explicitly configured paths (can override/add)
@@ -284,6 +339,7 @@ export async function discoverCustomToolPaths(configuredPaths: string[], cwd: st
  * @param configuredPaths - Explicit paths from settings.json and CLI --tool flags
  * @param cwd - Current working directory
  * @param builtInToolNames - Names of built-in tools to check for conflicts
+ * @param agentDir - Native user config dir. Default: getAgentDir()
  */
 export async function discoverAndLoadCustomTools(
 	configuredPaths: string[],
@@ -295,7 +351,8 @@ export async function discoverAndLoadCustomTools(
 		apply(reason: string): Promise<AgentToolResult<unknown>>;
 		reject?(reason: string): Promise<AgentToolResult<unknown> | undefined>;
 	}) => void,
+	agentDir?: string,
 ) {
-	const pathsWithSources = await discoverCustomToolPaths(configuredPaths, cwd);
+	const pathsWithSources = await discoverCustomToolPaths(configuredPaths, cwd, agentDir);
 	return loadCustomTools(pathsWithSources, cwd, builtInToolNames, pushPendingAction);
 }

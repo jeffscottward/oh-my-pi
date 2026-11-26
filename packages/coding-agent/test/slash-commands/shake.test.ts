@@ -1,10 +1,8 @@
 import { describe, expect, it, vi } from "bun:test";
+import { CommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/command-controller";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import type { ShakeMode } from "@oh-my-pi/pi-coding-agent/session/shake-types";
-import {
-	ACP_BUILTIN_SLASH_COMMANDS,
-	executeAcpBuiltinSlashCommand,
-} from "@oh-my-pi/pi-coding-agent/slash-commands/acp-builtins";
+import { executeAcpBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/acp-builtins";
 import { executeBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/builtin-registry";
 import type { SlashCommandRuntime } from "@oh-my-pi/pi-coding-agent/slash-commands/types";
 
@@ -27,7 +25,7 @@ function tuiRuntime() {
 	const showWarning = vi.fn();
 	const runtime = {
 		ctx: {
-			editor: { setText } as unknown as InteractiveModeContext["editor"],
+			composer: { setText } as unknown as InteractiveModeContext["composer"],
 			handleShakeCommand,
 			showWarning,
 		} as unknown as InteractiveModeContext,
@@ -43,7 +41,7 @@ describe("/shake dispatch (ACP)", () => {
 	});
 
 	it("parses each explicit mode", async () => {
-		for (const mode of ["elide", "images"] as const) {
+		for (const mode of ["elide", "images", "thinking"] as const) {
 			const h = acpRuntime();
 			await executeAcpBuiltinSlashCommand(`/shake ${mode}`, h.runtime);
 			expect(h.shake).toHaveBeenCalledWith(mode);
@@ -54,19 +52,8 @@ describe("/shake dispatch (ACP)", () => {
 		const h = acpRuntime();
 		const result = await executeAcpBuiltinSlashCommand("/shake bogus", h.runtime);
 		expect(h.shake).not.toHaveBeenCalled();
-		expect(result).toEqual({ consumed: true });
+		expect(result).toEqual({ consumed: true, failed: true });
 		expect((h.output.mock.calls[0]?.[0] as string) ?? "").toContain("bogus");
-	});
-
-	it("is advertised to ACP clients with the mode hint", () => {
-		const advertised = ACP_BUILTIN_SLASH_COMMANDS.find(c => c.name === "shake");
-		expect(advertised).toBeDefined();
-		expect(advertised?.input?.hint).toBe("[elide|images]");
-	});
-
-	it("advertises /shake images as the image-stripping path and no longer advertises /drop-images", () => {
-		expect(ACP_BUILTIN_SLASH_COMMANDS.some(c => c.name === "shake")).toBe(true);
-		expect(ACP_BUILTIN_SLASH_COMMANDS.some(c => c.name === "drop-images")).toBe(false);
 	});
 });
 
@@ -90,5 +77,74 @@ describe("/shake dispatch (TUI)", () => {
 		await executeBuiltinSlashCommand("/shake nope", h.runtime);
 		expect(h.handleShakeCommand).not.toHaveBeenCalled();
 		expect(h.showWarning).toHaveBeenCalled();
+	});
+});
+describe("CommandController /shake", () => {
+	it.each([
+		{ thinkingBlocksDropped: 2, interruptedThinkingNotesDropped: 0, description: "2 thinking blocks" },
+		{ thinkingBlocksDropped: 0, interruptedThinkingNotesDropped: 1, description: "1 interrupted-thinking note" },
+	])("reports $description and rebuilds the transcript", async ({ description, ...counts }) => {
+		const rebuildChatFromMessages = vi.fn();
+		const refresh = vi.fn();
+		const replayHistory = vi.fn();
+		const showStatus = vi.fn();
+		const ctx = {
+			session: {
+				shake: vi.fn(async () => ({
+					mode: "thinking" as const,
+					toolResultsDropped: 0,
+					blocksDropped: 0,
+					...counts,
+					tokensFreed: 0,
+				})),
+			},
+			rebuildChatFromMessages,
+			statusLine: { refresh },
+			shell: { host: { replayHistory } },
+			showStatus,
+			showError: vi.fn(),
+		} as unknown as InteractiveModeContext;
+
+		await new CommandController(ctx).handleShakeCommand("thinking");
+
+		expect(rebuildChatFromMessages).toHaveBeenCalledTimes(1);
+		expect(refresh).toHaveBeenCalledTimes(1);
+		expect(replayHistory).toHaveBeenCalledTimes(1);
+		expect(showStatus).toHaveBeenCalledWith(`Dropped ${description} from this session.`);
+	});
+
+	it("reports kept thinking without rebuilding the transcript", async () => {
+		const rebuildChatFromMessages = vi.fn();
+		const refresh = vi.fn();
+		const replayHistory = vi.fn();
+		const showStatus = vi.fn();
+		const ctx = {
+			session: {
+				shake: vi.fn(async () => ({
+					mode: "thinking" as const,
+					toolResultsDropped: 0,
+					blocksDropped: 0,
+					thinkingBlocksDropped: 0,
+					thinkingBlocksKept: 3,
+					tokensFreed: 0,
+				})),
+			},
+			rebuildChatFromMessages,
+			statusLine: { refresh },
+			shell: { host: { replayHistory } },
+			showStatus,
+			showError: vi.fn(),
+		} as unknown as InteractiveModeContext;
+
+		await new CommandController(ctx).handleShakeCommand("thinking");
+
+		// Nothing changed on disk or on screen, so only the status line speaks.
+		expect(rebuildChatFromMessages).not.toHaveBeenCalled();
+		expect(refresh).not.toHaveBeenCalled();
+		expect(replayHistory).not.toHaveBeenCalled();
+		expect(showStatus).toHaveBeenCalledTimes(1);
+		const status = showStatus.mock.calls[0]?.[0] as string;
+		expect(status).toContain("3 thinking blocks");
+		expect(status).toContain("kept");
 	});
 });

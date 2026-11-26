@@ -1,18 +1,16 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent, type AgentMessage } from "@oh-my-pi/pi-agent-core";
-import { estimateTokens } from "@oh-my-pi/pi-agent-core/compaction/compaction";
 import type { AssistantMessage, Message, Model } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { StatusLineComponent } from "@oh-my-pi/pi-coding-agent/modes/components/status-line";
-import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
-import { computeContextBreakdown } from "@oh-my-pi/pi-coding-agent/modes/utils/context-usage";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { computeSessionContextBreakdown } from "@oh-my-pi/pi-coding-agent/session/context-usage-runtime";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { disposeStatusLines, statusLine } from "./helpers/session-status-line";
 
 describe("Context usage consolidation", () => {
 	let sharedDir: TempDir;
@@ -23,11 +21,10 @@ describe("Context usage consolidation", () => {
 	beforeAll(async () => {
 		sharedDir = TempDir.createSync("@pi-context-shared-");
 		authStorage = await AuthStorage.create(path.join(sharedDir.path(), "testauth.db"));
-		authStorage.setRuntimeApiKey("anthropic", "test-key");
-		authStorage.setRuntimeApiKey("openai", "test-key");
+		authStorage.keys.setRuntime("anthropic", "test-key");
+		authStorage.keys.setRuntime("openai", "test-key");
 		modelRegistry = new ModelRegistry(authStorage);
 		await Settings.init({ inMemory: true });
-		await initTheme();
 
 		mockModel = createMockModel({
 			id: "gpt-mock",
@@ -43,7 +40,13 @@ describe("Context usage consolidation", () => {
 						cacheRead: 0,
 						cacheWrite: 0,
 						totalTokens: 120,
-						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						cost: {
+							input: 0,
+							output: 0,
+							cacheRead: 0,
+							cacheWrite: 0,
+							total: 0,
+						},
 					},
 				},
 			],
@@ -51,6 +54,7 @@ describe("Context usage consolidation", () => {
 	});
 
 	afterAll(async () => {
+		disposeStatusLines();
 		authStorage.close();
 		try {
 			await sharedDir.remove();
@@ -60,6 +64,7 @@ describe("Context usage consolidation", () => {
 	function createSession(
 		tempDir: TempDir,
 		messages: AgentMessage[] = [],
+		systemPrompt: string[] = ["You are a helpful assistant."],
 	): { session: AgentSession; sessionManager: SessionManager; agent: Agent } {
 		const sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
 		for (const msg of messages) {
@@ -70,7 +75,7 @@ describe("Context usage consolidation", () => {
 			getApiKey: () => "test-key",
 			initialState: {
 				model: mockModel,
-				systemPrompt: ["You are a helpful assistant."],
+				systemPrompt,
 				tools: [],
 				messages,
 			},
@@ -85,7 +90,7 @@ describe("Context usage consolidation", () => {
 			settings: Settings.isolated({
 				"compaction.enabled": true,
 				"compaction.autoContinue": false,
-				"compaction.strategy": "context-full",
+				"compaction.methodOrder": ["soft"],
 				"compaction.thresholdTokens": 8000,
 			}),
 			modelRegistry,
@@ -106,7 +111,11 @@ describe("Context usage consolidation", () => {
 		const tempDir = TempDir.createSync("@branch-local-");
 		const { session, sessionManager, agent } = createSession(tempDir);
 
-		sessionManager.appendMessage({ role: "user", content: "hello", timestamp: 1000 } as Message);
+		sessionManager.appendMessage({
+			role: "user",
+			content: "hello",
+			timestamp: 1000,
+		} as Message);
 		sessionManager.appendMessage({
 			role: "assistant",
 			content: [{ type: "text", text: "parent response" }],
@@ -149,7 +158,11 @@ describe("Context usage consolidation", () => {
 		} as AssistantMessage);
 
 		sessionManager.branch(parentId!);
-		sessionManager.appendMessage({ role: "user", content: "active branch hello", timestamp: 4000 } as Message);
+		sessionManager.appendMessage({
+			role: "user",
+			content: "active branch hello",
+			timestamp: 4000,
+		} as Message);
 		sessionManager.appendMessage({
 			role: "assistant",
 			content: [{ type: "text", text: "active response" }],
@@ -182,7 +195,11 @@ describe("Context usage consolidation", () => {
 		const tempDir = TempDir.createSync("@rollback-");
 		const { session, sessionManager, agent } = createSession(tempDir);
 
-		sessionManager.appendMessage({ role: "user", content: "first", timestamp: 1000 } as Message);
+		sessionManager.appendMessage({
+			role: "user",
+			content: "first",
+			timestamp: 1000,
+		} as Message);
 		const firstId = sessionManager.appendMessage({
 			role: "assistant",
 			content: [{ type: "text", text: "first response" }],
@@ -202,7 +219,11 @@ describe("Context usage consolidation", () => {
 			timestamp: 2000,
 		} as AssistantMessage);
 
-		sessionManager.appendMessage({ role: "user", content: "second", timestamp: 3000 } as Message);
+		sessionManager.appendMessage({
+			role: "user",
+			content: "second",
+			timestamp: 3000,
+		} as Message);
 		sessionManager.appendMessage({
 			role: "assistant",
 			content: [{ type: "text", text: "second response" }],
@@ -268,7 +289,11 @@ describe("Context usage consolidation", () => {
 		const tempDir = TempDir.createSync("@tail-custom-");
 		const { session, sessionManager, agent } = createSession(tempDir);
 
-		sessionManager.appendMessage({ role: "user", content: "query", timestamp: 1000 } as Message);
+		sessionManager.appendMessage({
+			role: "user",
+			content: "query",
+			timestamp: 1000,
+		} as Message);
 		sessionManager.appendMessage({
 			role: "assistant",
 			content: [{ type: "text", text: "anchor response" }],
@@ -301,7 +326,7 @@ describe("Context usage consolidation", () => {
 		const breakdown = session.getContextBreakdown();
 		expect(breakdown?.anchored).toBe(true);
 
-		const customEstimate = estimateTokens(customMsg);
+		const customEstimate = agent.tokenizer.countMessage(customMsg);
 		expect(breakdown?.usedTokens).toBe(150 + customEstimate);
 
 		await tempDir.remove();
@@ -311,7 +336,11 @@ describe("Context usage consolidation", () => {
 		const tempDir = TempDir.createSync("@agree-");
 		const { session, sessionManager, agent } = createSession(tempDir);
 
-		sessionManager.appendMessage({ role: "user", content: "query", timestamp: 1000 } as Message);
+		sessionManager.appendMessage({
+			role: "user",
+			content: "query",
+			timestamp: 1000,
+		} as Message);
 		sessionManager.appendMessage({
 			role: "assistant",
 			content: [{ type: "text", text: "anchor response" }],
@@ -336,52 +365,13 @@ describe("Context usage consolidation", () => {
 		const breakdownVal = session.getContextBreakdown();
 		const used = breakdownVal?.usedTokens;
 
-		const cb = computeContextBreakdown(session);
+		const cb = computeSessionContextBreakdown(session);
 		expect(cb.usedTokens).toBe(used!);
 
-		const sl = new StatusLineComponent(session);
-		expect(sl.getCachedContextBreakdown().usedTokens).toBe(used!);
+		expect(statusLine(session).contextBreakdown().usedTokens).toBe(used!);
 
 		const cu = session.getContextUsage();
 		expect(cu?.tokens).toBe(used!);
-
-		await tempDir.remove();
-	});
-
-	it("invalidates status-line cache on reasoning-signature growth", async () => {
-		const tempDir = TempDir.createSync("@cache-invalidate-");
-		const { session, sessionManager, agent } = createSession(tempDir);
-
-		sessionManager.appendMessage({ role: "user", content: "query", timestamp: 1000 } as Message);
-		const assistant: AssistantMessage = {
-			role: "assistant",
-			content: [{ type: "text", text: "text content" }],
-			usage: {
-				input: 250,
-				output: 20,
-				cacheRead: 0,
-				cacheWrite: 0,
-				totalTokens: 270,
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-			},
-			contextSnapshot: { promptTokens: 250, nonMessageTokens: 10 },
-			timestamp: 2000,
-			stopReason: "stop",
-			api: mockModel.api,
-			provider: mockModel.provider,
-			model: mockModel.id,
-		};
-		sessionManager.appendMessage(assistant);
-		syncSession(session, agent);
-
-		const sl = new StatusLineComponent(session);
-		const initialBreakdown = sl.getCachedContextBreakdown();
-
-		const assistantExt = assistant as unknown as { thinkingSignature: string };
-		assistantExt.thinkingSignature = "signature_grows";
-
-		const nextBreakdown = sl.getCachedContextBreakdown();
-		expect(nextBreakdown.usedTokens).toBe(initialBreakdown.usedTokens);
 
 		await tempDir.remove();
 	});
@@ -429,7 +419,11 @@ describe("Context usage consolidation", () => {
 		// While the request hangs (pending snapshot active, cutoff at the new
 		// prompt), simulate the turn's user message landing plus a completed tool
 		// step carrying a real, large provider prompt count.
-		sessionManager.appendMessage({ role: "user", content: "new question", timestamp: 5000 } as Message);
+		sessionManager.appendMessage({
+			role: "user",
+			content: "new question",
+			timestamp: 5000,
+		} as Message);
 		sessionManager.appendMessage({
 			role: "assistant",
 			content: [{ type: "text", text: "step" }],
@@ -469,7 +463,11 @@ describe("Context usage consolidation", () => {
 
 		// Prior completed turn establishes a real anchor that PREDATES the new
 		// prompt (resolves before the pending cutoff).
-		sessionManager.appendMessage({ role: "user", content: "old", timestamp: 1000 } as Message);
+		sessionManager.appendMessage({
+			role: "user",
+			content: "old",
+			timestamp: 1000,
+		} as Message);
 		sessionManager.appendMessage({
 			role: "assistant",
 			content: [{ type: "text", text: "old response" }],
@@ -545,6 +543,25 @@ describe("Context usage consolidation", () => {
 		expect(typeof cu?.tokens).toBe("number");
 		expect(cu?.percent).not.toBeNull();
 		expect(typeof cu?.percent).toBe("number");
+
+		await tempDir.remove();
+	});
+
+	// A before_agent_start extension can hand back a system-prompt array with a
+	// missing (undefined) section. getContextBreakdown funnels that array into
+	// both estimate paths — computeNonMessageBreakdown AND the collapsed
+	// computeNonMessageTokens — so the whole call must tolerate it rather than
+	// throwing "Failed to measure JavaScript string" and killing the session
+	// (issue #9331).
+	it("tolerates an undefined system-prompt section without throwing", async () => {
+		const tempDir = TempDir.createSync("@malformed-prompt-");
+		const malformed = ["You are a helpful assistant.", undefined as unknown as string, "trailing context"];
+		const { session } = createSession(tempDir, [], malformed);
+
+		const breakdown = session.getContextBreakdown();
+		expect(breakdown).toBeDefined();
+		expect(Number.isFinite(breakdown?.systemContextTokens ?? Number.NaN)).toBe(true);
+		expect(breakdown?.usedTokens ?? -1).toBeGreaterThanOrEqual(0);
 
 		await tempDir.remove();
 	});

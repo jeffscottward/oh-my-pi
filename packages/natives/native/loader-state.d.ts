@@ -1,21 +1,19 @@
 export interface EmbeddedAddonFile {
 	variant: "modern" | "baseline" | "default";
+	/** Basename of the extracted `.node` file. */
 	filename: string;
-	size?: number;
-	filePath?: string;
-}
-
-export interface EmbeddedAddonArchive {
-	format: "tar.gz";
-	filename: string;
-	filePath: string;
+	/** Decompressed addon size in bytes. */
+	size: number;
+	/** Build-time xxHash64 (hex) of the decompressed addon; names its extraction directory (`embedded-<hash>/`). */
+	hash: string;
+	/** Embedded zstd frame holding the addon bytes. */
+	zstdPath: string;
 }
 
 export interface EmbeddedAddon {
 	platformTag: string;
 	version: string;
 	files: EmbeddedAddonFile[];
-	archive?: EmbeddedAddonArchive;
 }
 
 export interface DetectCompiledBinaryInput {
@@ -25,6 +23,7 @@ export interface DetectCompiledBinaryInput {
 }
 
 export function detectCompiledBinary(input: DetectCompiledBinaryInput): boolean;
+
 
 export interface GetAddonFilenamesInput {
 	tag: string;
@@ -55,6 +54,31 @@ export interface ResolveLoaderCandidatesInput {
 
 export function resolveLoaderCandidates(input: ResolveLoaderCandidatesInput): string[];
 
+export interface InitLoaderContextOverrides {
+	nativeDir?: string;
+	platform?: NodeJS.Platform | string;
+	isCompiledBinary?: boolean;
+	leafPackageDir?: string | null;
+}
+
+export interface NativeLoaderContext {
+	platformTag: string;
+	packageVersion: string;
+	nativeDir: string;
+	leafPackageDir: string | null;
+	versionedDir: string;
+	isCompiledBinary: boolean;
+	stageFromNodeModules: boolean;
+	selectedVariant: "modern" | "baseline" | null;
+	addonFilenames: string[];
+	addonLabel: string;
+	candidates: string[];
+	isWorkspaceLoad: boolean;
+	nativesDir: string;
+}
+
+export function initLoaderContext(overrides?: InitLoaderContextOverrides): NativeLoaderContext;
+
 export interface CleanupStaleNativeVersionsInput {
 	nativesDir: string;
 	currentVersion: string;
@@ -62,13 +86,43 @@ export interface CleanupStaleNativeVersionsInput {
 
 export function cleanupStaleNativeVersions(input: CleanupStaleNativeVersionsInput): string[];
 
-export interface ExtractEmbeddedAddonArchiveInput {
-	archivePath: string;
+export function prepareNativeVersionDir(versionedDir: string): void;
+
+export interface ExtractEmbeddedAddonsInput {
 	files: EmbeddedAddonFile[];
 	targetDir: string;
 }
 
-export function extractEmbeddedAddonArchive(input: ExtractEmbeddedAddonArchiveInput): string[];
+/**
+ * Decompress each manifest addon to its `embedded-<hash>/<filename>` path unless that build is already there; returns the paths written.
+ * Creates and touches `targetDir` first; failing that (read-only or foreign-owned directory) throws only if an addon is missing.
+ */
+export function extractEmbeddedAddons(input: ExtractEmbeddedAddonsInput): string[];
+
+/** Where `extractEmbeddedAddons` puts `file`: `<targetDir>/embedded-<hash>/<filename>`. */
+export function embeddedAddonPath(targetDir: string, file: EmbeddedAddonFile): string;
+
+export interface PruneStaleEmbeddedAddonsInput {
+	targetDir: string;
+	/** Hashes of the running binary's addons, whose directories are kept. */
+	keepHashes: string[];
+}
+
+/** Best-effort removal of other builds' `embedded-<hash>` directories; returns the directories removed. */
+export function pruneStaleEmbeddedAddons(input: PruneStaleEmbeddedAddonsInput): string[];
+
+export interface ResolveRuntimeCandidatesInput {
+	candidates: string[];
+	versionedDir: string;
+	/** True when the binary embeds an addon for this platform and version. */
+	hasEmbedded: boolean;
+	/** This build's hash-path candidates, probed first. */
+	embedded: string[];
+	staged: string | null;
+}
+
+/** `loadNative`'s probe order; drops the shared `versionedDir/<filename>` paths when `hasEmbedded`. */
+export function resolveRuntimeCandidates(input: ResolveRuntimeCandidatesInput): string[];
 
 export interface SelectCpuVariantInput {
 	arch: string;
@@ -89,7 +143,6 @@ export function selectCpuVariant(input: SelectCpuVariantInput): SelectCpuVariant
 export interface ValidateLoadedBindingsContext {
 	isWorkspaceLoad: boolean;
 	packageVersion: string;
-	versionSentinelExport: string;
 }
 
 export function validateLoadedBindings(
@@ -97,5 +150,47 @@ export function validateLoadedBindings(
 	bindings: Record<string, unknown>,
 	candidate: string,
 ): void;
+
+/** Identity of the addon `loadNative()` returned, for missing-export diagnostics. */
+export interface NativeAddonStatus {
+	/** Absolute path of the loaded `.node`. */
+	path: string;
+	/** Release the loaded addon reports (post-link stamp or legacy sentinel), or `null` when unidentified. */
+	version: string | null;
+	/** `package.json#version` of the loader that loaded it. */
+	packageVersion: string;
+	/** True when the addon carries a different release than this package. */
+	stale: boolean;
+}
+
+/** The addon behind this process's exports; `null` before a successful load. */
+export function nativeAddonStatus(): NativeAddonStatus | null;
+
+/**
+ * Stub for an export the addon does not provide: `undefined` on a current
+ * addon, a throwing function on a stale one.
+ */
+export function missingNativeExport(
+	symbolName: string,
+	addon?: NativeAddonStatus | null,
+): (() => never) | undefined;
+
+/**
+ * Stub for a class the addon does not provide: `undefined` on a current addon,
+ * a class whose constructor throws on a stale one.
+ */
+export function missingNativeClass(
+	symbolName: string,
+	addon?: NativeAddonStatus | null,
+): (new (...args: unknown[]) => never) | undefined;
+
+/** Actionable text for {@link missingNativeExport}. */
+export function missingNativeExportMessage(symbolName: string, addon?: NativeAddonStatus | null): string;
+
+/**
+ * Open one `.node` addon with `process.dlopen` and return its exports, as
+ * `require` does; unlike Bun's `require`, it loads from a path that holds `?`.
+ */
+export function openNativeAddon(candidate: string): Record<string, unknown>;
 
 export function loadNative(): Record<string, unknown>;

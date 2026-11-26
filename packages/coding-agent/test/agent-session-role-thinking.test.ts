@@ -1,27 +1,44 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { Effort } from "@oh-my-pi/pi-ai";
+import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { THINKING_EFFORTS } from "@oh-my-pi/pi-catalog/effort";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import * as autoThinkingClassifier from "@oh-my-pi/pi-coding-agent/auto-thinking/classifier";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { SKILL_PROMPT_MESSAGE_TYPE } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { thinkingLevelWord } from "@oh-my-pi/pi-coding-agent/modes/view-model/status-line/segments";
 import {
 	AUTO_THINKING,
 	clampAutoThinkingEffort,
 	resolveProvisionalAutoLevel,
-} from "@oh-my-pi/pi-coding-agent/thinking";
+} from "@oh-my-pi/pi-coding-agent/thinking/levels";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
+import { cfgDefaultThinkingLevel } from "@oh-my-pi/pi-coding-agent/session/settings";
+
 describe("AgentSession role model thinking behavior", () => {
 	let tempDir: TempDir;
+	let fixtureDir: TempDir;
+	let authStorage: AuthStorage;
+	let modelRegistry: ModelRegistry;
 	let session: AgentSession;
 	let sessionSettings: Settings;
-	const authStorages: AuthStorage[] = [];
+
+	beforeAll(async () => {
+		fixtureDir = TempDir.createSync("@pi-role-thinking-fixture-");
+		authStorage = await AuthStorage.create(path.join(fixtureDir.path(), "testauth.db"));
+		authStorage.keys.setRuntime("anthropic", "test-key");
+		authStorage.keys.setRuntime("openai", "test-key");
+		modelRegistry = new ModelRegistry(authStorage, path.join(fixtureDir.path(), "models.yml"));
+	});
 
 	beforeEach(() => {
 		tempDir = TempDir.createSync("@pi-role-thinking-");
@@ -32,10 +49,12 @@ describe("AgentSession role model thinking behavior", () => {
 		if (session) {
 			await session.dispose();
 		}
-		for (const authStorage of authStorages.splice(0)) {
-			authStorage.close();
-		}
 		tempDir.removeSync();
+	});
+
+	afterAll(() => {
+		authStorage.close();
+		fixtureDir.removeSync();
 	});
 
 	function getAnthropicModelOrThrow(id: string) {
@@ -60,14 +79,11 @@ describe("AgentSession role model thinking behavior", () => {
 				thinkingLevel: options.initialThinkingLevel,
 			},
 		});
-		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
-		authStorages.push(authStorage);
-		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		authStorage.keys.setRuntime("anthropic", "test-key");
 		const runtimeApiKeys = options.runtimeApiKeys ?? {};
 		for (const provider in runtimeApiKeys) {
-			authStorage.setRuntimeApiKey(provider, runtimeApiKeys[provider]);
+			authStorage.keys.setRuntime(provider, runtimeApiKeys[provider]);
 		}
-		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
 
 		sessionSettings = Settings.isolated();
 		for (const [role, modelRoleValue] of Object.entries(options.modelRoles)) {
@@ -209,6 +225,33 @@ describe("AgentSession role model thinking behavior", () => {
 		expect(sessionSettings.getModelRole("default")).toBe(`${slowModel.provider}/${slowModel.id}:off`);
 	});
 
+	it.each([
+		{ selector: "a:max", id: "a:max", available: true },
+		{ selector: "a:max", id: "a:max", available: false },
+		{ selector: "A:max", id: "a:max", available: true },
+		{ selector: "A:auto", id: "a:auto", available: false },
+	])("does not inherit literal effort from $selector (available=$available)", async ({ selector, id, available }) => {
+		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		const nextModel = getAnthropicModelOrThrow("claude-sonnet-4-6");
+		const literalModel = { ...defaultModel, id };
+
+		await createSession({
+			initialModelId: defaultModel.id,
+			initialThinkingLevel: Effort.High,
+			modelRoles: { default: selector },
+		});
+		const allModels = modelRegistry.getAll("all");
+		vi.spyOn(modelRegistry, "getAll").mockReturnValue([...allModels, literalModel]);
+		if (available) {
+			const availableModels = modelRegistry.getAvailable();
+			vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([...availableModels, literalModel]);
+		}
+
+		await session.setModel(nextModel, "default", { persist: true });
+
+		expect(sessionSettings.getModelRole("default")).toBe(`${nextModel.provider}/${nextModel.id}`);
+	});
+
 	it("clamps unsupported selections from model metadata", async () => {
 		const model = getAnthropicModelOrThrow("claude-sonnet-4-6");
 		const agent = new Agent({
@@ -220,10 +263,7 @@ describe("AgentSession role model thinking behavior", () => {
 				thinkingLevel: undefined,
 			},
 		});
-		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth-non-xhigh.db"));
-		authStorages.push(authStorage);
-		authStorage.setRuntimeApiKey("anthropic", "test-key");
-		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models-non-xhigh.yml"));
+		authStorage.keys.setRuntime("anthropic", "test-key");
 
 		sessionSettings = Settings.isolated();
 		session = new AgentSession({
@@ -250,10 +290,7 @@ describe("AgentSession role model thinking behavior", () => {
 				thinkingLevel: undefined,
 			},
 		});
-		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth-max-clamp.db"));
-		authStorages.push(authStorage);
-		authStorage.setRuntimeApiKey("anthropic", "test-key");
-		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models-max-clamp.yml"));
+		authStorage.keys.setRuntime("anthropic", "test-key");
 
 		sessionSettings = Settings.isolated();
 		session = new AgentSession({
@@ -268,6 +305,42 @@ describe("AgentSession role model thinking behavior", () => {
 		expect(session.getAvailableThinkingLevels()).not.toContain("max");
 	});
 
+	it("carries the session effort to an unknown model and offers auto before capability discovery", async () => {
+		await createSession({
+			initialModelId: "claude-sonnet-4-5",
+			initialThinkingLevel: Effort.High,
+			modelRoles: {},
+		});
+		const model = buildModel({
+			id: "unlisted-reasoner",
+			name: "Unlisted Reasoner",
+			api: "openai-completions",
+			provider: "custom-thinking",
+			baseUrl: "https://custom.example/v1",
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 8192,
+		});
+		authStorage.keys.setRuntime(model.provider, "test-key");
+		session.setThinkingLevel(Effort.High);
+
+		await session.setModel(model);
+		expect(model.thinking?.unverified).toBe(true);
+		expect(session.thinkingLevel).toBe(Effort.High);
+		expect(session.agent.state.thinkingLevel).toBe(Effort.High);
+		expect(session.getAvailableEffortSelectors()).toEqual(["off", AUTO_THINKING, ...THINKING_EFFORTS]);
+
+		vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+		vi.spyOn(autoThinkingClassifier, "classifyDifficulty").mockResolvedValue(Effort.Medium);
+		session.setThinkingLevel(AUTO_THINKING);
+		expect(session.thinkingLevel).toBe(Effort.High);
+		await session.prompt("Implement a focused parser fix");
+		expect(session.configuredThinkingLevel()).toBe(AUTO_THINKING);
+		expect(session.thinkingLevel).toBe(Effort.Medium);
+		expect(session.agent.state.thinkingLevel).toBe(Effort.Medium);
+	});
+
 	it("cycles through off and auto before returning to effort levels", async () => {
 		const model = getAnthropicModelOrThrow("claude-sonnet-4-5");
 
@@ -280,10 +353,7 @@ describe("AgentSession role model thinking behavior", () => {
 				thinkingLevel: Effort.High,
 			},
 		});
-		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth-cycle-thinking.db"));
-		authStorages.push(authStorage);
-		authStorage.setRuntimeApiKey("anthropic", "test-key");
-		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models-cycle-thinking.yml"));
+		authStorage.keys.setRuntime("anthropic", "test-key");
 
 		sessionSettings = Settings.isolated();
 		session = new AgentSession({
@@ -330,10 +400,7 @@ describe("AgentSession role model thinking behavior", () => {
 				thinkingLevel: Effort.XHigh,
 			},
 		});
-		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth-cycle-max.db"));
-		authStorages.push(authStorage);
-		authStorage.setRuntimeApiKey("anthropic", "test-key");
-		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models-cycle-max.yml"));
+		authStorage.keys.setRuntime("anthropic", "test-key");
 
 		sessionSettings = Settings.isolated();
 		session = new AgentSession({
@@ -377,6 +444,138 @@ describe("AgentSession role model thinking behavior", () => {
 		expect(session.agent.state.thinkingLevel).toBe(Effort.Medium);
 	});
 
+	it("does not record late classifier usage in a replacement session after abort", async () => {
+		const model = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		await createSession({
+			initialModelId: model.id,
+			initialThinkingLevel: Effort.High,
+			modelRoles: { default: `${model.provider}/${model.id}` },
+		});
+		vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+		const classifierStarted = Promise.withResolvers<void>();
+		const releaseClassifier = Promise.withResolvers<void>();
+		vi.spyOn(autoThinkingClassifier, "classifyDifficulty").mockImplementation(async (_prompt, options) => {
+			classifierStarted.resolve();
+			await releaseClassifier.promise;
+			options.onUsage?.({
+				purpose: "auto-thinking",
+				role: "smol",
+				api: model.api,
+				provider: model.provider,
+				model: model.id,
+				stopReason: "stop",
+				usage: {
+					input: 3,
+					output: 1,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 4,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+			});
+			return Effort.Low;
+		});
+
+		session.setThinkingLevel(AUTO_THINKING);
+		const prompt = session.prompt("Classify this turn");
+		await classifierStarted.promise;
+		await session.abort();
+		await session.newSession();
+		releaseClassifier.resolve();
+		await prompt;
+
+		expect(session.sessionManager.getEntries().some(entry => entry.type === "model_usage")).toBe(false);
+	});
+
+	it("drops a classification that finishes after another model is selected", async () => {
+		const classified = getAnthropicModelOrThrow("claude-opus-4-7");
+		const picked = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		await createSession({
+			initialModelId: classified.id,
+			initialThinkingLevel: Effort.High,
+			modelRoles: { default: `${classified.provider}/${classified.id}` },
+		});
+		vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+		const classifierStarted = Promise.withResolvers<void>();
+		const releaseClassifier = Promise.withResolvers<void>();
+		vi.spyOn(autoThinkingClassifier, "classifyDifficulty").mockImplementation(async () => {
+			classifierStarted.resolve();
+			await releaseClassifier.promise;
+			return Effort.Max;
+		});
+
+		session.setThinkingLevel(AUTO_THINKING);
+		const prompt = session.prompt("Plan the storage migration");
+		await classifierStarted.promise;
+		await session.setModel(picked);
+		releaseClassifier.resolve();
+		await prompt;
+
+		// The picked model keeps the level auto starts it on, as when classification fails.
+		const fallback = resolveProvisionalAutoLevel(picked);
+		expect(session.model?.id).toBe(picked.id);
+		expect(session.configuredThinkingLevel()).toBe(AUTO_THINKING);
+		expect(session.thinkingLevel).toBe(fallback);
+		expect(session.agent.state.thinkingLevel).toBe(fallback);
+	});
+
+	it("classifies a user-invoked /skill turn under auto (resolves concrete effort)", async () => {
+		const model = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		await createSession({
+			initialModelId: model.id,
+			initialThinkingLevel: Effort.High,
+			modelRoles: { default: `${model.provider}/${model.id}` },
+		});
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+		const classifierSpy = vi.spyOn(autoThinkingClassifier, "classifyDifficulty").mockResolvedValue(Effort.Medium);
+
+		session.setThinkingLevel(AUTO_THINKING);
+		expect(session.autoResolvedThinkingLevel()).toBeUndefined();
+
+		// A /skill:<name> invocation reaches the session as a user-attributed
+		// custom message, not a `user` role. It is still a real user turn.
+		await session.promptCustomMessage({
+			customType: SKILL_PROMPT_MESSAGE_TYPE,
+			content: "Expanded SKILL.md body: implement the focused parser fix",
+			display: true,
+			details: { name: "implement", path: "/skills/implement/SKILL.md", args: "the parser" },
+			attribution: "user",
+		});
+
+		expect(classifierSpy).toHaveBeenCalledTimes(1);
+		expect(classifierSpy.mock.calls[0]?.[0]?.request).toContain("implement the focused parser fix");
+		expect(promptSpy).toHaveBeenCalledTimes(1);
+		expect(session.configuredThinkingLevel()).toBe(AUTO_THINKING);
+		expect(session.thinkingLevel).toBe(Effort.Medium);
+		expect(session.autoResolvedThinkingLevel()).toBe(Effort.Medium);
+		expect(session.agent.state.thinkingLevel).toBe(Effort.Medium);
+	});
+
+	it("does not classify an agent-originated skill custom message under auto", async () => {
+		const model = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		await createSession({
+			initialModelId: model.id,
+			initialThinkingLevel: Effort.High,
+			modelRoles: { default: `${model.provider}/${model.id}` },
+		});
+		vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+		const classifierSpy = vi.spyOn(autoThinkingClassifier, "classifyDifficulty").mockResolvedValue(Effort.Medium);
+
+		session.setThinkingLevel(AUTO_THINKING);
+
+		// Autoloaded / agent-originated skill injections must stay excluded.
+		await session.promptCustomMessage({
+			customType: SKILL_PROMPT_MESSAGE_TYPE,
+			content: "Autoloaded skill body",
+			display: false,
+			details: { name: "autoload", path: "/skills/autoload/SKILL.md" },
+			attribution: "agent",
+		});
+
+		expect(classifierSpy).not.toHaveBeenCalled();
+		expect(session.autoResolvedThinkingLevel()).toBeUndefined();
+	});
+
 	it("keeps auto active on resume (pending until the next turn reclassifies)", async () => {
 		const model = getAnthropicModelOrThrow("claude-sonnet-4-5");
 		const agent = new Agent({
@@ -388,13 +587,10 @@ describe("AgentSession role model thinking behavior", () => {
 				thinkingLevel: resolveProvisionalAutoLevel(model),
 			},
 		});
-		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth-auto-resume.db"));
-		authStorages.push(authStorage);
-		authStorage.setRuntimeApiKey("anthropic", "test-key");
-		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models-auto-resume.yml"));
+		authStorage.keys.setRuntime("anthropic", "test-key");
 		const sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
 		sessionSettings = Settings.isolated();
-		sessionSettings.set("defaultThinkingLevel", AUTO_THINKING);
+		cfgDefaultThinkingLevel.set(sessionSettings, AUTO_THINKING);
 		session = new AgentSession({
 			agent,
 			sessionManager,
@@ -434,13 +630,10 @@ describe("AgentSession role model thinking behavior", () => {
 				thinkingLevel: resolveProvisionalAutoLevel(model),
 			},
 		});
-		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth-manual-resume.db"));
-		authStorages.push(authStorage);
-		authStorage.setRuntimeApiKey("anthropic", "test-key");
-		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models-manual-resume.yml"));
+		authStorage.keys.setRuntime("anthropic", "test-key");
 		const sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
 		sessionSettings = Settings.isolated();
-		sessionSettings.set("defaultThinkingLevel", AUTO_THINKING);
+		cfgDefaultThinkingLevel.set(sessionSettings, AUTO_THINKING);
 		session = new AgentSession({
 			agent,
 			sessionManager,
@@ -480,13 +673,10 @@ describe("AgentSession role model thinking behavior", () => {
 				thinkingLevel: resolveProvisionalAutoLevel(model),
 			},
 		});
-		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth-pin-eq.db"));
-		authStorages.push(authStorage);
-		authStorage.setRuntimeApiKey("anthropic", "test-key");
-		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models-pin-eq.yml"));
+		authStorage.keys.setRuntime("anthropic", "test-key");
 		const sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
 		sessionSettings = Settings.isolated();
-		sessionSettings.set("defaultThinkingLevel", AUTO_THINKING);
+		cfgDefaultThinkingLevel.set(sessionSettings, AUTO_THINKING);
 		session = new AgentSession({
 			agent,
 			sessionManager,
@@ -506,7 +696,7 @@ describe("AgentSession role model thinking behavior", () => {
 		// defaultThinkingLevel), not silently stay `configured: "auto"`.
 		session.setThinkingLevel(Effort.Medium, true);
 		expect(session.isAutoThinking).toBe(false);
-		expect(sessionSettings.get("defaultThinkingLevel")).toBe(Effort.Medium);
+		expect(cfgDefaultThinkingLevel.get(sessionSettings)).toBe(Effort.Medium);
 		session.sessionManager.appendMessage(createAssistantMessage("done"));
 
 		const sessionFile = session.sessionFile;
@@ -541,6 +731,34 @@ describe("AgentSession role model thinking behavior", () => {
 		);
 	});
 
+	it("preserves the resolved auto level when a later classification fails", async () => {
+		const model = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		await createSession({
+			initialModelId: model.id,
+			initialThinkingLevel: Effort.High,
+			modelRoles: { default: `${model.provider}/${model.id}` },
+		});
+		vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+		vi.spyOn(autoThinkingClassifier, "classifyDifficulty")
+			.mockResolvedValueOnce(Effort.Low)
+			.mockRejectedValueOnce(new Error("classifier down"));
+
+		session.setThinkingLevel(AUTO_THINKING);
+		await session.prompt("Handle a straightforward update");
+		const receiptCount = session.sessionManager
+			.getEntries()
+			.filter(entry => entry.type === "thinking_level_change").length;
+		await session.prompt("Investigate another update");
+
+		expect(session.configuredThinkingLevel()).toBe(AUTO_THINKING);
+		expect(session.thinkingLevel).toBe(Effort.Low);
+		expect(session.autoResolvedThinkingLevel()).toBe(Effort.Low);
+		expect(session.agent.state.thinkingLevel).toBe(Effort.Low);
+		expect(session.sessionManager.getEntries().filter(entry => entry.type === "thinking_level_change")).toHaveLength(
+			receiptCount,
+		);
+	});
+
 	it("skips classification for synthetic turns", async () => {
 		const model = getAnthropicModelOrThrow("claude-sonnet-4-5");
 		await createSession({
@@ -559,6 +777,40 @@ describe("AgentSession role model thinking behavior", () => {
 		expect(session.configuredThinkingLevel()).toBe(AUTO_THINKING);
 		expect(session.thinkingLevel).toBe(provisional);
 		expect(session.autoResolvedThinkingLevel()).toBeUndefined();
+	});
+
+	it("settles auto on the running level when a run starts without a user turn", async () => {
+		const model = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		const mock = createMockModel({ provider: "anthropic", handler: async () => ({ content: ["ack"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: mock.stream,
+		});
+		sessionSettings = Settings.isolated({ "compaction.enabled": false });
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: sessionSettings,
+			modelRegistry,
+			thinkingLevel: AUTO_THINKING,
+		});
+		const classifierSpy = vi.spyOn(autoThinkingClassifier, "classifyDifficulty").mockResolvedValue(Effort.Low);
+		expect(thinkingLevelWord(session)).toBe(AUTO_THINKING);
+
+		// An IRC wake runs the agent without a user turn to classify. The composer
+		// must show the level it runs at, not auto as pending.
+		await session.sendCustomMessage(
+			{ customType: "irc:incoming", content: "ping", display: false },
+			{ triggerTurn: true },
+		);
+		await session.waitForIdle();
+
+		const provisional = resolveProvisionalAutoLevel(model);
+		expect(classifierSpy).not.toHaveBeenCalled();
+		expect(session.agent.state.thinkingLevel).toBe(provisional);
+		expect(thinkingLevelWord(session)).toBe(provisional);
+		expect(session.configuredThinkingLevel()).toBe(AUTO_THINKING);
 	});
 
 	it("maps ultrathink prompts to the model's highest supported level, clamped below max", async () => {
@@ -612,12 +864,9 @@ describe("AgentSession role model thinking behavior", () => {
 				thinkingLevel: undefined,
 			},
 		});
-		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth-non-reasoning-auto.db"));
-		authStorages.push(authStorage);
-		authStorage.setRuntimeApiKey("openai", "test-key");
-		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models-non-reasoning-auto.yml"));
+		authStorage.keys.setRuntime("openai", "test-key");
 		sessionSettings = Settings.isolated();
-		sessionSettings.set("defaultThinkingLevel", AUTO_THINKING);
+		cfgDefaultThinkingLevel.set(sessionSettings, AUTO_THINKING);
 		session = new AgentSession({
 			agent,
 			sessionManager: SessionManager.inMemory(),
@@ -638,34 +887,6 @@ describe("AgentSession role model thinking behavior", () => {
 		expect(session.thinkingLevel).toBeUndefined();
 		expect(session.agent.state.thinkingLevel).toBeUndefined();
 		expect(session.autoResolvedThinkingLevel()).toBeUndefined();
-	});
-
-	it("applies matching role thinking to temporary model picks", async () => {
-		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
-		const temporaryModel = getBundledModel("google-antigravity", "gemini-3.5-flash");
-		if (!temporaryModel) throw new Error("Expected google-antigravity model gemini-3.5-flash to exist");
-
-		await createSession({
-			initialModelId: defaultModel.id,
-			initialThinkingLevel: Effort.Low,
-			modelRoles: {
-				smol: `${temporaryModel.provider}/${temporaryModel.id}:high`,
-			},
-			runtimeApiKeys: {
-				[temporaryModel.provider]: "test-key",
-			},
-		});
-
-		const roleResolved = session.resolveRoleModelWithThinking("smol");
-		expect(roleResolved.model?.id).toBe(temporaryModel.id);
-		expect(roleResolved.thinkingLevel).toBe(Effort.High);
-
-		const roleThinkingLevel = session.resolveTemporaryModelThinkingLevel(temporaryModel);
-		await session.setModelTemporary(temporaryModel, roleThinkingLevel);
-
-		expect(session.model?.provider).toBe(temporaryModel.provider);
-		expect(session.model?.id).toBe(temporaryModel.id);
-		expect(session.thinkingLevel).toBe(Effort.High);
 	});
 
 	it("ignores a stale recorded role and cycles from the active model", async () => {
@@ -705,5 +926,35 @@ describe("AgentSession role model thinking behavior", () => {
 		expect(result?.role).toBe("slow");
 		expect(result?.model.id).toBe(slowModel.id);
 		expect(session.model?.id).toBe(slowModel.id);
+	});
+
+	it("does not carry the previous session's auto-resolved level across /new (#13383)", async () => {
+		const model = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		await createSession({
+			initialModelId: model.id,
+			initialThinkingLevel: Effort.High,
+			modelRoles: { default: `${model.provider}/${model.id}` },
+		});
+		vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+		vi.spyOn(autoThinkingClassifier, "classifyDifficulty").mockResolvedValue(Effort.Medium);
+
+		session.setThinkingLevel(AUTO_THINKING);
+		await session.prompt("Classify this turn");
+		// First session classified to Medium; the cache is what `/new` must drop.
+		expect(session.isAutoThinking).toBe(true);
+		expect(session.autoResolvedThinkingLevel()).toBe(Effort.Medium);
+
+		await session.newSession();
+
+		// The configured auto mode survives, but the per-turn cache is gone,
+		// so the next turn reclassifies its own prompt from undefined.
+		expect(session.isAutoThinking).toBe(true);
+		expect(session.configuredThinkingLevel()).toBe(AUTO_THINKING);
+		expect(session.autoResolvedThinkingLevel()).toBeUndefined();
+		const provisional = resolveProvisionalAutoLevel(model);
+		const entries = session.sessionManager.getEntries().filter(e => e.type === "thinking_level_change");
+		expect(session.thinkingLevel).toBe(provisional);
+		expect(session.agent.state.thinkingLevel).toBe(provisional);
+		expect(entries.at(-1)).toMatchObject({ thinkingLevel: provisional, configured: AUTO_THINKING });
 	});
 });

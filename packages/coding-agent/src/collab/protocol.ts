@@ -7,24 +7,23 @@
  * control messages that carry no session data.
  */
 
-import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
+import type { ImageContent } from "@oh-my-pi/pi-ai";
 import type {
 	BusChannel,
 	CollabUiRequest,
 	GuestFrame,
-	ParsedCollabLink,
 	Participant,
-	SessionState,
 	AgentSnapshot as WireAgentSnapshot,
 } from "@oh-my-pi/pi-wire";
 import {
 	DEFAULT_RELAY_URL,
 	ENVELOPE_HEADER_LENGTH,
+	formatCollabLink,
+	isLocalRelayHostname,
+	normalizeRelayOrigin,
 	ROOM_ID_BYTES,
-	ROOM_KEY_BYTES,
-	WRITE_TOKEN_BYTES,
 } from "@oh-my-pi/pi-wire";
-import type { ContextUsage } from "../extensibility/extensions/types";
+import type { CollabSessionState } from "../modes/view-model/status-line/types";
 import type { AgentSessionEvent } from "../session/agent-session";
 import type { SessionEntry, SessionHeader } from "../session/session-entries";
 
@@ -39,22 +38,22 @@ export type {
 	RelayControlToGuest,
 	RelayControlToHost,
 } from "@oh-my-pi/pi-wire";
-export { COLLAB_PROMPT_MESSAGE_TYPE, COLLAB_PROTO } from "@oh-my-pi/pi-wire";
+export {
+	COLLAB_PROMPT_MESSAGE_TYPE,
+	COLLAB_PROTO,
+	formatCollabLink,
+	generateRoomId,
+	packEnvelope,
+	parseCollabLink,
+	rewriteEnvelopePeer,
+	unpackEnvelope,
+} from "@oh-my-pi/pi-wire";
 export { DEFAULT_RELAY_URL, ENVELOPE_HEADER_LENGTH, ROOM_ID_BYTES };
 
 export type CollabParticipant = Participant;
 export type AgentSnapshot = WireAgentSnapshot;
 
-/** Debounced footer snapshot broadcast by the host. */
-export type CollabSessionState = SessionState & {
-	/**
-	 * Host model (full catalog object). Guests apply it to their replica
-	 * agent state so model display and context-window math are native.
-	 */
-	model?: Model;
-	/** Host status-line context numbers (guest system prompt/tools differ, so local estimates drift). */
-	contextUsage?: ContextUsage;
-};
+export type { CollabSessionState };
 
 /**
  * Encrypted payload frames (inside AES-GCM, JSON). The wire package pins the
@@ -62,9 +61,9 @@ export type CollabSessionState = SessionState & {
  * that serialize into those shapes.
  */
 export type CollabFrame =
-	// guest -> host (hello/abort/agent-cmd/fetch-transcript/ui-response are taken verbatim from the wire grammar)
+	// guest -> host (every guest frame but prompt is taken verbatim from the wire grammar)
 	| Exclude<GuestFrame, { t: "prompt" }>
-	| { t: "prompt"; text: string; images?: ImageContent[] }
+	| { t: "prompt"; text: string; images?: ImageContent[]; followUp?: true }
 	// host -> guest
 	| {
 			t: "welcome";
@@ -103,106 +102,69 @@ export type CollabFrame =
 	/** Targeted reply to fetch-transcript; `error` marks a terminal read failure that guests must surface without hot retrying. */
 	| { t: "transcript"; reqId: number; text: string; newSize: number; error?: string }
 	| { t: "bye"; reason: string }
-	| { t: "error"; message: string };
+	/** `resync`: the host no longer counts this guest as joined; the guest should send `hello` again. */
+	| { t: "error"; message: string; resync?: true };
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Wire envelope: [4B uint32 BE peerId][sealed payload]
-// Host→relay: peerId 0 broadcasts to all guests; peerId N targets guest N.
-// Guest→relay: always 0; the relay rewrites it to the sender's id.
+// Pre-serialized frames: the host bounds replicated payloads by serializing
+// them, so the frames that carry them are assembled from that JSON instead of
+// stringifying the payload a second time.
 // ═══════════════════════════════════════════════════════════════════════════
 
-export function packEnvelope(peerId: number, sealed: Uint8Array): Uint8Array {
-	const out = new Uint8Array(ENVELOPE_HEADER_LENGTH + sealed.byteLength);
-	new DataView(out.buffer).setUint32(0, peerId, false);
-	out.set(sealed, ENVELOPE_HEADER_LENGTH);
-	return out;
+declare const encodedFrameBrand: unique symbol;
+
+/** A `CollabFrame`'s JSON form, produced only by the encoders below. */
+export type EncodedFrame = string & { readonly [encodedFrameBrand]: true };
+
+/**
+ * Field table for a `CollabFrame` variant: its tag under `t`, every other
+ * field mapped to its own name. Annotating an encoder's table with this makes
+ * renaming, adding, or removing a field of that variant a type error here.
+ */
+type FrameFields<T extends CollabFrame["t"]> = {
+	readonly [K in keyof Extract<CollabFrame, { t: T }>]-?: K extends "t" ? T : K;
+};
+
+const ENTRY_FIELDS: FrameFields<"entry"> = { t: "entry", entry: "entry" };
+const EVENT_FIELDS: FrameFields<"event"> = { t: "event", event: "event" };
+const SNAPSHOT_CHUNK_FIELDS: FrameFields<"snapshot-chunk"> = {
+	t: "snapshot-chunk",
+	entries: "entries",
+	final: "final",
+};
+
+const ENTRY_FRAME_HEAD = `{"t":"${ENTRY_FIELDS.t}","${ENTRY_FIELDS.entry}":`;
+const EVENT_FRAME_HEAD = `{"t":"${EVENT_FIELDS.t}","${EVENT_FIELDS.event}":`;
+const SNAPSHOT_CHUNK_HEAD = `{"t":"${SNAPSHOT_CHUNK_FIELDS.t}","${SNAPSHOT_CHUNK_FIELDS.entries}":[`;
+const SNAPSHOT_CHUNK_FINAL = `],"${SNAPSHOT_CHUNK_FIELDS.final}":`;
+
+/** The single construction point of {@link EncodedFrame}. */
+function encodedFrame(json: string): EncodedFrame {
+	return json as EncodedFrame;
 }
 
-export function unpackEnvelope(data: Uint8Array): { peerId: number; payload: Uint8Array } | null {
-	if (data.byteLength < ENVELOPE_HEADER_LENGTH) return null;
-	const peerId = new DataView(data.buffer, data.byteOffset, ENVELOPE_HEADER_LENGTH).getUint32(0, false);
-	return { peerId, payload: data.subarray(ENVELOPE_HEADER_LENGTH) };
+export function encodeFrame(frame: CollabFrame): EncodedFrame {
+	return encodedFrame(JSON.stringify(frame));
 }
 
-/** Rewrite the peerId in place without copying the payload. */
-export function rewriteEnvelopePeer(data: Uint8Array, peerId: number): void {
-	new DataView(data.buffer, data.byteOffset, ENVELOPE_HEADER_LENGTH).setUint32(0, peerId, false);
+/** `{ t: "entry", entry }` from the entry's JSON. */
+export function encodeEntryFrame(entryJson: string): EncodedFrame {
+	return encodedFrame(`${ENTRY_FRAME_HEAD}${entryJson}}`);
+}
+
+/** `{ t: "event", event }` from the event's JSON. */
+export function encodeEventFrame(eventJson: string): EncodedFrame {
+	return encodedFrame(`${EVENT_FRAME_HEAD}${eventJson}}`);
+}
+
+/** `{ t: "snapshot-chunk", entries, final }` from each entry's JSON. */
+export function encodeSnapshotChunk(entryJsons: readonly string[], final: boolean): EncodedFrame {
+	return encodedFrame(`${SNAPSHOT_CHUNK_HEAD}${entryJsons.join(",")}${SNAPSHOT_CHUNK_FINAL}${final}}`);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Link format: wss://<host[:port]>/r/<roomId>.<base64url-32-byte-key>
 // ═══════════════════════════════════════════════════════════════════════════
-
-const ROOM_PATH_RE = /^\/r\/([A-Za-z0-9_-]{10,64})(?:\.([A-Za-z0-9_-]+))?$/;
-const BARE_LINK_RE = /^([A-Za-z0-9_-]{10,64})[#.]([A-Za-z0-9_-]+)$/;
-const B64URL_RE = /^[A-Za-z0-9_-]+$/;
-const LOCAL_HOSTNAMES: Record<string, true> = { localhost: true, "127.0.0.1": true, "::1": true, "[::1]": true };
-
-function isLocalHostname(hostname: string): boolean {
-	return LOCAL_HOSTNAMES[hostname] === true;
-}
-
-export function generateRoomId(): string {
-	const bytes = new Uint8Array(ROOM_ID_BYTES);
-	crypto.getRandomValues(bytes);
-	return Buffer.from(bytes).toString("base64url");
-}
-
-/** Normalize a relay base URL (ws/wss/http/https) into a ws/wss origin, or an error. */
-function normalizeRelayOrigin(relayUrl: string): { origin: string } | { error: string } {
-	let url: URL;
-	try {
-		url = new URL(relayUrl);
-	} catch {
-		return { error: `Invalid relay URL: ${relayUrl}` };
-	}
-	let scheme: string;
-	switch (url.protocol) {
-		case "wss:":
-		case "https:":
-			scheme = "wss:";
-			break;
-		case "ws:":
-		case "http:":
-			scheme = "ws:";
-			break;
-		default:
-			return { error: `Unsupported relay URL scheme: ${url.protocol}` };
-	}
-	if (scheme === "ws:" && !isLocalHostname(url.hostname)) {
-		return { error: "relay link must be wss:// (plain ws:// is only allowed for localhost)" };
-	}
-	const port = url.port ? `:${url.port}` : "";
-	return { origin: `${scheme}//${url.hostname}${port}` };
-}
-
-/**
- * Render the shareable link. Compact forms: the default relay collapses to
- * `<roomId>.<key>`, other wss relays drop the scheme (`host[:port]/r/…`);
- * only localhost ws:// links keep their full URL so parsing cannot
- * mis-infer wss.
- *
- * The room secret is dot-joined (`<roomId>.<key>`) rather than `#`-joined:
- * RFC 3986 forbids a raw `#` inside a fragment, so strict URL stacks (macOS
- * Foundation behind terminal click-to-open) percent-encode a second `#` to
- * `%23` and break the link. Parsers still accept the legacy `#` form and the
- * mangled `%23` form.
- *
- * Full links append the write token to the key
- * (`base64url(key ∥ writeToken)`); read-only (view) links carry the bare
- * 32-byte key, which is also the pre-token link format.
- */
-export function formatCollabLink(relayUrl: string, roomId: string, key: Uint8Array, writeToken?: Uint8Array): string {
-	const normalized = normalizeRelayOrigin(relayUrl);
-	if ("error" in normalized) throw new Error(normalized.error);
-	const secret = writeToken ? Buffer.concat([key, writeToken]) : Buffer.from(key);
-	const keyText = secret.toString("base64url");
-	if (normalized.origin === DEFAULT_RELAY_URL) return `${roomId}.${keyText}`;
-	const compact = normalized.origin.startsWith("wss://")
-		? normalized.origin.slice("wss://".length)
-		: normalized.origin;
-	return `${compact}/r/${roomId}.${keyText}`;
-}
 
 function normalizeCollabWebBaseUrl(relayUrl: string, webUrl?: string): string {
 	const explicitWebUrl = webUrl?.trim();
@@ -223,7 +185,7 @@ function normalizeCollabWebBaseUrl(relayUrl: string, webUrl?: string): string {
 	if (url.protocol !== "http:" && url.protocol !== "https:") {
 		throw new Error("collab.webUrl must start with http:// or https://");
 	}
-	if (url.protocol === "http:" && !isLocalHostname(url.hostname)) {
+	if (url.protocol === "http:" && !isLocalRelayHostname(url.hostname)) {
 		throw new Error("collab.webUrl must use https:// unless it targets localhost");
 	}
 	if (url.search || url.hash) {
@@ -246,51 +208,4 @@ export function formatCollabWebLink(
 	webUrl?: string,
 ): string {
 	return `${normalizeCollabWebBaseUrl(relayUrl, webUrl)}/#${formatCollabLink(relayUrl, roomId, key, writeToken)}`;
-}
-
-export function parseCollabLink(link: string): ParsedCollabLink | { error: string } {
-	// Lenient input: terminals that open OSC 8 links through strict URL stacks
-	// (macOS Foundation) percent-encode the legacy second `#` to `%23`.
-	let text = link.trim().replace(/%23/gi, "#");
-	// Bare `<roomId>.<key>` (legacy `<roomId>#<key>`) → default relay.
-	const bare = BARE_LINK_RE.exec(text);
-	if (bare) text = `${DEFAULT_RELAY_URL}/r/${bare[1]}.${bare[2]}`;
-	// Scheme-less `host[:port]/r/…` → wss.
-	else if (!text.includes("://")) text = `wss://${text}`;
-	let url: URL;
-	try {
-		url = new URL(text);
-	} catch {
-		return { error: `Invalid collab link: ${link}` };
-	}
-	if ((url.protocol === "http:" || url.protocol === "https:") && url.hash) {
-		const inner = url.hash.startsWith("#") ? url.hash.slice(1) : url.hash;
-		const parsed = parseCollabLink(inner);
-		if (!("error" in parsed)) return parsed;
-	}
-	const normalized = normalizeRelayOrigin(url.origin);
-	if ("error" in normalized) return normalized;
-	const match = ROOM_PATH_RE.exec(url.pathname);
-	if (!match) {
-		// Non-http(s) deep links may also carry a complete collab link in the
-		// fragment. http(s) links are handled once above so invalid fragments
-		// fall through to direct relay validation instead of double-recursing.
-		const inner = url.hash.startsWith("#") ? url.hash.slice(1) : url.hash;
-		if (inner && url.protocol !== "http:" && url.protocol !== "https:") return parseCollabLink(inner);
-		return { error: "Collab link must contain a /r/<roomId> path" };
-	}
-	const roomId = match[1]!;
-	// Key rides dot-joined in the path (`/r/<roomId>.<key>`); legacy links
-	// carry it in the fragment (`/r/<roomId>#<key>`).
-	const fragment = match[2] ?? (url.hash.startsWith("#") ? url.hash.slice(1) : url.hash);
-	if (!fragment) {
-		return { error: "Collab link is missing the <key> part" };
-	}
-	const secret = B64URL_RE.test(fragment) ? new Uint8Array(Buffer.from(fragment, "base64url")) : null;
-	if (!secret || (secret.byteLength !== ROOM_KEY_BYTES && secret.byteLength !== ROOM_KEY_BYTES + WRITE_TOKEN_BYTES)) {
-		return { error: "Collab link key must be 32 (view) or 48 (full) base64url bytes" };
-	}
-	const key = secret.subarray(0, ROOM_KEY_BYTES);
-	const writeToken = secret.byteLength > ROOM_KEY_BYTES ? secret.subarray(ROOM_KEY_BYTES) : undefined;
-	return { wsUrl: `${normalized.origin}/r/${roomId}`, roomId, key, writeToken };
 }

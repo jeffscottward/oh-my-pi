@@ -10,3 +10,9 @@ export function formatShortSha(value: string | undefined): string | undefined {
 
 	return value.slice(0, 12);
 }
+
+/** Append a labeled Markdown metadata value when present. */
+export function pushLine(lines: string[], label: string, value: string | number | boolean | undefined): void {
+	if (value === undefined || value === "") return;
+	lines.push(`${label}: ${value}`);
+}
