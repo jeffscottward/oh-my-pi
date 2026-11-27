@@ -2,7 +2,7 @@ name: CI
 
 on:
    push:
-      branches: [main]
+      branches-ignore: ["**"] # Fork-only: push jobs need upstream vmon runners; PR CI is the merge gate
       paths:
          - "packages/**"
          - "crates/**"
