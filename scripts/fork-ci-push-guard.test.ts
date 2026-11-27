@@ -8,11 +8,14 @@
  *   jobs to queue indefinitely on missing `vmon-large/from=omp-ci` runners.
  * - Upstream adds `tags` or `tags-ignore` under `on.push` or narrows `branches-ignore`,
  *   allowing tag or branch pushes to trigger `ci.yml`.
- * - `on.pull_request` is removed or drops `main`, breaking the fork's PR merge gate.
- * - Malformed YAML or bad CLI invocations exit 0 instead of failing loudly.
+ * - `on.pull_request` is removed, uses `branches-ignore`, or drops/negates `main`,
+ *   breaking the fork's PR merge gate.
+ * - Malformed YAML, failing workflow YAML, unreadable paths, or bad CLI arguments exit 0
+ *   instead of failing loudly.
  */
 import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
+import { $ } from "bun";
 import { validateForkCiWorkflow } from "./fork-ci-push-guard";
 
 const GUARD_SCRIPT = path.resolve(import.meta.dir, "fork-ci-push-guard.ts");
@@ -106,7 +109,7 @@ on:
 		);
 	});
 
-	it("rejects missing or non-main pull_request triggers", () => {
+	it("rejects missing, branches-ignore, non-main, or negated-main pull_request triggers", () => {
 		const missingPr = validateForkCiWorkflow(`
 on:
    push:
@@ -114,6 +117,18 @@ on:
 `);
 		expect(missingPr.ok).toBe(false);
 		expect(missingPr.errors).toContain("Workflow must define 'on.pull_request' targeting 'main'.");
+
+		const prBranchesIgnore = validateForkCiWorkflow(`
+on:
+   push:
+      branches-ignore: ["**"]
+   pull_request:
+      branches-ignore: [docs]
+`);
+		expect(prBranchesIgnore.ok).toBe(false);
+		expect(prBranchesIgnore.errors).toContain(
+			"on.pull_request must not use 'branches-ignore' (use explicit branches including 'main').",
+		);
 
 		const wrongBranch = validateForkCiWorkflow(`
 on:
@@ -124,6 +139,16 @@ on:
 `);
 		expect(wrongBranch.ok).toBe(false);
 		expect(wrongBranch.errors).toContain("on.pull_request.branches must include 'main'.");
+
+		const negatedMain = validateForkCiWorkflow(`
+on:
+   push:
+      branches-ignore: ["**"]
+   pull_request:
+      branches: [main, "!main"]
+`);
+		expect(negatedMain.ok).toBe(false);
+		expect(negatedMain.errors).toContain("on.pull_request.branches must include 'main'.");
 	});
 
 	it("returns a parse error on malformed YAML", () => {
@@ -132,7 +157,7 @@ on:
 		expect(result.errors[0]).toContain("Failed to parse workflow YAML:");
 	});
 
-	it("enforces CLI stdin, argument validation, and exit-code contracts", () => {
+	it("enforces CLI stdin, failing-YAML, missing-file, argument validation, and exit-code contracts", async () => {
 		const validYaml = `
 on:
    push:
@@ -148,11 +173,32 @@ on:
 		expect(okRun.exitCode).toBe(0);
 		expect(okRun.stdout.toString()).toContain("<stdin> OK");
 
-		const emptyArg = Bun.spawnSync(["bun", GUARD_SCRIPT, ""], { stdout: "pipe", stderr: "pipe" });
+		const invalidYaml = `
+on:
+   push:
+      branches: [main]
+   pull_request:
+      branches: [main]
+`;
+		const failRun = Bun.spawnSync(["bun", GUARD_SCRIPT, "-"], {
+			stdin: new TextEncoder().encode(invalidYaml),
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(failRun.exitCode).toBe(1);
+		expect(failRun.stderr.toString()).toContain("on.push must not define 'branches' in the fork.");
+
+		const missingFile = await $`bun ${GUARD_SCRIPT} /tmp/nonexistent-fork-ci-push-guard-fixture.yml`
+			.quiet()
+			.nothrow();
+		expect(missingFile.exitCode).toBe(1);
+		expect(missingFile.stderr.toString()).toContain("failed to read");
+
+		const emptyArg = await $`bun ${GUARD_SCRIPT} ""`.quiet().nothrow();
 		expect(emptyArg.exitCode).toBe(1);
 		expect(emptyArg.stderr.toString()).toContain("must not be empty");
 
-		const extraArgs = Bun.spawnSync(["bun", GUARD_SCRIPT, "a.yml", "b.yml"], { stdout: "pipe", stderr: "pipe" });
+		const extraArgs = await $`bun ${GUARD_SCRIPT} a.yml b.yml`.quiet().nothrow();
 		expect(extraArgs.exitCode).toBe(1);
 		expect(extraArgs.stderr.toString()).toContain("usage:");
 	});

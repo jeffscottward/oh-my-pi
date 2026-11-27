@@ -1,6 +1,6 @@
-# Fork-only: verify `.github/workflows/ci.yml` never schedules non-hosted jobs
-# (such as upstream's `vmon-large/from=omp-ci`) on `push` to `main` or tags,
-# while keeping `pull_request` CI on `main` using GitHub-hosted runners.
+# Fork-only: verify `.github/workflows/ci.yml` keeps the fork trigger invariant:
+# `on.push` is absent or sets `branches-ignore: ["**"]` with none of `branches`,
+# `tags`, or `tags-ignore`, and `on.pull_request` still targets `main`.
 #
 # Uses only Bun built-ins (`Bun.YAML.parse`, `bun:test`), so it provisions Bun
 # directly via `oven-sh/setup-bun` with no monorepo `bun install` or cache I/O.

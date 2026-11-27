@@ -88,7 +88,15 @@ function validatePullRequestTrigger(prValue: unknown, errors: string[]): void {
 		return;
 	}
 	const branches = map.branches;
-	const includesMain = branches === "main" || (Array.isArray(branches) && branches.some(entry => entry === "main"));
+	let includesMain = false;
+	if (branches === "main") {
+		includesMain = true;
+	} else if (Array.isArray(branches)) {
+		for (const entry of branches) {
+			if (entry === "main") includesMain = true;
+			else if (entry === "!main" || entry === "!*" || entry === "!**") includesMain = false;
+		}
+	}
 	if (!includesMain) {
 		errors.push("on.pull_request.branches must include 'main'.");
 	}
