@@ -1,0 +1,47 @@
+# Fork-only: verify `.github/workflows/ci.yml` never schedules non-hosted jobs
+# (such as upstream's `vmon-large/from=omp-ci`) on `push` to `main` or tags,
+# while keeping `pull_request` CI on `main` using GitHub-hosted runners.
+#
+# Uses only Bun built-ins (`Bun.YAML.parse`, `bun:test`), so it provisions Bun
+# directly via `oven-sh/setup-bun` with no monorepo `bun install` or cache I/O.
+# Future static `ci.yml` invariants should extend this workflow.
+name: Fork CI push guard
+
+on:
+   workflow_dispatch:
+   pull_request:
+      branches: [main]
+      paths:
+         - ".github/workflows/ci.yml"
+         - ".github/workflows/fork-ci-push-guard.yml"
+         - "scripts/fork-ci-push-guard.ts"
+         - "scripts/fork-ci-push-guard.test.ts"
+   push:
+      branches: [main]
+      paths:
+         - ".github/workflows/ci.yml"
+         - ".github/workflows/fork-ci-push-guard.yml"
+         - "scripts/fork-ci-push-guard.ts"
+         - "scripts/fork-ci-push-guard.test.ts"
+
+permissions:
+   contents: read
+
+concurrency:
+   group: fork-ci-push-guard-${{ github.ref }}
+   cancel-in-progress: true
+
+jobs:
+   guard:
+      name: Guard fork CI push triggers
+      runs-on: ubuntu-22.04
+      timeout-minutes: 10
+      steps:
+         - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+           with:
+              bun-version: 1.4.5
+         - name: Test the push guard contract
+           run: bun test scripts/fork-ci-push-guard.test.ts
+         - name: Validate .github/workflows/ci.yml
+           run: bun scripts/fork-ci-push-guard.ts
